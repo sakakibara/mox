@@ -273,7 +273,7 @@ fn checkLayers(
             else => containsMoxDirective(hd.body) or interp.containsCapture(hd.body),
         };
         if (!skip) {
-            try validate.checkLayer(arena, format, hd.body, display, hd.body_removed, diag);
+            try validate.checkLayer(arena, format, hd.body, display, targetKey(file), hd.body_removed, diag);
             if (format.isJson() and merging) try validate.checkDuplicateKeys(arena, format, hd.body, display, &.{}, false, diag);
         }
     }
@@ -284,7 +284,7 @@ fn checkLayers(
         };
         if (!format.isJson() and interp.containsCapture(raw)) continue;
         const display = layerDisplay(arena, file, o.path);
-        try validate.checkLayer(arena, format, raw, display, &.{}, diag);
+        try validate.checkLayer(arena, format, raw, display, targetKey(file), &.{}, diag);
         if (format.isJson() and merging and match_mod.matches(match_mod.effectiveOverlayTuple(o, bindings), bindings)) {
             try validate.checkDuplicateKeys(arena, format, raw, display, &.{}, false, diag);
         }
@@ -801,8 +801,14 @@ fn parseFile(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const 
 /// its location, so a capture the merge reads before it expands is named.
 fn layerFailed(arena: std.mem.Allocator, err: anyerror, format: source.format.Format, text: []const u8, display: []const u8, removed: []const u32, diag: ?*interp.Diag) anyerror {
     if (err == error.OutOfMemory) return err;
-    try validate.checkLayer(arena, format, text, display, removed, diag);
+    try validate.checkLayer(arena, format, text, display, "", removed, diag);
     return err;
+}
+
+/// The home-relative key of the target `file` composes.
+pub fn targetKey(file: ManagedFile) []const u8 {
+    const p = file.source_base_path;
+    return if (std.mem.startsWith(u8, p, "src/")) p["src/".len..] else p;
 }
 
 fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8, dialect: json.Dialect) !json.Value {

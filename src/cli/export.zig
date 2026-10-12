@@ -289,7 +289,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, bindings, &m_state, secrets, null, &diag) catch |e| {
             if (e == error.FormatViolation) {
-                try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), diag.capture() orelse "?" });
+                const rep_ = mox.compose.validate.splitReport(diag.capture() orelse "?");
+                try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), rep_.head });
+                try mox.compose.validate.writeMore(ctx.err, rep_.more);
             } else {
                 try ctx.err.print("mox export: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
                 try apply_cmd.explainComposeError(ctx.err, "mox export", e);

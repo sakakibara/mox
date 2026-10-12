@@ -226,7 +226,7 @@ fn directiveArgs(line: []const u8, marker: []const u8) ?[]const u8 {
 
 /// One or more double-quoted items separated by whitespace; `\"` and `\\`
 /// escapes inside an item. Anything else is invalid.
-fn parseQuotedArgv(arena: std.mem.Allocator, s: []const u8) ParseError![]const []const u8 {
+pub fn parseQuotedArgv(arena: std.mem.Allocator, s: []const u8) ParseError![]const []const u8 {
     var items: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (true) {

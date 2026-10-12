@@ -49,10 +49,11 @@ pub fn checkLayer(
     format: Format,
     text: []const u8,
     display: []const u8,
+    key: []const u8,
     removed: []const u32,
     diag: ?*interp.Diag,
 ) Error!void {
-    var f = (try firstFailure(arena, format, text, display)) orelse return;
+    var f = (try firstFailure(arena, format, text, display, key)) orelse return;
     const line = source.head.sourceLine(removed, f.line);
     if (f.hint == null and !format.isJson() and interp.containsCapture(lineAt(text, lineOffset(text, f.line)))) f.hint = merged_capture_hint;
     return report(arena, diag, try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, line, f.col }), try reason(arena, format, f, false), f.hint);
@@ -63,7 +64,7 @@ pub fn checkLayer(
 /// `has_secret` says mox resolved a secret into it, so no byte of the
 /// parser's message may be printed.
 pub fn liveFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, has_secret: bool) !?[]const u8 {
-    const f = (try firstFailure(arena, format, text, display)) orelse return null;
+    const f = (try firstFailure(arena, format, text, display, "")) orelse return null;
     const why = try reason(arena, format, f, has_secret);
     const hint = shownHint(f, has_secret);
     if (hint) |h| return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}; {s}", .{ display, f.line, f.col, why, h });
@@ -81,7 +82,7 @@ pub fn checkOutput(
     has_secret: bool,
     diag: ?*interp.Diag,
 ) Error!void {
-    const f = (try firstFailure(arena, format, bytes, "")) orelse return;
+    const f = (try firstFailure(arena, format, bytes, "", "")) orelse return;
     const loc = try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ f.line, try layerList(arena, layers) });
     return report(arena, diag, loc, try reason(arena, format, f, has_secret), shownHint(f, has_secret));
 }
@@ -192,15 +193,15 @@ fn lineCol(text: []const u8, offset: usize) LineCol {
 
 /// The first parse failure of `text` in `format`, or null when it parses.
 /// `display` names the file in a directive refusal's overlay hint.
-fn firstFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?Failure {
-    var f = (try parserFailure(arena, format, text, display)) orelse return null;
+fn firstFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, key: []const u8) !?Failure {
+    var f = (try parserFailure(arena, format, text, display, key)) orelse return null;
     if (f.hint == null and std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) f.hint = bom_hint;
     return f;
 }
 
-fn parserFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?Failure {
+fn parserFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, key: []const u8) !?Failure {
     return switch (format) {
-        .json, .jsonc => jsonFailure(arena, format, text, display),
+        .json, .jsonc => jsonFailure(arena, format, text, display, key),
         .toml => blk: {
             var errs: std.ArrayList(toml.Diagnostic) = .empty;
             _ = toml.parse(arena, text, .{ .errors = &errs }) catch |e| switch (e) {
@@ -268,9 +269,9 @@ fn lineAt(text: []const u8, offset: usize) []const u8 {
     return text[start..end];
 }
 
-fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?Failure {
+fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, key: []const u8) !?Failure {
     if (format == .json) {
-        if (try directiveRefusal(arena, text, display)) |f| return f;
+        if (try directiveRefusal(arena, text, display, key)) |f| return f;
     }
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
         return .{ .line = 1, .col = 1, .message = "unexpected end of input", .hint = empty_hint };
@@ -305,15 +306,19 @@ fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, displ
 
 /// A strict-JSON layer's first `mox:` comment, refused with the place its
 /// directive lives instead. Found with the JSONC tokenizer, so a string that
-/// merely spells `// mox:` is content.
-fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const u8) !?Failure {
+/// merely spells `// mox:` is content. When the first one is a head
+/// directive, the hint is every head directive of the layer as one
+/// attributes entry for `key`, ready to paste.
+fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const u8, key: []const u8) !?Failure {
     var t = json.Tokenizer.init(text, .jsonc);
     var seen_value = false;
     var first: ?struct { verb: []const u8, start: usize, leading: bool } = null;
     var has_end = false;
-    // The arguments of every directive spelled with the first one's verb,
-    // for a hint that can be pasted into the attributes file.
-    var args_seen: std.ArrayList([]const u8) = .empty;
+    var own: std.ArrayList([]const u8) = .empty;
+    var disown: std.ArrayList([]const u8) = .empty;
+    var check: ?[]const []const u8 = null;
+    var gate: ?[]const u8 = null;
+    var defaults: std.ArrayList([]const u8) = .empty;
     while (t.next()) |tok| {
         if (tok.kind != .comment) {
             seen_value = true;
@@ -325,28 +330,41 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
         const args = std.mem.trimStart(u8, body["mox:".len..], " \t");
         const verb_end = std.mem.indexOfAny(u8, args, " \t(\"") orelse args.len;
         const verb = args[0..verb_end];
+        const rest = std.mem.trim(u8, args[verb_end..], " \t");
         if (std.mem.eql(u8, verb, "end")) has_end = true;
         if (first == null) first = .{ .verb = verb, .start = start, .leading = !seen_value };
-        if (std.mem.eql(u8, verb, first.?.verb)) try args_seen.append(arena, std.mem.trim(u8, args[verb_end..], " \t"));
+        if (std.mem.eql(u8, verb, "own")) {
+            try own.append(arena, rest);
+        } else if (std.mem.eql(u8, verb, "disown")) {
+            try disown.append(arena, rest);
+        } else if (std.mem.eql(u8, verb, "check")) {
+            check = source.head.parseQuotedArgv(arena, rest) catch null;
+        } else if (std.mem.eql(u8, verb, "default")) {
+            try defaults.append(arena, rest);
+        } else if (std.mem.eql(u8, verb, "when") and !seen_value and gate == null) {
+            gate = rest;
+        }
     }
     const hit = first orelse return null;
     const lc = lineCol(text, hit.start);
     const v = hit.verb;
-    const where = try attributesWhere(arena, display);
-    const hint: []const u8 = if (std.mem.eql(u8, v, "own") or std.mem.eql(u8, v, "disown"))
-        try std.fmt.allocPrint(arena, "declare it in {s}: {s} {s} = {s}", .{ where.file, where.table, v, try tomlList(arena, args_seen.items, false) })
-    else if (std.mem.eql(u8, v, "check"))
-        try std.fmt.allocPrint(arena, "declare it in {s}: {s} check = {s}", .{ where.file, where.table, try tomlList(arena, args_seen.items[0..1], true) })
-    else if (std.mem.eql(u8, v, "when") and hit.leading and !has_end)
-        try std.fmt.allocPrint(arena, "declare the whole-file gate in {s}: {s} when = {s}", .{ where.file, where.table, try tomlString(arena, args_seen.items[0]) })
-    else if (std.mem.eql(u8, v, "secret"))
+    const head_verb = eqAny(v, &.{ "own", "disown", "check", "default" }) or (std.mem.eql(u8, v, "when") and hit.leading and !has_end);
+    const hint: []const u8 = if (head_verb) blk: {
+        const where = try attributesWhere(arena, display, key);
+        var entry: std.ArrayList(u8) = .empty;
+        try entry.print(arena, "declare it in {s} and remove the comments:\n{s}", .{ where.file, where.table });
+        if (own.items.len > 0) try entry.print(arena, "\nown = {s}", .{try tomlArray(arena, own.items)});
+        if (disown.items.len > 0) try entry.print(arena, "\ndisown = {s}", .{try tomlArray(arena, disown.items)});
+        if (check) |argv| try entry.print(arena, "\ncheck = {s}", .{try tomlArray(arena, argv)});
+        if (!has_end) if (gate) |g| try entry.print(arena, "\nwhen = {s}", .{try tomlString(arena, g)});
+        if (defaults.items.len > 0) try entry.print(arena, "\ndefaults = {s}", .{try tomlDefaults(arena, defaults.items)});
+        break :blk try entry.toOwnedSlice(arena);
+    } else if (std.mem.eql(u8, v, "secret"))
         "use a \"<secret:URI>\" capture inside a JSON string instead"
-    else if (std.mem.eql(u8, v, "default"))
-        try std.fmt.allocPrint(arena, "declare it in {s}: {s} defaults = {s}", .{ where.file, where.table, try tomlDefaults(arena, args_seen.items) })
     else if (std.mem.eql(u8, v, "keep-empty"))
         "remove it: a structured file is never omitted when empty"
     else if (eqAny(v, &.{ "when", "include", "replace", "append", "prepend", "remove", "from", "for", "end" }))
-        try std.fmt.allocPrint(arena, "vary the file with an overlay {s}.d/<axis>.json instead", .{std.fs.path.basenamePosix(display)})
+        try std.fmt.allocPrint(arena, "vary the file with an overlay {s}.d/<axis>.json instead", .{std.fs.path.basenamePosix(if (key.len > 0) key else display)})
     else
         comment_hint;
     const message = try std.fmt.allocPrint(arena, "mox directive \"{s}\" in strict JSON, which has no comments", .{v});
@@ -355,16 +373,13 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
 
 const Where = struct { file: []const u8, table: []const u8 };
 
-/// The attributes file and table header a layer named `display` (repo- or
-/// private-relative, `src/` or `private/` first) declares its target in.
-fn attributesWhere(arena: std.mem.Allocator, display: []const u8) !Where {
-    const slash = std.mem.indexOfScalar(u8, display, '/') orelse return .{ .file = ".mox/attributes.toml", .table = "[\"<target>\"]" };
-    var key = display[slash + 1 ..];
-    if (std.mem.indexOf(u8, key, ".d/")) |d| key = key[0..d];
+/// The attributes file and table header the target `key` of a layer named
+/// `display` (`src/` or `private/` first) is declared in.
+fn attributesWhere(arena: std.mem.Allocator, display: []const u8, key: []const u8) !Where {
     const private = std.mem.startsWith(u8, display, "private/");
     return .{
         .file = if (private) "the private layer's .mox/attributes.toml" else ".mox/attributes.toml",
-        .table = try std.fmt.allocPrint(arena, "[{s}]", .{try tomlString(arena, key)}),
+        .table = try std.fmt.allocPrint(arena, "[{s}]", .{try tomlString(arena, if (key.len > 0) key else "<target>")}),
     };
 }
 
@@ -373,22 +388,10 @@ fn tomlString(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return quoteKey(arena, s);
 }
 
-/// The TOML array of `items`: each a directive argument, or with `argv`
-/// the double-quoted argv items of one `check` line.
-fn tomlList(arena: std.mem.Allocator, items: []const []const u8, argv: bool) ![]const u8 {
+/// The TOML array of `items`, each a basic string.
+fn tomlArray(arena: std.mem.Allocator, items: []const []const u8) ![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
-    for (items) |item| {
-        if (!argv) {
-            try parts.append(arena, try tomlString(arena, item));
-            continue;
-        }
-        var rest = item;
-        while (std.mem.indexOfScalar(u8, rest, '"')) |open| {
-            const close = std.mem.indexOfScalarPos(u8, rest, open + 1, '"') orelse break;
-            try parts.append(arena, rest[open .. close + 1]);
-            rest = rest[close + 1 ..];
-        }
-    }
+    for (items) |item| try parts.append(arena, try tomlString(arena, item));
     return std.fmt.allocPrint(arena, "[{s}]", .{try std.mem.join(arena, ", ", parts.items)});
 }
 
@@ -402,6 +405,22 @@ fn tomlDefaults(arena: std.mem.Allocator, items: []const []const u8) ![]const u8
         try parts.append(arena, try std.fmt.allocPrint(arena, "{s} = {s}", .{ name, try tomlString(arena, value) }));
     }
     return std.fmt.allocPrint(arena, "{{ {s} }}", .{try std.mem.join(arena, ", ", parts.items)});
+}
+
+/// A report as printed: its first line goes inside `ERROR <file> (...)`,
+/// and any further lines (a pasteable attributes entry) follow it.
+pub const Printed = struct { head: []const u8, more: []const u8 };
+
+pub fn splitReport(text: []const u8) Printed {
+    const nl = std.mem.indexOfScalar(u8, text, '\n') orelse return .{ .head = text, .more = "" };
+    return .{ .head = text[0..nl], .more = text[nl + 1 ..] };
+}
+
+/// The lines after a report's first, indented under its ERROR row.
+pub fn writeMore(w: *std.Io.Writer, more: []const u8) !void {
+    if (more.len == 0) return;
+    var lines = std.mem.splitScalar(u8, more, '\n');
+    while (lines.next()) |line| try w.print("      {s}\n", .{line});
 }
 
 fn eqAny(s: []const u8, set: []const []const u8) bool {
@@ -462,7 +481,7 @@ fn failureText(format: Format, text: []const u8) !?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     errdefer arena.deinit();
     var d: interp.Diag = .{};
-    checkLayer(arena.allocator(), format, text, "src/s.json", &.{}, &d) catch |e| switch (e) {
+    checkLayer(arena.allocator(), format, text, "src/s.json", "s.json", &.{}, &d) catch |e| switch (e) {
         error.FormatViolation => {
             const out = try testing.allocator.dupe(u8, d.capture().?);
             arena.deinit();
@@ -486,17 +505,16 @@ fn expectFailure(format: Format, text: []const u8, want: []const []const u8) !vo
 }
 
 test "strict JSON: a directive head is refused naming its attributes key" {
-    try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "declare it in .mox/attributes.toml: [\"s.json\"] disown = [\"a\"]" });
+    try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "declare it in .mox/attributes.toml and remove the comments:\n[\"s.json\"]\ndisown = [\"a\"]" });
 }
 
 test "strict JSON: each directive kind names its replacement" {
-    try expectFailure(.json, "// mox: own a\n// mox: own b.c\n{}\n", &.{"[\"s.json\"] own = [\"a\", \"b.c\"]"});
-    try expectFailure(.json, "// mox: check \"x\" \"--y\"\n{}\n", &.{"[\"s.json\"] check = [\"x\", \"--y\"]"});
-    try expectFailure(.json, "// mox: when os=darwin\n{}\n", &.{"[\"s.json\"] when = \"os=darwin\""});
+    try expectFailure(.json, "// mox: own a\n// mox: own b.c\n// mox: check \"x\" \"say \\\"hi\\\"\"\n// mox: when os=darwin\n// mox: default profile=\"work\"\n{}\n", &.{"[\"s.json\"]\nown = [\"a\", \"b.c\"]\ncheck = [\"x\", \"say \\\"hi\\\"\"]\nwhen = \"os=darwin\"\ndefaults = { profile = \"work\" }"});
+    try expectFailure(.json, "// mox: when os=darwin\n{}\n", &.{"\n[\"s.json\"]\nwhen = \"os=darwin\""});
     try expectFailure(.json, "{\n// mox: when os=darwin\n\"a\": 1\n// mox: end\n}\n", &.{ "s.json:2:1:", "overlay s.json.d/<axis>.json" });
     try expectFailure(.json, "{\n// mox: include \"x.json\"\n}\n", &.{"overlay s.json.d/<axis>.json"});
     try expectFailure(.json, "{\n// mox: secret \"env:X\"\n}\n", &.{"\"<secret:URI>\" capture inside a JSON string"});
-    try expectFailure(.json, "// mox: default profile=\"work\"\n{}\n", &.{"[\"s.json\"] defaults = { profile = \"work\" }"});
+    try expectFailure(.json, "// mox: default profile=\"work\"\n{}\n", &.{"\n[\"s.json\"]\ndefaults = { profile = \"work\" }"});
     try expectFailure(.json, "// mox: keep-empty\n{}\n", &.{"never omitted when empty"});
 }
 
@@ -523,7 +541,7 @@ test "checkLayer: a line of the stripped text names the line the source has it o
     var d: interp.Diag = .{};
     // Lines 1 and 2 of the source were stripped; the error on stripped line
     // 2 is source line 4.
-    try testing.expectError(error.FormatViolation, checkLayer(arena.allocator(), .toml, "[a]\nk = = 1\n", "src/x.toml", &.{ 1, 2 }, &d));
+    try testing.expectError(error.FormatViolation, checkLayer(arena.allocator(), .toml, "[a]\nk = = 1\n", "src/x.toml", "x.toml", &.{ 1, 2 }, &d));
     try testing.expect(std.mem.startsWith(u8, d.capture().?, "src/x.toml:4:"));
 }
 

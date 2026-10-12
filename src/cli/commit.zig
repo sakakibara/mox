@@ -1698,7 +1698,9 @@ fn commitRun(
             var cdiag: mox.compose.interp.Diag = .{};
             const now = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &axis_resolver, &m_state, secrets, null, &cdiag) catch |e| {
                 if (e == error.FormatViolation) {
-                    try ctx.err.print("mox commit: {f}: not committed: {s}\n", .{ display.of(file.live_path, m_state.home), cdiag.capture() orelse "?" });
+                    const rep_ = mox.compose.validate.splitReport(cdiag.capture() orelse "?");
+                    try ctx.err.print("mox commit: {f}: not committed: {s}\n", .{ display.of(file.live_path, m_state.home), rep_.head });
+                    try mox.compose.validate.writeMore(ctx.err, rep_.more);
                 } else {
                     try ctx.err.print("mox commit: {f}: source does not compose: {s}; not committed\n", .{ display.of(file.live_path, m_state.home), @errorName(e) });
                 }
@@ -4304,7 +4306,7 @@ fn structLayers(
     for (paths) |p| {
         const bytes = try Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(max_file_bytes));
         const value = commit_struct.parseLayer(arena, format, bytes) catch |e| {
-            if (e != error.OutOfMemory) mox.compose.validate.checkLayer(arena, format, bytes, mox.compose.catA.layerDisplay(arena, file, p), &.{}, diag) catch {};
+            if (e != error.OutOfMemory) mox.compose.validate.checkLayer(arena, format, bytes, mox.compose.catA.layerDisplay(arena, file, p), mox.compose.catA.targetKey(file), &.{}, diag) catch {};
             return e;
         };
         try out.append(arena, .{

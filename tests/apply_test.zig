@@ -6984,12 +6984,34 @@ test "strict json: a leading directive is refused naming the attributes key that
     defer arena.deinit();
     const a = arena.allocator();
 
-    try put(io, &tmp, "repo/src/settings.json", "// mox: disown model\n{\"theme\": \"dark\"}\n");
+    const body = "{\"theme\": \"dark\"}\n";
+    try put(io, &tmp, "repo/src/.config/conf.d/app.json", "// mox: disown model\n// mox: disown \"auto mode\"\n" ++ body);
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/settings.json", "src/settings.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml: [\"settings.json\"] disown = [\"model\"]"));
-    try std.testing.expect(!exists(io, try c.homePath("settings.json")));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/conf.d/app.json", "src/.config/conf.d/app.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml and remove the comments:"));
+    try std.testing.expect(!exists(io, try c.homePath(".config/conf.d/app.json")));
+
+    // The entry printed under the ERROR row is pasted as is.
+    var entry: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, r.err, '\n');
+    var after = false;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "ERROR   ~/.config/conf.d/app.json") != null) {
+            after = true;
+            continue;
+        }
+        if (!after) continue;
+        if (!std.mem.startsWith(u8, line, "      ")) break;
+        try entry.appendSlice(a, line);
+        try entry.append(a, '\n');
+    }
+    try std.testing.expectEqualStrings("      [\".config/conf.d/app.json\"]\n      disown = [\"model\", \"\\\"auto mode\\\"\"]\n", entry.items);
+    try put(io, &tmp, "repo/.mox/attributes.toml", entry.items);
+    try put(io, &tmp, "repo/src/.config/conf.d/app.json", body);
+    const r2 = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(exists(io, try c.homePath(".config/conf.d/app.json")));
 }
 
 test "strict json: a string spelling a directive is content and applies verbatim" {

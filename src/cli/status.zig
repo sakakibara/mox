@@ -446,7 +446,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var diag: mox.compose.interp.Diag = .{};
         const composed = mox.compose.composeFileTracked(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, null, &diag) catch |e| {
             if (e == error.FormatViolation) {
-                try rows.print("  {s:<8} {s}{s} ({s})\n", .{ Label.err.text(), shown, annot, diag.capture() orelse "?" });
+                const rep_ = mox.compose.validate.splitReport(diag.capture() orelse "?");
+                try rows.print("  {s:<8} {s}{s} ({s})\n", .{ Label.err.text(), shown, annot, rep_.head });
+                try mox.compose.validate.writeMore(rows, rep_.more);
             } else if (diag.capture()) |cap| {
                 try rows.print("  {s:<8} {s}{s} (compose failed: {s}: {s})\n", .{ Label.err.text(), shown, annot, @errorName(e), cap });
             } else {

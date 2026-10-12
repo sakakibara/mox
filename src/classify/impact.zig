@@ -112,7 +112,7 @@ fn composeOrNull(
 /// What a failed compose says: a format violation's located report, else
 /// the error's name.
 pub fn failText(arena: std.mem.Allocator, e: anyerror, d: *const compose.interp.Diag) ![]const u8 {
-    if (e == error.FormatViolation) if (d.capture()) |cap| return arena.dupe(u8, cap);
+    if (e == error.FormatViolation) if (d.capture()) |cap| return arena.dupe(u8, compose.validate.splitReport(cap).head);
     return @errorName(e);
 }
 

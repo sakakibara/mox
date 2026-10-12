@@ -808,7 +808,9 @@ A failure is that file's `ERROR` in `apply`, `status`, `diff` and `export`,
 and nothing of it reaches the live tree:
 
 ```
-ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml: [".claude/settings.json"] disown = ["model", "autoMode"])
+ERROR ~/.claude/settings.json (src/.claude/settings.json:1:1: mox directive "disown" in strict JSON, which has no comments; declare it in .mox/attributes.toml and remove the comments:)
+      [".claude/settings.json"]
+      disown = ["model", "autoMode"]
 ERROR ~/app.toml (composed output line 2 from src/app.toml and src/app.toml.d/os=darwin.toml: invalid integer)
 ```
 
@@ -820,10 +822,11 @@ quote any line: the reason is fixed text (`does not parse as toml`, or for
 INI the parser's error kind, such as `expected assignment`), a duplicate key
 reads `duplicate key <redacted>`, and a hint that would quote the file is
 left out. A strict-JSON failure carries a hint by its cause: the attributes
-table and key that replace a mox directive, ready to paste (see Region
-directives); `format = "jsonc"` for any other comment; removing a trailing
-comma; `{}` for an empty file; quoting a bare capture; stripping a byte order
-mark. An empty partial render ("mox owns nothing here") is exempt.
+entry that replaces every head directive of the layer, printed under the
+row ready to paste (see Region directives); `format = "jsonc"` for any
+other comment; removing a trailing comma; `{}` for an empty file; quoting a
+bare capture; stripping a byte order mark. An empty partial render ("mox
+owns nothing here") is exempt.
 
 ## Sources that leave the tree
 
