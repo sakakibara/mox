@@ -8369,3 +8369,22 @@ test "private layer: while it is absent a file it contributes to is left as it i
     try std.testing.expectEqualStrings(before, try read(io, a, shared));
     try std.testing.expectEqualStrings("p2\n", try read(io, a, try c.homePath("plain.txt")));
 }
+
+test "generator: a JSON template's string row value expands its own captures, a secret included" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\ndir = \"<machine.os>/bin\"\ntok = \"<secret:cmd:printf hunter2>\"\nbd = \"<machine.os>/b\"\nbt = \"<secret:cmd:printf hunter3>\"\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{\"dir\": \"<id.dir>\", \"tok\": \"<id.tok>\", \"bd\": <id.bd>, \"bt\": <id.bt>}\n// mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const os = @tagName(builtin.os.tag);
+    const want = try std.fmt.allocPrint(a, "{{\"dir\": \"{s}/bin\", \"tok\": \"hunter2\", \"bd\": \"{s}/b\", \"bt\": \"hunter3\"}}\n", .{ if (std.mem.eql(u8, os, "macos")) "darwin" else os, if (std.mem.eql(u8, os, "macos")) "darwin" else os });
+    try std.testing.expectEqualStrings(want, try read(io, a, try c.homePath("id-a.json")));
+    // The secret is kept out of mox's own content cache.
+    try std.testing.expect((try mox.apply.applied.readContent(a, io, c.state, try c.homePath("id-a.json"))) == null);
+}

@@ -728,9 +728,10 @@ pub fn soleDataCapture(arena: std.mem.Allocator, template: []const u8, ctx: Ctx)
 }
 
 /// The scalar a template that is exactly one loop-row capture (`<var>` or
-/// `<var.field>`, no chain, no default) resolves to, typed by how the data
-/// wrote it, or null when the template is anything else or the field is
-/// not a scalar.
+/// `<var.field>`, no chain, no default) resolves to when the data wrote it
+/// as a number or a bool, or null otherwise. A string value is left to the
+/// ordinary expansion, which expands the captures it holds and tracks a
+/// secret among them.
 pub fn soleRowCapture(arena: std.mem.Allocator, template: []const u8, ctx: Ctx) std.mem.Allocator.Error!?data.source.Scalar {
     if (template.len < 2 or template[0] != '<' or template[template.len - 1] != '>') return null;
     const close = capture.closeIndex(template, 0) orelse return null;
@@ -742,12 +743,12 @@ pub fn soleRowCapture(arena: std.mem.Allocator, template: []const u8, ctx: Ctx) 
     for (ctx.scope) |frame| {
         if (!std.mem.eql(u8, frame.name, head)) continue;
         switch (frame.value) {
-            .scalar => |s| return if (dot == null) .{ .text = s, .kind = .string } else null,
+            .scalar => return null,
             .record => |r| {
                 const d = dot orelse return null;
                 const v = r.get(inner[d + 1 ..]) orelse return null;
                 return switch (v) {
-                    .string => |s| .{ .text = s, .kind = .string },
+                    .string => null,
                     .int => |i| .{ .text = try std.fmt.allocPrint(arena, "{d}", .{i}), .kind = .integer },
                     .bool => |b| .{ .text = if (b) "true" else "false", .kind = .boolean },
                     .array_of_strings => null,
