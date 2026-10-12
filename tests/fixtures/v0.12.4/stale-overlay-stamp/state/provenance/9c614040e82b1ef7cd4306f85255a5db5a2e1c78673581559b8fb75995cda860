@@ -1,0 +1,14 @@
+{
+  "v": 1,
+  "live_path": "/FIXTURE/home/config.toml",
+  "segments": [
+    {
+      "out_start": 0,
+      "out_len": 2,
+      "origin": {
+        "kind": "overlay",
+        "path": "/FIXTURE/repo/src/config.toml"
+      }
+    }
+  ]
+}

@@ -4288,20 +4288,14 @@ test "commit: a stale pre-fix overlay stamp is refreshed from source, not obeyed
     const a = arena.allocator();
 
     // Composes verbatim from the base on darwin; the current rule stamps it
-    // `.base`. An older mox stamped it `.overlay` because the file DECLARES an
-    // overlay -- simulate that persisted state, as an upgrade would find it.
+    // `.base`. A mox before 0.12.4 stamped it `.overlay` because the file
+    // DECLARES an overlay: the state an upgrade finds holds that stamp.
     try writeRepo(io, &tmp, "repo/src/config.toml", "# banner\ntheme = \"light\"\n");
     try writeRepo(io, &tmp, "repo/src/config.toml.d/os=linux.toml", "theme = \"blue\"\n");
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
-
-    _ = try h.run(&.{ "mox", "apply" });
+    try testutil.legacyState(a, io, "stale-overlay-stamp", h.root, h.state);
     const live = try h.liveOf("config.toml");
-    const stale = [_]mox.provenance.map.Segment{.{
-        .out_start = 0,
-        .out_len = 2,
-        .origin = .{ .overlay = .{ .path = try h.srcOf("config.toml") } },
-    }};
-    try mox.provenance.map.persist(a, io, h.state, live, &stale);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "# banner\ntheme = \"light\"\n" });
 
     // A comment edit has no key path; obeying the stale stamp would strand it
     // as manual until the drift is discarded. The refresh recomposes the
