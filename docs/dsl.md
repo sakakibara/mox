@@ -356,15 +356,16 @@ with no chain and no default, emits the scalar in its own JSON type:
 
 composes to `{ "port": 8080, "debug": false }` when `data/server.toml` holds
 `port = 8080` and `debug = false`. A TOML integer or float becomes a number, a
-bool a bool, a string a string, and a date-time stays a string. A number is
-written as JavaScript writes it: the shortest digits that read back as the
-same value, in decimal notation for 1e-7 <= |x| < 1e21 (`100000`, `0.0001`,
-`3`) and in exponent notation otherwise (`1e+300`, `1e-7`). A TOML `inf`
-or `nan`, which JSON cannot hold, is a compose error naming the capture. The
-type is the value's as resolved, so a private `data/` file that shadows it
-with another TOML type changes the emitted type too; store a TOML string to
-keep a string. Anything else -- a chain, a default, text around the capture, a key
--- is a string. A key capture that expands to a key its object already holds
+bool a bool, a string a string, and a date-time stays a string. An integer
+is written exactly as TOML holds it. A float is written as JavaScript
+writes a number: the shortest digits that read back as the same value, in
+decimal notation for 1e-7 <= |x| < 1e21 (`100000`, `0.0001`, `3`) and in
+exponent notation otherwise (`1e+300`, `1e-7`). A TOML `inf` or `nan`,
+which JSON cannot hold, is a compose error naming the capture. The type is
+the value's as resolved, so a private `data/` file that shadows it with
+another TOML type changes the emitted type too; store a TOML string to keep
+a string. Anything else -- a chain, a default, text around the capture, a
+key -- is a string. A key capture that expands to a key its object already holds
 is refused (see Validation). A capture written outside a string
 (`"port": <data.server.port>`) is not JSON and is refused, with the hint to
 quote it.

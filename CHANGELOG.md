@@ -44,13 +44,14 @@ All notable changes to mox are documented here. The format follows
   the output line and its layers), with a hint. mox never prints a byte of
   a live file in a parse error, nor of an output a secret was resolved
   into: such an error gives the location and fixed text, and a duplicate
-  key reads `duplicate key <redacted>`. A layer that is no document of its format on
-  its own is checked through the output instead: an include fragment, a
-  non-JSON layer holding a capture or a region, and a JSONC layer holding a
-  `// mox:` directive. An output is checked only where machine state is at
-  hand (it is the output for this machine), an empty partial render ("mox
-  owns nothing here") is exempt, and so is an output composed where secrets
-  are not resolved that still holds a `<SECRET:...>` placeholder.
+  key reads `duplicate key <redacted>`. A layer that is no document of its
+  format on its own is checked through the output instead: an include
+  fragment, a non-JSON layer holding a capture or a region, and a JSONC
+  layer holding a `// mox:` directive. An output is checked only where
+  machine state is at hand (it is the output for this machine), an empty
+  partial render ("mox owns nothing here") is exempt, and so is an output
+  composed where secrets are not resolved that still holds a
+  `<SECRET:...>` placeholder.
 - A `.json` target is strict JSON: a comment or trailing comma in any of its
   layers, or in a partial target's live file, is an `ERROR`, and a `// mox:`
   comment is refused naming the attributes key or overlay that replaces it.
@@ -64,12 +65,12 @@ All notable changes to mox are documented here. The format follows
   JSON, so a `"` or `\` in a resolved value no longer breaks the output. A
   quoted single `<data.FILE.KEY>` capture of a number or bool used to give a
   string and now gives the typed value; store a TOML string to keep a
-  string. A typed number is written as JavaScript writes it: shortest
-  round-trip digits, decimal notation for 1e-7 <= |x| < 1e21 and exponent
-  notation otherwise (`1e+300`). A TOML `inf` or `nan`, which JSON cannot
-  hold, is a compose error naming the capture. Text interpolation renders
-  every value as before. Captures inside JSONC comments are no longer
-  expanded.
+  string. A typed integer is written exactly; a typed float is written as
+  JavaScript writes a number: shortest round-trip digits, decimal notation
+  for 1e-7 <= |x| < 1e21 and exponent notation otherwise (`1e+300`). A TOML
+  `inf` or `nan`, which JSON cannot hold, is a compose error naming the
+  capture. Text interpolation renders every value as before. Captures
+  inside JSONC comments are no longer expanded.
 - A repeated key in a YAML mapping, which YAML forbids, is refused in any
   layer or output, as TOML's already is.
 - A generic INI file may hold a bare key everywhere mox reads it.

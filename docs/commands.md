@@ -381,10 +381,11 @@ without `--yes`, reports only and exits 1 if edits remain;
 prompt. Exit codes are listed at the end of this section.
 
 A named path whose source left the tree (a `STALE` or edited stale file),
-or a file of a generator that left the tree, has no source to route into: `mox commit <path>` keeps the live file and
-forgets the path on this machine (`released ~/x on this machine`) once the
-run commits; a run that only reports (`--dry-run`, or no terminal without
-`--yes`) says it would, and one that aborts releases nothing.
+or a file of a generator that left the tree, has no source to route into:
+`mox commit <path>` keeps the live file and forgets the path on this
+machine (`released ~/x on this machine`) once the run commits; a run that
+only reports (`--dry-run`, or no terminal without `--yes`) says it would,
+and one that aborts releases nothing.
 
 <!-- generated: flags commit -->
 | Flag | Description |
@@ -704,9 +705,9 @@ packages entirely.
   writing, a write or restore failed (sources restored or copied as above,
   nothing recorded), a temporary check write for a key placement, a line
   or a row failed, any temporary check write could not be reverted, or
-  `--abort-on-prompt` reached a prompt. A temporary check write for a coupled rename that
-  fails undoes that rename (`coupled update to <path> undone: <path> could
-  not take it (<error>)`) and is not an exit 2.
+  `--abort-on-prompt` reached a prompt. A temporary check write for a
+  coupled rename that fails undoes that rename (`coupled update to <path>
+  undone: <path> could not take it (<error>)`) and is not an exit 2.
 
 ## diff
 
