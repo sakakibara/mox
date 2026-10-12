@@ -765,8 +765,11 @@ includes a file whose layers or output do not parse in its format, with
 the layer and line and a hint, and a file whose `.mox/attributes.toml`
 entry breaks the schema. A partially owned file is
 classified on its owned content only, so the program's writes on the
-other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
-`MISSING`, `STALE`, or `ERROR`.
+other side never surface. `ORPHAN` is a file a generator manifest written
+before manifests named their repo lists for a generator that is gone: mox
+never removes it, and `mox commit <file>` forgets it. Exits 1 if any file
+is `OUTDATED`, `DRIFT`, `MISSING`, `STALE`, or `ERROR`; `ORPHAN` counts
+toward nothing.
 
 A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING`, each installed

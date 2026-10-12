@@ -130,8 +130,9 @@ All notable changes to mox are documented here. The format follows
   upgraded binary's next apply tags it again.
 - A generator manifest written before this release names no repo and is
   never swept. The first apply that still produces the generator rewrites
-  its manifest tagged; a generator that left the tree before the upgrade
-  keeps its files, no longer tracked.
+  its manifest tagged. A generator that left the tree before the upgrade
+  keeps its files: apply never removes them, `mox status` lists each as
+  `ORPHAN`, and `mox commit <file>` forgets one.
 
 ### Fixed
 - apply's summary counts a generator's dropped files, an orphaned

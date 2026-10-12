@@ -6599,3 +6599,35 @@ test "orphans: an edited file of a gone generator is removed by a named --overwr
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, try h.liveOf(".config/r-b.inc")));
 }
+
+test "orphans: a file of an untagged manifest whose generator is gone is listed, never removed, and forgotten by commit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const leaf = try h.liveOf(".config/old.inc");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
+    try mox.apply.applied.record(a, io, h.state, leaf, "old\n", "");
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.state, "generated" }));
+    const manifest = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/old-gen.inc")) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 0), s.rc);
+    try std.testing.expect(lineWith(s.out, "ORPHAN", "~/.config/old.inc (generated before this version; its generator is gone"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, leaf));
+    const c = try h.run(&.{ "mox", "commit", "--yes", "~/.config/old.inc" });
+    try std.testing.expectEqual(@as(u8, 0), c.rc);
+    try std.testing.expect(!exists(io, manifest));
+    try std.testing.expect(exists(io, leaf));
+    const s2 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s2.out, "ORPHAN") == null);
+}

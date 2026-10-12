@@ -369,6 +369,28 @@ pub fn orphanManifestOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8,
     return null;
 }
 
+/// Every existing file an untagged manifest -- written before manifests
+/// named their repo -- lists for a generator no longer in the tree. Such a
+/// file is never swept; status names it so it can be forgotten.
+pub fn untaggedOrphanLeaves(arena: std.mem.Allocator, io: Io, state_dir: []const u8, tree_live: *const std.StringHashMap(void)) ![]const []const u8 {
+    var tree_names = std.StringHashMap(void).init(arena);
+    var it = tree_live.keyIterator();
+    while (it.next()) |p| try tree_names.put(try arena.dupe(u8, &manifestName(p.*)), {});
+    var out: std.ArrayList([]const u8) = .empty;
+    const gen_dir_path = try std.fs.path.join(arena, &.{ state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
+    for (entries) |entry| {
+        if (entry.kind != .file or tree_names.contains(entry.name)) continue;
+        const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ gen_dir_path, entry.name }), arena, .limited(max_content_bytes)) catch continue;
+        if ((try repoOf(arena, bytes)) != null) continue;
+        for (try leavesOf(arena, bytes)) |leaf| {
+            Io.Dir.cwd().access(io, leaf, .{}) catch continue;
+            try out.append(arena, leaf);
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Drop `leaf` from the manifest at `manifest_path`, deleting the manifest
 /// when no file is left in it.
 pub fn dropLeaf(arena: std.mem.Allocator, io: Io, manifest_path: []const u8, leaf: []const u8) !void {
