@@ -93,9 +93,23 @@ pub fn find(
     return out.toOwnedSlice(arena);
 }
 
-/// True when the private layer at `private_dir` is absent.
-pub fn privateMissing(io: Io, private_dir: []const u8) bool {
-    Io.Dir.cwd().access(io, private_dir, .{}) catch |e| return e == error.FileNotFound or e == error.NotDir;
+/// True when the private layer at `private_dir` cannot be trusted to hold
+/// what it held: it is absent, or holds no file, while records of `repo`
+/// under `home` name it. An empty mountpoint or an unsynced folder reads
+/// the same as a missing one.
+pub fn privateUnavailable(arena: std.mem.Allocator, io: Io, private_dir: []const u8, state_dir: []const u8, repo: []const u8, home: []const u8) !bool {
+    if (try holdsAFile(arena, io, private_dir)) return false;
+    return privateRecords(arena, io, state_dir, repo, home);
+}
+
+fn holdsAFile(arena: std.mem.Allocator, io: Io, dir_path: []const u8) !bool {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (walker.next(io) catch return false) |entry| {
+        if (entry.kind != .directory) return true;
+    }
     return false;
 }
 

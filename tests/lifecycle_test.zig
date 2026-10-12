@@ -6825,11 +6825,11 @@ test "private layer: while it is absent its files are left in place with a warni
     // The volume goes away.
     try Io.Dir.cwd().deleteFile(io, priv);
     const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, st.out, "is missing; its files are left in place") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "is unavailable; nothing is swept and files it contributes to are left as they are") != null);
     try std.testing.expect(std.mem.indexOf(u8, st.out, "STALE") == null);
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "is missing; its files are left in place") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "is unavailable; nothing is swept and files it contributes to are left as they are") != null);
     try std.testing.expectEqualStrings("token\n", try read(io, a, try h.liveOf(".netrc")));
 }
 

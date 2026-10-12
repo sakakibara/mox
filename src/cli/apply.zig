@@ -465,7 +465,9 @@ fn applyPass(
 
     // A tombstone that matches nothing here is reported before any record
     // changes, so this run's own sweep cannot hide it.
-    if (!scoped) try warnPrivateMissing(ctx, ctx.out, repo_tag);
+    // An unavailable private layer stops every sweep and every rewrite of a
+    // file it contributes to, as a failed file stops the sweeps.
+    const priv_down = try privateDown(ctx, ctx.out, repo_tag);
     if (!scoped) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree)) |u|
         try printUnmatched(ctx.out, u, home);
 
@@ -482,7 +484,7 @@ fn applyPass(
         const shown = try display.alloc(ctx.alloc, file.live_path, home);
         // Records name the layer a file comes from, so a sweep can tell a
         // private-only file while the private layer is absent.
-        const file_tag = if (fromPrivate(file)) private_tag else repo_tag;
+        const file_tag = if (privateContributes(file, &.{})) private_tag else repo_tag;
         // A head declaration the walk could not honor is this file's error
         // alone; everything else still applies.
         if (file.head_error.len > 0) {
@@ -497,12 +499,16 @@ fn applyPass(
             try compose_failed.append(ctx.alloc, file.live_path);
             continue;
         }
+        if (priv_down and try leftForPrivate(ctx, ctx.out, file.live_path, repo_tag)) {
+            counts.skip += 1;
+            continue;
+        }
 
         // A GENERATOR (`for ... into`) fans out to N files instead of writing
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are
         // deferred to a second pass against the global keep set below.
-        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home, file_tag)) continue;
+        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home, .{ .file = file_tag, .repo = repo_tag, .private = private_tag }, priv_down)) continue;
 
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never composed or written.
@@ -633,12 +639,12 @@ fn applyPass(
                     .check_timeout_ms = check_timeout_ms,
                     .extra_path_dirs = mox_path_dirs.items,
                     .mox_bin_dir = mox_bin_dir,
-                    .repo = file_tag,
+                    .repo = if (privateContributes(file, prov.items)) private_tag else file_tag,
                 }, &counts, &snapshotted);
             } else {
                 if (!try dropPlantedLink(ctx, file.live_path, snap_id, dry_run, force, &units, &counts, &snapshotted)) continue;
                 try applyRegularFile(ctx, .{
-                    .repo = file_tag,
+                    .repo = if (privateContributes(file, prov.items)) private_tag else file_tag,
                     .live_path = file.live_path,
                     .bytes = bytes,
                     .prov_items = prov.items,
@@ -692,7 +698,7 @@ fn applyPass(
     // per-leaf DRIFT line: a refused, still-in-tree generator folds into the
     // ONE `generated_set` unit below instead of a per-leaf row.
     for (gen_states.items) |g| {
-        if (!g.succeeded) continue;
+        if (!g.succeeded or priv_down) continue;
         const prune = try mox.apply.generated.pruneStale(ctx.alloc, ctx.io, .{
             .state_dir = context.paths.state_dir,
             .snapshots_dir = context.paths.snapshots_dir,
@@ -722,7 +728,7 @@ fn applyPass(
     // far -- sweeps nothing: a failure at a moved path must not remove the
     // old path's file before the new one is written.
     const sweep_ok = blk: {
-        if (scoped or counts.fail > 0 or compose_failed.items.len > 0) break :blk false;
+        if (scoped or priv_down or counts.fail > 0 or compose_failed.items.len > 0) break :blk false;
         for (files) |f| if (f.head_error.len > 0) break :blk false;
         for (gen_states.items) |g| if (!g.succeeded) break :blk false;
         break :blk true;
@@ -760,7 +766,7 @@ fn applyPass(
     }
     // A full run sweeps every stale path but removes an edited one only when
     // a scoped run names it; a scoped run sweeps only the stale paths it names.
-    if (orphan_named.count() > 0 and counts.fail == 0) {
+    if (orphan_named.count() > 0 and counts.fail == 0 and !priv_down) {
         var opts = try orphanOptions(ctx, tree, &ruleset, snap_id, force, dry_run);
         opts.keep = &keep_set;
         opts.kept_inodes = &kept_inodes;
@@ -776,7 +782,7 @@ fn applyPass(
             }
         }
     }
-    if (sweep_ok or (stale_named.count() > 0 and counts.fail == 0)) {
+    if (sweep_ok or (stale_named.count() > 0 and counts.fail == 0 and !priv_down)) {
         var tree_keep: std.StringHashMap(void) = .init(ctx.alloc);
         for (tree.files) |f| try tree_keep.put(f.live_path, {});
         for (manifest_leaves) |leaf| try tree_keep.put(leaf, {});
@@ -792,7 +798,6 @@ fn applyPass(
             .force = force and scoped,
             .only = if (scoped) &stale_named else null,
             .dry_run = dry_run,
-            .private_missing = mox.apply.stale.privateMissing(ctx.io, context.paths.private_dir),
         }, &units, &counts, &snapshotted);
     }
     if (!scoped and !dry_run) try mox.apply.stale.markTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree.released);
@@ -805,7 +810,7 @@ fn applyPass(
     // managed-file tree, so a foreign file refused here counts toward the
     // exit code but, like an orphaned generator, does not add a report row.
     var exact_result = mox.apply.exact.Result{};
-    if (!scoped and tree.exact_dirs.len > 0) {
+    if (!scoped and !priv_down and tree.exact_dirs.len > 0) {
         var managed_live: std.ArrayList([]const u8) = .empty;
         var kit = keep_set.keyIterator();
         while (kit.next()) |p| try managed_live.append(ctx.alloc, p.*);
@@ -1795,6 +1800,10 @@ fn warnBadWholeFileGateAxis(ctx: *app.Ctx, file: mox.source.tree.ManagedFile) !v
 /// prune/manifest pass. `current` is the set produced this run (empty when the
 /// generator failed); `prior` is its recorded manifest. A failed generator is
 /// pruned against nothing and its manifest is left intact.
+/// The record tags a generator's files may carry: its own, the repo's, and
+/// the private layer's for a file the private layer contributes to.
+const GenTags = struct { file: []const u8, repo: []const u8, private: []const u8 };
+
 const GenState = struct {
     live_path: []const u8,
     /// The tag its manifest names.
@@ -1921,8 +1930,6 @@ const StaleInput = struct {
     /// When set, only these stale paths are judged.
     only: ?*const std.StringHashMap(void) = null,
     dry_run: bool,
-    /// The private layer is absent: its files are left in place.
-    private_missing: bool = false,
 };
 
 /// True after naming an attributes file, the repo's or the private
@@ -1961,17 +1968,45 @@ pub fn orphanOptions(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: 
         .released_live = released_live,
         .links = links,
         .ruleset = ruleset,
-        .private_missing = mox.apply.stale.privateMissing(ctx.io, context.paths.private_dir),
     };
 }
 
-/// Warn, in `out`, that the private layer is absent while records name it:
-/// the files it wrote are left in place until it is back.
-pub fn warnPrivateMissing(ctx: *app.Ctx, out: *std.Io.Writer, repo_tag: []const u8) !void {
+/// True, after warning in `out`, when the private layer is unavailable
+/// (see `stale.privateUnavailable`): the run then sweeps nothing and leaves
+/// every file the layer contributes to as it is.
+pub fn privateDown(ctx: *app.Ctx, out: *std.Io.Writer, repo_tag: []const u8) !bool {
     const context = ctx.context.?;
-    if (!mox.apply.stale.privateMissing(ctx.io, context.paths.private_dir)) return;
-    if (!try mox.apply.stale.privateRecords(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, context.paths.home)) return;
-    try out.print("  WARN    private layer {f} is missing; its files are left in place\n", .{display.of(context.paths.private_dir, context.paths.home)});
+    if (!try mox.apply.stale.privateUnavailable(ctx.alloc, ctx.io, context.paths.private_dir, context.paths.state_dir, repo_tag, context.paths.home)) return false;
+    try out.print("  WARN    private layer {f} is unavailable; nothing is swept and files it contributes to are left as they are\n", .{display.of(context.paths.private_dir, context.paths.home)});
+    return true;
+}
+
+/// True, after naming it in `out`, when the private layer contributed to
+/// what mox last wrote at `live_path`: while the layer is unavailable it is
+/// left as it is, never rewritten without its private part.
+pub fn leftForPrivate(ctx: *app.Ctx, out: *std.Io.Writer, live_path: []const u8, repo_tag: []const u8) !bool {
+    const context = ctx.context.?;
+    const tag = try mox.apply.applied.tagFor(ctx.alloc, ctx.io, context.paths.state_dir, live_path, repo_tag);
+    if (mox.apply.applied.layerOf(tag, repo_tag) != .private) return false;
+    try out.print("  WARN    {f} is left as it is (the private layer contributes to it)\n", .{display.of(live_path, context.paths.home)});
+    return true;
+}
+
+/// True when the private layer contributed to `file`: its base, an overlay,
+/// a fragment, or a line of `prov` (a loop over its data) comes from it.
+pub fn privateContributes(file: mox.source.tree.ManagedFile, prov: []const mox.provenance.map.Segment) bool {
+    const pd = file.private_dir;
+    if (pd.len == 0) return false;
+    if (file.has_base and std.mem.startsWith(u8, file.source_base_abs, pd)) return true;
+    for (file.overlays) |o| if (std.mem.startsWith(u8, o.path, pd)) return true;
+    for (file.regions) |r| if (std.mem.startsWith(u8, r.path, pd)) return true;
+    for (prov) |seg| switch (seg.origin) {
+        .fragment => |f| if (std.mem.startsWith(u8, f.path, pd)) return true,
+        .overlay => |o| if (std.mem.startsWith(u8, o.path, pd)) return true,
+        .loop => |l| if (std.mem.startsWith(u8, l.data_source, pd)) return true,
+        else => {},
+    };
+    return false;
 }
 
 /// Record in `scan` what status and diff learned of `live` by composing it
@@ -2112,7 +2147,6 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
     const jc: mox.apply.removable.Ctx = .{ .home = home, .keep = in.keep, .kept = &inodes, .ruleset = in.ruleset, .links = &links };
     for (cands) |c| {
         if (in.only) |only| if (!only.contains(c.live_path)) continue;
-        if (c.private and in.private_missing) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         if (in.released.contains(try mox.apply.stale.foldCase(ctx.alloc, c.live_path))) {
             if (!in.dry_run) try forgetAll(ctx, c.live_path);
@@ -2776,8 +2810,10 @@ fn applyGenerator(
     gen_states: *std.ArrayList(GenState),
     ruleset: *const mox.source.ignore.match.RuleSet,
     home: []const u8,
-    repo: []const u8,
+    tags: GenTags,
+    priv_down: bool,
 ) !bool {
+    const repo = tags.file;
     const shown = try display.alloc(ctx.alloc, file.live_path, home);
     var diag: mox.compose.interp.Diag = .{};
     const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, m_state, secrets, &diag) catch |e| {
@@ -2828,6 +2864,7 @@ fn applyGenerator(
 
     // Current produced set for the manifest + global keep-set.
     var current: std.ArrayList([]const u8) = .empty;
+    var any_private = false;
     for (outputs) |o| {
         // A generated output whose rendered path matches an ignore rule (itself
         // or a containing directory) is outside mox's management, same as any
@@ -2839,6 +2876,12 @@ fn applyGenerator(
         }
         try current.append(ctx.alloc, o.live_path);
         try produced.put(o.live_path, {});
+        const leaf_private = privateContributes(file, o.prov);
+        if (leaf_private) any_private = true;
+        if (priv_down and try leftForPrivate(ctx, ctx.out, o.live_path, tags.repo)) {
+            counts.skip += 1;
+            continue;
+        }
         // Not written, but still this generator's: kept, never pruned.
         if (o.invalid) |why| {
             counts.fail += 1;
@@ -2846,7 +2889,7 @@ fn applyGenerator(
             continue;
         }
         try applyRegularFile(ctx, .{
-            .repo = repo,
+            .repo = if (leaf_private) tags.private else repo,
             .live_path = o.live_path,
             .bytes = o.content,
             .prov_items = o.prov,
@@ -2866,7 +2909,7 @@ fn applyGenerator(
     const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, file.live_path);
     try gen_states.append(ctx.alloc, .{
         .live_path = file.live_path,
-        .tag = repo,
+        .tag = if (any_private) tags.private else repo,
         .prior = prior,
         .current = try current.toOwnedSlice(ctx.alloc),
         .succeeded = true,
@@ -2897,11 +2940,6 @@ fn generatedParentEscapes(io: std.Io, base_dir: []const u8, live_path: []const u
         if (st.kind == .sym_link) return true;
     }
     return false;
-}
-
-/// True for a file only the private layer holds.
-fn fromPrivate(file: mox.source.tree.ManagedFile) bool {
-    return file.private_dir.len > 0 and file.has_base and std.mem.startsWith(u8, file.source_base_abs, file.private_dir);
 }
 
 /// The prior live content to snapshot before an overwrite, with any secret

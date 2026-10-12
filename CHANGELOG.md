@@ -144,10 +144,13 @@ All notable changes to mox are documented here. The format follows
   files.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
   run where any file failed to compose or write or carried a head error.
-- Records of a private-only file name the private layer, and while the
-  layer is absent its files are left in place, with a warning in `status`
-  and `apply`. A private layer that is a symlink to a directory is followed
-  instead of failing with `NotDir`.
+- Records of a file the private layer contributes to name the private
+  layer. While such records exist and the layer is absent or holds no file,
+  it is unavailable: apply sweeps nothing and leaves every file the layer
+  contributes to as it is, and `status`, `diff` and `apply --dry-run` say
+  so, warning `private layer <path> is unavailable; nothing is swept and
+  files it contributes to are left as they are`. A private layer that is a
+  symlink to a directory is followed instead of failing with `NotDir`.
 - A record whose live path is now a directory mox never wrote is forgotten
   once, with a note, instead of failing every run.
 

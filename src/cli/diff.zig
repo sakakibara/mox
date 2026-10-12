@@ -265,7 +265,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         refused = true;
     };
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
+    const priv_repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
+    const priv_down = try apply_cmd.privateDown(ctx, ctx.err, priv_repo_tag);
     for (files) |file| {
+        if (priv_down and try apply_cmd.leftForPrivate(ctx, ctx.err, file.live_path, priv_repo_tag)) continue;
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
@@ -297,6 +300,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 continue;
             }) |outputs| {
                 for (outputs) |o| {
+                    if (priv_down and try apply_cmd.leftForPrivate(ctx, ctx.err, o.live_path, priv_repo_tag)) continue;
                     if (o.invalid) |why| {
                         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
                         continue;
@@ -368,7 +372,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // A file whose source left the tree: apply removes it when unedited, so
     // its live content shows on the removed side.
-    if (a.paths.len == 0) {
+    if (a.paths.len == 0 and !priv_down) {
         const stale = mox.apply.stale;
         const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
         const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
@@ -377,9 +381,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         const links = try stale.managedLinks(ctx.alloc, tree.files);
         const jc: mox.apply.removable.Ctx = .{ .home = home, .kept = &inodes, .ruleset = &ruleset, .links = &links };
-        const private_missing = stale.privateMissing(ctx.io, context.paths.private_dir);
         for (cands) |c| {
-            if (c.private and private_missing) continue;
             if (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c)) != .remove) continue;
             if (c.kind == .symlink) {
                 try diffLinkRemoval(ctx, sty, stat_mode, c.live_path, c.target, &total, &changed);

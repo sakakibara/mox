@@ -211,9 +211,7 @@ fn staleRows(
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
     const links = try stale.managedLinks(ctx.alloc, tree.files);
     const jc: mox.apply.removable.Ctx = .{ .home = home, .kept = &inodes, .ruleset = ruleset, .links = &links };
-    const private_missing = stale.privateMissing(ctx.io, context.paths.private_dir);
     for (cands) |c| {
-        if (c.private and private_missing) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         switch (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c))) {
             .kept, .gone, .now_dir, .same_file, .ignored => {},
@@ -332,7 +330,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
-    if (a.paths.len == 0) try apply_cmd.warnPrivateMissing(ctx, rows, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
+    const priv_down = try apply_cmd.privateDown(ctx, rows, repo_tag);
     if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home), tree)) |u|
         try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
@@ -343,6 +342,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // Every row names the file the way a human reads it; the real path is
         // still what the checks below are run against.
         const shown = try display.alloc(ctx.alloc, file.live_path, home);
+        if (priv_down and try apply_cmd.leftForPrivate(ctx, rows, file.live_path, repo_tag)) continue;
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
         if (file.head_error.len > 0) {
@@ -376,6 +376,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 var gen_drifted = false;
                 for (outputs) |o| {
                     const leaf_shown = try display.alloc(ctx.alloc, o.live_path, home);
+                    if (priv_down and try apply_cmd.leftForPrivate(ctx, rows, o.live_path, repo_tag)) continue;
                     if (o.invalid) |why| {
                         tally.add(.err);
                         try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), leaf_shown, why });
@@ -556,7 +557,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     // Files whose source left the tree, as apply's sweeps would judge them.
-    if (a.paths.len == 0) {
+    // An unavailable private layer stops every sweep, so none is previewed.
+    if (a.paths.len == 0 and !priv_down) {
         try staleRows(ctx, tree, &ruleset, rows, &tally, &units);
         try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try untaggedRows(ctx, tree, rows, &scan);

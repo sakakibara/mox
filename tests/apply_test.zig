@@ -8282,3 +8282,90 @@ test "status: a partial target whose live file does not parse gives its location
     const st = try c.run(&.{ "mox", "status" });
     try std.testing.expect(lineHasBoth(st.out, "ERROR    ~/p.toml", "live ~/p.toml:1:5: does not parse as toml"));
 }
+
+const unavailable_warn = "is unavailable; nothing is swept and files it contributes to are left as they are";
+
+test "private layer: an empty one, or a link to an empty folder, sweeps nothing while records name it" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/.keep", "k\n");
+    try put(io, &tmp, "state/private/.netrc", "token\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const netrc = try c.homePath(".netrc");
+
+    // An empty mountpoint.
+    try tmp.dir.rename("state/private", tmp.dir, "vol-p", io);
+    try tmp.dir.createDirPath(io, "state/private");
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, unavailable_warn) != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "STALE") == null);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, unavailable_warn) != null);
+    try std.testing.expectEqualStrings("token\n", try read(io, a, netrc));
+
+    // A link to an empty synced folder.
+    try tmp.dir.deleteDir(io, "state/private");
+    try tmp.dir.createDirPath(io, "vol-empty");
+    try tmp.dir.symLink(io, try tmp.dir.realPathFileAlloc(io, "vol-empty", a), "state/private", .{});
+    _ = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("token\n", try read(io, a, netrc));
+}
+
+test "private layer: while it is absent the exact-dir sweep and the generator prune remove nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/.ssh/.mox-exact", "");
+    try put(io, &tmp, "repo/src/.ssh/config", "Host *\n");
+    try put(io, &tmp, "state/private/.ssh/id_ed25519", "PRIVATE KEY\n");
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"public\"\n");
+    try put(io, &tmp, "state/private/data/ids.toml", "[[ids]]\nslug = \"public\"\n[[ids]]\nslug = \"secrethost\"\n");
+    try put(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try tmp.dir.rename("state/private", tmp.dir, "away", io);
+
+    const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove") == null);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, unavailable_warn) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  removed ") == null);
+    try std.testing.expectEqualStrings("PRIVATE KEY\n", try read(io, a, try c.homePath(".ssh/id_ed25519")));
+    try std.testing.expectEqualStrings("k=secrethost\n", try read(io, a, try c.homePath(".config/Id-secrethost.inc")));
+}
+
+test "private layer: while it is absent a file it contributes to is left as it is, and the warning names it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/shared.json", "{\"a\": 1}\n");
+    try put(io, &tmp, "repo/src/plain.txt", "p\n");
+    try put(io, &tmp, "state/private/shared.json.d/os=" ++ host_os ++ ".json", "{\"b\": 2}\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    const shared = try c.homePath("shared.json");
+    const before = try read(io, a, shared);
+    try std.testing.expect(std.mem.indexOf(u8, before, "\"b\"") != null);
+    try tmp.dir.rename("state/private", tmp.dir, "away", io);
+    try put(io, &tmp, "repo/src/plain.txt", "p2\n");
+
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, unavailable_warn) != null);
+    try std.testing.expect(lineHasBoth(st.out, "~/shared.json", "left as it is"));
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineHasBoth(r.out, "~/shared.json", "left as it is"));
+    try std.testing.expectEqualStrings(before, try read(io, a, shared));
+    try std.testing.expectEqualStrings("p2\n", try read(io, a, try c.homePath("plain.txt")));
+}

@@ -65,9 +65,6 @@ pub const Options = struct {
     kept_inodes: ?*const stale.Kept = null,
     /// Live paths still produced or managed: never removed.
     keep: ?*const std.StringHashMap(void) = null,
-    /// The private layer is absent: a manifest written for a generator only
-    /// it holds is left alone.
-    private_missing: bool = false,
 };
 
 pub const Result = struct {
@@ -268,8 +265,7 @@ pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *co
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
         const r = (try repoOf(arena, bytes)) orelse continue;
-        const layer = applied.layerOf(r, opts.repo) orelse continue;
-        if (layer == .private and opts.private_missing) continue;
+        if (applied.layerOf(r, opts.repo) == null) continue;
         const leaves = try leavesOf(arena, bytes);
         for (leaves) |leaf| if (!parent_link.underHome(leaf, opts.home)) continue :outer;
         const released = if (try generatorOf(arena, bytes)) |g|

@@ -983,11 +983,19 @@ private-only file forgets it here and writes no tombstone, editing the
 private attributes, not the repo's.
 
 The private layer may be a symlink to a directory elsewhere. Every record
-of a private-only file names the private layer, so while the layer is
-absent -- an unmounted volume, a moved directory -- no sweep touches its
-files: `status` and `apply` warn `private layer <path> is missing; its
-files are left in place`, and the next run with the layer back converges
-as usual.
+of a file the private layer contributes to -- its own file, or a repo file
+it adds an overlay, a fragment or loop data to -- names the private layer.
+While records name it and the layer is absent or holds no file (an
+unmounted volume, an empty mountpoint, an unsynced folder), it is
+unavailable: apply sweeps nothing of any kind (stale files, a gone
+generator's files, a generator's dropped files, an exact directory's
+entries) and leaves every file the layer contributes to as it is rather
+than rewrite it without its private part, while repo-only files still
+apply. `status`, `diff` and `apply --dry-run` show the same and preview no
+removal, under one warning: `private layer <path> is unavailable; nothing
+is swept and files it contributes to are left as they are`, with a line
+naming each file left. The next run with the layer back converges as
+usual.
 
 ## Concurrency and snapshots
 
