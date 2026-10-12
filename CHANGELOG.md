@@ -22,9 +22,14 @@ All notable changes to mox are documented here. The format follows
   snapshot-first, an edited one is drift until named (`apply --overwrite
   <path>` removes it, `commit <path>` keeps the edit and forgets the path
   here), and a partially owned one is left in place, no longer managed, its
-  records forgotten. Every record now names
-  the repo and HOME it came from, so one repo's apply, or a run under
+  records forgotten. Every record and generator manifest now names the repo
+  and the HOME it was applied under, so one repo's apply, or a run under
   another HOME sharing the state directory, never touches another's files.
+- `mox status` and `mox diff` show the files of a generator that left the
+  tree, as the orphan sweep would judge them: `STALE` (or `DRIFT` when
+  edited) "its generator left the tree", and an unedited one as a removal
+  in the diff. A `.moxignore`-matched one is left alone by both the sweep
+  and the preview.
 - The private layer reads its own `<state dir>/private/.mox/attributes.toml`
   and joins fact discovery. A private entry may set any key for a
   private-only path, and only `mode` for a path the repo manages, which
@@ -59,7 +64,14 @@ All notable changes to mox are documented here. The format follows
   JSON, so a `"` or `\` in a resolved value no longer breaks the output. A
   quoted single `<data.FILE.KEY>` capture of a number or bool used to give a
   string and now gives the typed value; store a TOML string to keep a
-  string. Captures inside JSONC comments are no longer expanded.
+  string. A typed number is written as JavaScript writes it: shortest
+  round-trip digits, decimal notation for 1e-7 <= |x| < 1e21 and exponent
+  notation otherwise (`1e+300`). A TOML `inf` or `nan`, which JSON cannot
+  hold, is a compose error naming the capture. Text interpolation renders
+  every value as before. Captures inside JSONC comments are no longer
+  expanded.
+- A repeated key in a YAML mapping, which YAML forbids, is refused in any
+  layer or output, as TOML's already is.
 - A generic INI file may hold a bare key everywhere mox reads it.
 - `mox remove` keeps the live file on every machine: it leaves a tombstone,
   `released = true`, in `.mox/attributes.toml`, and a removed generator's
@@ -94,6 +106,11 @@ All notable changes to mox are documented here. The format follows
   there are left in place and forgotten, `remove --purge` of one is
   refused, and `rollback` names an entry it cannot restore through a
   symlink instead of failing with `NotDir`.
+- `rollback` replaces a symlink mox planted at a live path, as before, but
+  refuses one it did not plant, naming the snapshot copy left in place and
+  exiting 1, instead of destroying the user's link with no copy kept.
+- An attributes file that is not valid TOML, the repo's or the private
+  layer's, stops every command with exit 2.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
   run where any file failed to compose or write or carried a head error.
 
