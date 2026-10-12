@@ -320,7 +320,7 @@ fn removeLeaf(
 ) !void {
     if (parent_link.through(io, opts.home, live_path, opts.links)) {
         if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
-        try stdout.print("  {s}: {s}\n", .{ live_path, parent_link.reason });
+        try stdout.print("  {s}: {s}\n", .{ try tilde(arena, opts.home, live_path), parent_link.reason });
         return;
     }
     // Inspect the leaf WITHOUT following a symlink. A leaf that drifted into a
@@ -339,7 +339,7 @@ fn removeLeaf(
         // here), so it is an error, not drift needing a decision.
         .directory => {
             result.error_refused += 1;
-            try stderr.print("  {s}: generated leaf is now a directory, not removing\n", .{live_path});
+            try stderr.print("  {s}: generated leaf is now a directory, not removing\n", .{try tilde(arena, opts.home, live_path)});
             return;
         },
         // mox only ever wrote a regular file as a generated leaf, so a symlink
@@ -349,27 +349,27 @@ fn removeLeaf(
             if (!opts.force) {
                 result.drift_refused += 1;
                 if (!opts.mute_drift_message)
-                    try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --overwrite to prune)\n", .{live_path});
+                    try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --overwrite to prune)\n", .{try tilde(arena, opts.home, live_path)});
                 return;
             }
             if (opts.dry_run) {
                 result.removed += 1;
-                try stdout.print("  would remove {s} (generated, no longer produced)\n", .{live_path});
+                try stdout.print("  would remove {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
                 return;
             }
             snapshot.saveSymlink(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, target) catch |e| {
                 result.error_refused += 1;
-                try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ live_path, @errorName(e) });
+                try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
                 return;
             };
             Io.Dir.cwd().deleteFile(io, live_path) catch |e| {
                 result.error_refused += 1;
-                try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ live_path, @errorName(e) });
+                try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
                 return;
             };
             try forgetRecords(arena, io, opts.state_dir, live_path);
             result.removed += 1;
-            try stdout.print("  removed {s} (generated, no longer produced)\n", .{live_path});
+            try stdout.print("  removed {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
             return;
         },
         // Not a symlink, directory, or absent entry: usually a regular file.
@@ -383,7 +383,7 @@ fn removeLeaf(
         .readable, .absent => {},
         .special => {
             result.error_refused += 1;
-            try stderr.print("  {s}: generated leaf is not a regular file, not removing\n", .{live_path});
+            try stderr.print("  {s}: generated leaf is not a regular file, not removing\n", .{try tilde(arena, opts.home, live_path)});
             return;
         },
     }
@@ -396,7 +396,7 @@ fn removeLeaf(
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             result.error_refused += 1;
-            try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; not removing, cannot read to back up)\n", .{live_path});
+            try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; not removing, cannot read to back up)\n", .{try tilde(arena, opts.home, live_path)});
             return;
         },
     };
@@ -408,12 +408,12 @@ fn removeLeaf(
     if (!clean and !opts.force) {
         result.drift_refused += 1;
         if (!opts.mute_drift_message)
-            try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --overwrite to prune)\n", .{live_path});
+            try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --overwrite to prune)\n", .{try tilde(arena, opts.home, live_path)});
         return;
     }
     if (opts.dry_run) {
         result.removed += 1;
-        try stdout.print("  would remove {s} (generated, no longer produced)\n", .{live_path});
+        try stdout.print("  would remove {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
         return;
     }
 
@@ -422,17 +422,23 @@ fn removeLeaf(
     const snap_content = try redactedContent(arena, io, opts.state_dir, live_path, content);
     snapshot.save(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, snap_content) catch |e| {
         result.error_refused += 1;
-        try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ live_path, @errorName(e) });
+        try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
         return;
     };
     Io.Dir.cwd().deleteFile(io, live_path) catch |e| {
         result.error_refused += 1;
-        try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ live_path, @errorName(e) });
+        try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
         return;
     };
     try forgetRecords(arena, io, opts.state_dir, live_path);
     result.removed += 1;
-    try stdout.print("  removed {s} (generated, no longer produced)\n", .{live_path});
+    try stdout.print("  removed {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
+}
+
+/// `path` as reports name it, a leading HOME written `~`.
+fn tilde(arena: std.mem.Allocator, home: []const u8, path: []const u8) ![]const u8 {
+    if (!parent_link.underHome(path, home)) return path;
+    return std.fmt.allocPrint(arena, "~{s}", .{path[home.len..]});
 }
 
 /// Clear every last-applied + provenance record for a pruned leaf.

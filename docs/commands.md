@@ -714,8 +714,14 @@ generator that left the tree; a file that
 does not parse in its format is an `ERROR` line on stderr, as apply
 reports it. Read-only and takes no lock. A difference is not
 an error, so a run that completes exits 0 whether or not anything
-differs; a refusal -- a path that is not managed, a malformed ownership
-declaration or `attributes.toml` -- exits 1.
+differs. A refusal exits 1: a path that is not managed, a malformed
+ownership declaration in a head, an `attributes.toml` (the repo's or the
+private layer's, which exits 2) that is not valid TOML, and an
+attributes entry that breaks the schema, with or without a source. A
+file's own `ERROR` that does not come from an attributes file -- a
+head directive on an unstructured target, one spelled with the wrong
+comment marker, a mox directive in strict JSON, or a layer or output that
+does not parse -- is reported and the run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |

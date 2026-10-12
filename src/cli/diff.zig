@@ -623,7 +623,7 @@ pub const command = app.command(Spec, .{
     .name = "diff",
     .usage = "mox diff [--flags] [<paths...>]",
     .summary = "Show a unified diff of composed output vs each live file",
-    .details = "Read-only and takes no lock. A difference is not an error: exit 0 whether or not anything differs, 1 on a refusal -- a path that is not managed, a malformed ownership declaration or attributes.toml.",
+    .details = "Read-only and takes no lock. A difference is not an error: exit 0 whether or not anything differs. Exit 1 on a refusal: a path that is not managed, a malformed head ownership declaration, an attributes.toml that is not valid TOML, or an attributes entry that breaks the schema. A file's own ERROR from its head, its layers or its output exits 0.",
     .group = .general,
     .needs_context = true,
 }, run);

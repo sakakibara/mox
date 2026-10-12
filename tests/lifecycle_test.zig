@@ -5403,6 +5403,9 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
     try Io.Dir.cwd().deleteFile(io, try h.srcOf(".edited"));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".edited"), .data = "mine, edited\n" });
 
+    const bad = try h.run(&.{ "mox", "commit", "~/.edited", "~/.nowhere" });
+    try std.testing.expectEqual(@as(u8, 1), bad.rc);
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 0), dry.rc);
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
@@ -6116,6 +6119,7 @@ test "apply: leaves of a generator that left the tree, or no longer produced, co
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
     const pruned = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, pruned.out, ", 1 removed,") != null);
+    if (builtin.os.tag != .windows) try std.testing.expect(std.mem.indexOf(u8, pruned.out, "removed ~/.config/id-b.inc (generated, no longer produced)") != null);
     try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
     const orphan = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, orphan.out, ", 1 removed,") != null);
