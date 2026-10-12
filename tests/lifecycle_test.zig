@@ -7002,3 +7002,30 @@ test "rollback: a link already as the snapshot has it is not counted as restored
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expect(std.mem.indexOf(u8, rb.out, "Restored 0 file(s)") != null);
 }
+
+test "exact dir: --overwrite of a foreign directory keeps its links and empty directories for rollback" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.cfg/.mox-exact", "");
+    try writeRepo(io, &tmp, "repo/src/.cfg/a", "a\n");
+    const real = try std.fs.path.join(a, &.{ h.root, "real" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = real, .data = "user data\n" });
+    try Io.Dir.cwd().createDirPath(io, try h.liveOf(".cfg/foreign/sub"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg/foreign/file"), .data = "f\n" });
+    try Io.Dir.cwd().symLink(io, real, try h.liveOf(".cfg/foreign/link"), .{});
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try h.liveOf(".cfg/foreign"), .{}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "rollback" })).rc);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try Io.Dir.cwd().readLink(io, try h.liveOf(".cfg/foreign/link"), &buf);
+    try std.testing.expectEqualStrings(real, buf[0..n]);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, try h.liveOf(".cfg/foreign/sub"), .{})).kind == .directory);
+    try std.testing.expectEqualStrings("f\n", try read(io, a, try h.liveOf(".cfg/foreign/file")));
+}

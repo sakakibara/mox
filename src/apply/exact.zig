@@ -225,15 +225,17 @@ fn sweepDir(
         try stdout.print("  would remove {s}/ (unmanaged, exact dir)\n", .{live_path});
         return;
     }
-    // Every descendant must be snapshotted before the tree is removed. If any
-    // entry could not be (unreadable, un-openable subdir, save failure, or
-    // past the depth cap), refuse the delete: removing it would destroy data
-    // with no recoverable copy.
-    if (!try snapshotTree(arena, io, live_path, opts, 0)) {
-        result.error_refused += 1;
-        try stderr.print("  UNSNAPSHOTTABLE {s}/ (exact dir; not removing, would lose unsaved data)\n", .{live_path});
-        return;
-    }
+    // The whole tree -- files, links, and every directory with its mode --
+    // is snapshotted before it is removed. If any entry cannot be, refuse the
+    // delete: removing it would destroy data with no recoverable copy.
+    snapshot.saveTree(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            result.error_refused += 1;
+            try stderr.print("  UNSNAPSHOTTABLE {s}/ (exact dir; not removing, would lose unsaved data)\n", .{live_path});
+            return;
+        },
+    };
     try report(liveRemove(arena, io, opts, live_path, .taken_tree, null), live_path, "/", stdout, stderr, result);
 }
 
@@ -280,38 +282,6 @@ fn subtreeHasIgnored(arena: std.mem.Allocator, io: Io, dir_live: []const u8, hom
         if (e.kind == .directory and try subtreeHasIgnored(arena, io, child, home, ruleset, depth + 1)) return true;
     }
     return false;
-}
-
-/// Snapshot every file under `dir_live`. Returns true only when the whole
-/// subtree was captured: any unreadable file, un-openable subdir, failed save,
-/// or exceeding the depth cap yields false so the caller refuses the delete.
-/// Symlinks and special files carry no recoverable content (matching the
-/// top-level `sweepOther` stance) and do not block the delete.
-fn snapshotTree(arena: std.mem.Allocator, io: Io, dir_live: []const u8, opts: Options, depth: usize) !bool {
-    if (depth >= max_depth) return false;
-    var dir = Io.Dir.cwd().openDir(io, dir_live, .{ .iterate = true, .follow_symlinks = false }) catch return false;
-    defer dir.close(io);
-
-    var complete = true;
-    for (try dirent.sorted(arena, io, dir)) |e| {
-        const child = try std.fs.path.join(arena, &.{ dir_live, e.name });
-        switch (e.kind) {
-            .file => {
-                const content = Io.Dir.cwd().readFileAlloc(io, child, arena, .limited(64 * 1024 * 1024)) catch {
-                    complete = false;
-                    continue;
-                };
-                snapshot.save(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, child, content) catch {
-                    complete = false;
-                };
-            },
-            .directory => {
-                if (!try snapshotTree(arena, io, child, opts, depth + 1)) complete = false;
-            },
-            else => {},
-        }
-    }
-    return complete;
 }
 
 test "enforce: an unreadable file is refused, never deleted with an empty snapshot" {
