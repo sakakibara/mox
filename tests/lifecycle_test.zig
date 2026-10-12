@@ -6455,3 +6455,79 @@ test "facts: an unconsumed default from a strict-JSON target's attributes names 
     try std.testing.expect(std.mem.indexOf(u8, r.err, "`defaults = { lonely = ... }` in the .mox/attributes.toml entry for") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "# mox: default lonely") == null);
 }
+
+test "rollback: a partial target since turned into a managed symlink is never patched through the link" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/c.yaml", "# mox: own a\na: 1\n");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("c.yaml"), .data = "a: 0\nb: keep\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+
+    const outside = try std.fs.path.join(a, &.{ h.root, "outside.yaml" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = outside, .data = "a: 9\n" });
+    try writeRepo(io, &tmp, "repo/src/c.yaml", outside);
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"c.yaml\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expect((try mox.apply.applied.readOwned(a, io, h.state, try h.liveOf("c.yaml"))) == null);
+
+    _ = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqualStrings("a: 9\n", try read(io, a, outside));
+}
+
+test "apply: a managed symlink turned partial replaces its own link, leaving the file it pointed at alone" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const inrepo = try std.fs.path.join(a, &.{ h.repo, "shared", "c.toml" });
+    try writeRepo(io, &tmp, "repo/shared/c.toml", "a = 0\nb = \"keep\"\n");
+    try writeRepo(io, &tmp, "repo/src/c.toml", inrepo);
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"c.toml\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    try writeRepo(io, &tmp, "repo/src/c.toml", "# mox: own a\na = 1\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "");
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("a = 0\nb = \"keep\"\n", try read(io, a, inrepo));
+    const st = try Io.Dir.cwd().statFile(io, try h.liveOf("c.toml"), .{ .follow_symlinks = false });
+    try std.testing.expect(st.kind == .file);
+    try std.testing.expectEqualStrings("a = 1\n", try read(io, a, try h.liveOf("c.toml")));
+}
+
+test "apply partial: a user's symlink is patched through and rolled back through the same link" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\na = 1\n");
+    const target = try h.liveOf("real-app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = target, .data = "a = 1\nb = \"prog\"\n" });
+    try Io.Dir.cwd().symLink(io, "real-app.toml", try h.liveOf("app.toml"), .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\na = 2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("a = 2\nb = \"prog\"\n", try read(io, a, target));
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    try std.testing.expectEqualStrings("a = 1\nb = \"prog\"\n", try read(io, a, target));
+    const st = try Io.Dir.cwd().statFile(io, try h.liveOf("app.toml"), .{ .follow_symlinks = false });
+    try std.testing.expect(st.kind == .sym_link);
+}

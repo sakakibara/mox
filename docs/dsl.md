@@ -736,6 +736,12 @@ A change to the declared list is first contact for the affected content: an
 adopted when it already matches the source, and reported as drift otherwise;
 a `disown` path you add simply stops being compared.
 
+When a target changes kind -- partial to symlink, whole file to symlink,
+and back -- apply drops the records of the old kind. A target that was a
+symlink mox planted and is now a file has that link replaced by a regular
+file first, so the file the old link pointed at is never written; a link
+the user made at a partially owned target is patched through.
+
 A partially owned target's live file is read in the target's format and
 dialect: a live file that does not parse is refused, since mox cannot patch
 what it cannot preserve, with its location and a hint (`live ~/x.json:3:9:

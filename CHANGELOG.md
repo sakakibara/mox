@@ -106,6 +106,9 @@ All notable changes to mox are documented here. The format follows
   there are left in place and forgotten, `remove --purge` of one is
   refused, and `rollback` names an entry it cannot restore through a
   symlink instead of failing with `NotDir`.
+- A target that changes kind drops the records of its old kind, and a
+  symlink mox planted is replaced by a regular file before the target is
+  written as a file, so the file the old link pointed at is never written.
 - `rollback` replaces a symlink mox planted at a live path, as before, but
   refuses one it did not plant, naming the snapshot copy left in place and
   exiting 1, instead of destroying the user's link with no copy kept.

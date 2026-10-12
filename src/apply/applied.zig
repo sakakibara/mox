@@ -162,6 +162,10 @@ pub fn record(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path
     const hash = contentHashHex(content);
     const body = try std.fmt.allocPrint(arena, "{s} {s}\nrepo {s}\n", .{ &hash, live_path, try pctEncode(arena, repo) });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rec_path, .data = body });
+    // One record family per path: a whole file is no longer a link or a
+    // partial target.
+    Io.Dir.cwd().deleteFile(io, try symlinkPath(arena, state_dir, live_path)) catch {};
+    Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
 }
 
 fn recordPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const u8) ![]u8 {
@@ -229,6 +233,10 @@ const owned_version: i128 = 1;
 /// Record the owned state mox just asserted at `live_path`, under
 /// `<state>/applied-owned/`.
 pub fn recordOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, rec: OwnedRecord) !void {
+    // One record family per path: a partial target is no longer a link or
+    // a whole file.
+    Io.Dir.cwd().deleteFile(io, try symlinkPath(arena, state_dir, live_path)) catch {};
+    try forgetWholeFile(arena, io, state_dir, live_path);
     const path = try ownedPath(arena, state_dir, live_path);
     if (std.fs.path.dirname(path)) |parent| {
         try Io.Dir.cwd().createDirPath(io, parent);
@@ -343,6 +351,11 @@ pub fn recordSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, li
         try pctEncode(arena, target), try pctEncode(arena, live_path), try pctEncode(arena, repo),
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+    // One record family per path: a link is no longer a whole file or a
+    // partial target, so nothing later patches through it.
+    Io.Dir.cwd().deleteFile(io, try recordPath(arena, state_dir, live_path)) catch {};
+    Io.Dir.cwd().deleteFile(io, try contentPath(arena, state_dir, live_path)) catch {};
+    Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
 }
 
 /// A parsed symlink record. An untagged record is the bare target alone:
@@ -533,6 +546,32 @@ test "recordOwned then readOwned round-trips a cleartext record, forget removes 
 
     try forget(a, io, state_dir, "/home/me/.codex/config.toml");
     try std.testing.expect(try readOwned(a, io, state_dir, "/home/me/.codex/config.toml") == null);
+}
+
+test "one record family per path: each record drops the others" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_dir = try stateDirAbs(a, io, &tmp.sub_path);
+    const p = "/home/me/c.toml";
+    const owned: OwnedRecord = .{ .canonical = "= a\n", .canonical_hash = null, .secret = false, .own_paths = &.{"a"}, .secret_paths = &.{} };
+
+    try record(a, io, state_dir, p, "a = 1\n", "r");
+    try recordContent(a, io, state_dir, p, "a = 1\n");
+    try recordOwned(a, io, state_dir, p, owned);
+    try std.testing.expect(try read(a, io, state_dir, p) == null);
+    try std.testing.expect(try readContent(a, io, state_dir, p) == null);
+
+    try recordSymlink(a, io, state_dir, p, "/t", "r");
+    try std.testing.expect(try readOwned(a, io, state_dir, p) == null);
+    try recordOwned(a, io, state_dir, p, owned);
+    try std.testing.expect(try readSymlink(a, io, state_dir, p) == null);
+    try recordSymlink(a, io, state_dir, p, "/t", "r");
+    try record(a, io, state_dir, p, "a = 1\n", "r");
+    try std.testing.expect(try readSymlink(a, io, state_dir, p) == null);
 }
 
 test "recordOwned: a secret-bearing record stores the hash and never the canonical text" {

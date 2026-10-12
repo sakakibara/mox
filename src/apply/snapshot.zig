@@ -436,7 +436,14 @@ fn restoreDir(
             },
             .file => {
                 const target = try source_path.joinKeyOnto(arena, home, rel);
-                if (try entryRefusal(arena, io, home, target, state_dir)) |why| {
+                // A withheld partial target is re-patched by the caller, through
+                // a link the user made; only a symlinked parent stops it here.
+                const withheld = skip != null and skip.?.contains(target);
+                const why_opt: ?Refused.Why = if (withheld)
+                    (if (parent_link.through(io, home, target, null)) Refused.Why.parent_link else null)
+                else
+                    try entryRefusal(arena, io, home, target, state_dir);
+                if (why_opt) |why| {
                     try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
                     continue;
                 }

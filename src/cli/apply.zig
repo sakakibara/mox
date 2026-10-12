@@ -618,6 +618,7 @@ fn applyPass(
                 counts.ok += 1;
                 try ctx.out.print("  symlinked {s} -> {s}\n", .{ shown, target });
             } else if (file.own_paths.len > 0) {
+                if (!dry_run) try dropPlantedLink(ctx, file.live_path, snap_id, &snapshotted);
                 try applyPartialFile(ctx, .{
                     .file = file,
                     .bytes = bytes,
@@ -634,6 +635,7 @@ fn applyPass(
                     .repo = repo_tag,
                 }, &counts, &snapshotted);
             } else {
+                if (!dry_run) try dropPlantedLink(ctx, file.live_path, snap_id, &snapshotted);
                 try applyRegularFile(ctx, .{
                     .repo = repo_tag,
                     .live_path = file.live_path,
@@ -1969,6 +1971,24 @@ pub fn mergePrivate(ctx: *app.Ctx, cmd: []const u8, base_tree: mox.source.tree.M
         },
         else => return e,
     };
+}
+
+/// Remove the symlink mox planted at `live_path` (its target is the one the
+/// symlink record holds) when the target is now a file: snapshot the link,
+/// unlink it and drop its record, so the new kind is written as a regular
+/// file and never through the old link into the file it pointed at. A link
+/// the user made is left for the write to patch through.
+fn dropPlantedLink(ctx: *app.Ctx, live_path: []const u8, snap_id: []const u8, snapshotted: *bool) !void {
+    const context = ctx.context.?;
+    const recorded = (try mox.apply.applied.readSymlink(ctx.alloc, ctx.io, context.paths.state_dir, live_path)) orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.cwd().readLink(ctx.io, live_path, &buf) catch return;
+    if (!mox.apply.applied.sameSymlinkTarget(buf[0..n], recorded)) return;
+    try mox.apply.snapshot.saveSymlink(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, live_path, buf[0..n]);
+    snapshotted.* = true;
+    try std.Io.Dir.cwd().deleteFile(ctx.io, live_path);
+    try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    try ctx.out.print("  unlinked {f} (the symlink mox planted there; it is a file now)\n", .{display.of(live_path, context.paths.home)});
 }
 
 /// One tombstone this machine cannot match, as status and apply print it.
