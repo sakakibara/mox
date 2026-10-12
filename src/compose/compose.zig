@@ -52,6 +52,13 @@ pub fn composeFileTracked(
     prov: ?*std.ArrayList(Segment),
     diag: ?*interp.Diag,
 ) !?[]u8 {
+    // A symlink source holds its link target: text, never a document of its
+    // key's format.
+    if (file.is_symlink and file.format != null) {
+        var as_text = file;
+        as_text.format = null;
+        return composeFileTracked(arena, io, as_text, bindings, machine_state_opt, secrets, prov, diag);
+    }
     const cat = (try categoryOf(arena, io, file)) orelse return null;
 
     switch (cat) {

@@ -807,6 +807,11 @@ permits duplicate keys, and what they mean is the program's call. TOML and
 YAML require a mapping's keys to be unique, so a repeated key is refused in
 any layer or output of those formats.
 
+Only a source whose bytes compose into the target in its format is checked:
+a symlink source holds a link target and a generator template holds a loop,
+so neither is parsed as its key's format. A strict-JSON key's generator
+template spells its loop with `//` lines.
+
 A layer of a merge is read before captures expand, so a bare capture in a
 merged TOML or YAML layer is reported at its line and column with a hint to
 put it inside a string. `mox commit` reports a layer or live file that does

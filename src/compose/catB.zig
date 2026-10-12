@@ -535,7 +535,7 @@ pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const marker = file.marker(base_content) orelse return null;
+    const marker = file.generatorMarker(base_content) orelse return null;
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;
     return wholeFileGateExpr(base_content, parsed);
 }
@@ -609,7 +609,7 @@ pub fn composeGenerator(
     if (!file.has_base or file.source_base_abs.len == 0) return null;
 
     const base_content = try Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes));
-    const marker = file.marker(base_content) orelse return null;
+    const marker = file.generatorMarker(base_content) orelse return null;
     // A parse error here is not a generator decision: let the normal compose
     // path re-parse and report it with a source location.
     const parsed = dsl.driver.parseFile(arena, base_content, marker, null) catch return null;

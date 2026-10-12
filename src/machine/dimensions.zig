@@ -1130,7 +1130,7 @@ const Discoverer = struct {
         if (!file.has_base or file.source_base_abs.len == 0) return;
 
         const raw = Io.Dir.cwd().readFileAlloc(self.io, file.source_base_abs, self.arena, .limited(max_file_bytes)) catch return;
-        const marker = file.marker(raw) orelse {
+        const marker = file.generatorMarker(raw) orelse {
             // Mirrors compose's own null-marker passthrough (`compose.catB.
             // composeTrackedContent`): with no marker at all, no directive
             // can exist in this file either, but compose still interpolates

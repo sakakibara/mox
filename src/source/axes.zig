@@ -337,7 +337,7 @@ fn scanFile(ax: *Axes, arena: std.mem.Allocator, io: Io, file: source.tree.Manag
     }
     if (file.has_base and file.source_base_abs.len > 0) {
         const raw = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_bytes)) catch return;
-        const marker = file.marker(raw) orelse return;
+        const marker = file.generatorMarker(raw) orelse return;
         // A head declaration (`own`/`disown`/`check`) is not DSL syntax --
         // the walk and real compose both strip it before parsing (`compose.
         // catA.readBaseHead`) -- so it must be stripped here too, or a file

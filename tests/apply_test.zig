@@ -7828,3 +7828,40 @@ test "capture: text interpolation renders every data type exactly as before type
     // A typed JSON number follows JavaScript's Number-to-string rule.
     try std.testing.expectEqualStrings("{\"f1\": 0.0001, \"f2\": 100000, \"f3\": 1e+300, \"f4\": 0, \"f6\": 3, \"f7\": 1e-7, \"f8\": 123456789.125, \"i\": 42}\n", try read(io, a, try c.homePath("num.json")));
 }
+
+test "validation: a symlink source or a generator template is never parsed as its key's format" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var attrs: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ "c.json", "c.jsonc", "c.toml" }) |name| {
+        try put(io, &tmp, try std.fmt.allocPrint(a, "repo/src/{s}", .{name}), "/etc/hosts");
+        try attrs.print(a, "[\"{s}\"]\nsymlink = true\n\n", .{name});
+    }
+    try put(io, &tmp, "repo/.mox/attributes.toml", attrs.items);
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{\"id\": \"<id.slug>\"}\n// mox: end\n");
+    try put(io, &tmp, "repo/src/g.jsonc", "// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.jsonc\"\n{\"id\": \"<id.slug>\"}\n// mox: end\n");
+    try put(io, &tmp, "repo/src/g.toml", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.toml\"\nid = \"<id.slug>\"\n# mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    if (r.rc != 0) {
+        std.debug.print("{s}\n{s}\n", .{ r.out, r.err });
+        return error.Refused;
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "c.json", "c.jsonc", "c.toml" }) |name| {
+        try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try c.homePath(name), &buf)]);
+    }
+    try std.testing.expectEqualStrings("{\"id\": \"a\"}\n", try read(io, a, try c.homePath("id-a.json")));
+    try std.testing.expectEqualStrings("id = \"a\"\n", try read(io, a, try c.homePath("id-a.toml")));
+    for ([_][]const u8{ "status", "diff" }) |cmd| {
+        const s = try c.run(&.{ "mox", cmd });
+        try std.testing.expect(std.mem.indexOf(u8, s.out, "ERROR") == null and std.mem.indexOf(u8, s.err, "ERROR") == null);
+    }
+}

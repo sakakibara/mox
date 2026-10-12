@@ -3867,7 +3867,7 @@ fn addDirectiveTexts(arena: std.mem.Allocator, io: Io, m: *AcceptedTexts, file: 
     const path = try m.ids.canonical(file.source_base_abs);
     try addAccepted(arena, m, path, .{ .text = template, .directive = true });
     const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch return;
-    const marker = file.marker(content) orelse return;
+    const marker = file.generatorMarker(content) orelse return;
     const events = mox.dsl.scanner.scan(arena, content, marker) catch |e| switch (e) {
         error.OutOfMemory => return e,
         // Too long to be a directive the parser accepts: every token counts.
@@ -6784,7 +6784,7 @@ fn realignScope(cc: *const ClassCtx, lf: *LoopFile) !bool {
             return true;
         },
     };
-    const marker = file.marker(content) orelse return false;
+    const marker = file.generatorMarker(content) orelse return false;
     const events = mox.dsl.scanner.scan(cc.arena, content, marker) catch |e| switch (e) {
         error.OutOfMemory => return e,
         // Too long to be a directive the parser accepts, loop or not.

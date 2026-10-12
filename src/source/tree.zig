@@ -215,6 +215,14 @@ pub const ManagedFile = struct {
         return dsl.comment.markerForFile(self.source_base_path, content);
     }
 
+    /// The marker a generator template or loop in this file is spelled
+    /// with: a strict-JSON key's template is no JSON document, so its loop
+    /// lines are `//` comments.
+    pub fn generatorMarker(self: ManagedFile, content: []const u8) ?[]const u8 {
+        if (self.format == .json) return "//";
+        return self.marker(content);
+    }
+
     /// Absolute path of the TOML data source a `# mox: for` in this file
     /// names: a `/`-bearing key is repo-relative, with the private layer
     /// shadowing the repo; a bare name is this file's own `<base>.d/<name>`.
