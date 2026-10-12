@@ -83,7 +83,20 @@ pub fn checkOutput(
     has_secret: bool,
     diag: ?*interp.Diag,
 ) Error!void {
-    const f = (try firstFailure(arena, format, bytes, "", "")) orelse return;
+    return checkOutputFor(arena, format, bytes, layers, has_secret, "", diag);
+}
+
+/// `checkOutput` for the target `key`, which a hint names.
+pub fn checkOutputFor(
+    arena: std.mem.Allocator,
+    format: Format,
+    bytes: []const u8,
+    layers: []const []const u8,
+    has_secret: bool,
+    key: []const u8,
+    diag: ?*interp.Diag,
+) Error!void {
+    const f = (try firstFailure(arena, format, bytes, "", key)) orelse return;
     const loc = try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ f.line, try layerList(arena, layers) });
     return report(arena, diag, loc, try reason(arena, format, f, has_secret), shownHint(f, has_secret));
 }
@@ -354,7 +367,7 @@ fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, displ
             const lc = lineCol(text, start);
             var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message, .err = e };
             if (at == '/' and format == .json) {
-                f.hint = comment_hint;
+                f.hint = if (key.len > 0) try std.fmt.allocPrint(arena, "remove the comment, or set format = \"jsonc\" for [{s}] in .mox/attributes.toml if the program reads comments", .{try quoteKey(arena, key)}) else comment_hint;
             } else if (trailing) {
                 f.hint = trailing_comma_hint;
             } else if (at == '<') {

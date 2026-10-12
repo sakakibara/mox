@@ -8543,3 +8543,19 @@ test "generator: with a key capture, only a duplicate the capture made is refuse
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings("{\"y\": 1, \"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("g-a.json")));
 }
+
+test "generator: each file is checked in the format its own path names, its jsonc attribute honoured" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n[[ids]]\nslug = \"b\"\n");
+    try put(io, &tmp, "repo/src/.config/g.jsonc", "// mox: for id in \"data/ids.toml\" into \"x-<id.slug>.json\"\n{\"k\": \"<id.slug>\" /* note */}\n// mox: end\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\".config/x-b.json\"]\nformat = \"jsonc\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/x-a.json", "set format = \"jsonc\" for [\".config/x-a.json\"] in .mox/attributes.toml"));
+    try std.testing.expectEqualStrings("{\"k\": \"b\" /* note */}\n", try read(io, a, try c.homePath(".config/x-b.json")));
+}
