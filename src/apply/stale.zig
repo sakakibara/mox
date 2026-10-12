@@ -14,6 +14,7 @@ const write = @import("write.zig");
 const dirent = @import("../source/dirent.zig");
 const tree_mod = @import("../source/tree.zig");
 const parent_link = @import("parent_link.zig");
+const identity = @import("identity.zig");
 const generated = @import("generated.zig");
 
 const Io = std.Io;
@@ -34,6 +35,11 @@ pub const Candidate = struct {
     hash: [applied.hash_hex_len]u8 = undefined,
     /// The target a symlink record holds.
     target: []const u8 = "",
+    /// A symlink record of a link rollback put back: drift, never removed
+    /// without `--overwrite`.
+    rolled_back: bool = false,
+    /// Written for a file only the private layer holds.
+    private: bool = false,
 };
 
 /// Every stale record of `repo` under `home`, one per live path, sorted by
@@ -56,7 +62,7 @@ pub fn find(
         if (!tagged(rec.repo, repo) or !parent_link.underHome(rec.live_path, home)) continue;
         if (keep.contains(rec.live_path) or seen.contains(rec.live_path)) continue;
         try seen.put(rec.live_path, {});
-        try out.append(arena, .{ .live_path = rec.live_path, .kind = .owned });
+        try out.append(arena, .{ .live_path = rec.live_path, .kind = .owned, .private = isPrivate(rec.repo, repo) });
     }
     for (try recordBytes(arena, io, state_dir, "applied-symlink", 1024 * 1024)) |bytes| {
         const rec = try applied.parseSymlink(arena, bytes);
@@ -64,7 +70,7 @@ pub fn find(
         if (!tagged(rec.repo, repo) or !parent_link.underHome(live, home)) continue;
         if (keep.contains(live) or seen.contains(live)) continue;
         try seen.put(live, {});
-        try out.append(arena, .{ .live_path = live, .kind = .symlink, .target = rec.target });
+        try out.append(arena, .{ .live_path = live, .kind = .symlink, .target = rec.target, .rolled_back = rec.rolled_back, .private = isPrivate(rec.repo, repo) });
     }
     for (try recordBytes(arena, io, state_dir, "applied", 1024 * 1024)) |bytes| {
         const rec = (try applied.parseWhole(arena, bytes)) orelse continue;
@@ -75,16 +81,33 @@ pub fn find(
         if (seen.contains(rec.live_path)) {
             for (out.items) |*c| {
                 if (c.kind == .symlink and std.mem.eql(u8, c.live_path, rec.live_path) and !isSymlink(io, c.live_path)) {
-                    c.* = .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash };
+                    c.* = .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash, .private = isPrivate(rec.repo, repo) };
                 }
             }
             continue;
         }
         try seen.put(rec.live_path, {});
-        try out.append(arena, .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash });
+        try out.append(arena, .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash, .private = isPrivate(rec.repo, repo) });
     }
     std.mem.sort(Candidate, out.items, {}, lessByPath);
     return out.toOwnedSlice(arena);
+}
+
+/// True when the private layer at `private_dir` is absent.
+pub fn privateMissing(io: Io, private_dir: []const u8) bool {
+    Io.Dir.cwd().access(io, private_dir, .{}) catch |e| return e == error.FileNotFound or e == error.NotDir;
+    return false;
+}
+
+/// True when any record or generator manifest of `repo` under `home` was
+/// written for a file only the private layer holds.
+pub fn privateRecords(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, home: []const u8) !bool {
+    var none = std.StringHashMap(void).init(arena);
+    for (try find(arena, io, state_dir, repo, home, &none)) |c| if (c.private) return true;
+    for (try recordBytes(arena, io, state_dir, "generated", 64 * 1024 * 1024)) |bytes| {
+        if (applied.layerOf(try generated.repoOf(arena, bytes), repo) == .private) return true;
+    }
+    return false;
 }
 
 /// The stale records of `repo` under `home` against the whole tree `tree`:
@@ -185,8 +208,11 @@ fn isSymlink(io: Io, path: []const u8) bool {
 }
 
 fn tagged(rec_repo: ?[]const u8, repo: []const u8) bool {
-    const r = rec_repo orelse return false;
-    return std.mem.eql(u8, r, repo);
+    return applied.layerOf(rec_repo, repo) != null;
+}
+
+fn isPrivate(rec_repo: ?[]const u8, repo: []const u8) bool {
+    return applied.layerOf(rec_repo, repo) == .private;
 }
 
 fn lessByPath(_: void, a: Candidate, b: Candidate) bool {
@@ -206,26 +232,6 @@ fn recordBytes(arena: std.mem.Allocator, io: Io, state_dir: []const u8, family: 
     return out.toOwnedSlice(arena);
 }
 
-/// What the sweep does with one candidate.
-pub const Verdict = enum {
-    /// Nothing is there any more: forget the records.
-    gone,
-    /// The same file as a path the tree manages (a case-only rename on a
-    /// case-insensitive filesystem, or a hardlink): forget, remove nothing.
-    same_file,
-    /// Unedited since mox wrote it: remove it, snapshot first.
-    remove,
-    /// Edited since mox wrote it: drift, kept.
-    drift,
-    /// A partially owned file: left in place, its records forgotten.
-    leave,
-    /// Not a regular file or symlink mox could have left: refused.
-    special,
-    /// A directory above it is a symlink, so the path names a file outside
-    /// HOME's own tree: left in place, its records forgotten.
-    linked_parent,
-};
-
 /// The live paths `files` plants as symlinks.
 pub fn managedLinks(arena: std.mem.Allocator, files: []const tree_mod.ManagedFile) !std.StringHashMap(void) {
     var out = std.StringHashMap(void).init(arena);
@@ -233,60 +239,25 @@ pub fn managedLinks(arena: std.mem.Allocator, files: []const tree_mod.ManagedFil
     return out;
 }
 
-/// Judge `c` against the live tree. `tree_inodes` holds the inode of every
-/// live path the tree manages that exists; `links` the live paths it plants
-/// as symlinks.
-pub fn judge(
-    arena: std.mem.Allocator,
-    io: Io,
-    c: Candidate,
-    tree_inodes: *const std.AutoHashMap(u128, void),
-    home: []const u8,
-    links: *const std.StringHashMap(void),
-) !Verdict {
-    if (parent_link.through(io, home, c.live_path, links)) return .linked_parent;
-    const st = Io.Dir.cwd().statFile(io, c.live_path, .{ .follow_symlinks = false }) catch |e| switch (e) {
-        error.FileNotFound, error.NotDir => return .gone,
-        else => return .special,
-    };
-    if (inodeIn(st.inode, tree_inodes)) return .same_file;
-    switch (c.kind) {
-        .owned => return .leave,
-        .symlink => {
-            if (st.kind != .sym_link) return .drift;
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const n = Io.Dir.cwd().readLink(io, c.live_path, &buf) catch return .special;
-            return if (applied.sameSymlinkTarget(buf[0..n], c.target)) .remove else .drift;
-        },
-        .whole => {
-            if (st.kind == .sym_link or st.kind == .directory) return .drift;
-            if (write.guardLiveRead(io, c.live_path) == .special) return .special;
-            const live = Io.Dir.cwd().readFileAlloc(io, c.live_path, arena, .limited(64 * 1024 * 1024)) catch return .special;
-            const h = applied.contentHashHex(live);
-            return if (std.mem.eql(u8, &h, &c.hash)) .remove else .drift;
-        },
-    }
+/// The identities of kept paths: device and inode, so two files on
+/// different devices that share an inode number are never one file.
+pub const Kept = std.AutoHashMap(identity.Identity, void);
+
+/// True when `path` is the same file as one `kept` holds: a case-only
+/// rename on a case-insensitive filesystem, or a hardlink. Both sweeps then
+/// forget the record and remove nothing.
+pub fn sameFile(io: Io, path: []const u8, kept: *const Kept) bool {
+    const id = identity.of(io, path, .no_follow) orelse return false;
+    return kept.contains(id);
 }
 
-/// True when `path` is the same file as one whose inode `kept` holds: a
-/// case-only rename on a case-insensitive filesystem, or a hardlink. Both
-/// sweeps then forget the record and remove nothing.
-pub fn sameFile(io: Io, path: []const u8, kept: *const std.AutoHashMap(u128, void)) bool {
-    const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
-    return inodeIn(st.inode, kept);
-}
-
-fn inodeIn(inode: anytype, kept: *const std.AutoHashMap(u128, void)) bool {
-    return kept.contains(@intCast(inode));
-}
-
-/// The inode of every path in `paths` that exists, read without following
-/// a symlink, so a dangling link still stats.
-pub fn inodesOf(arena: std.mem.Allocator, io: Io, paths: []const []const u8) !std.AutoHashMap(u128, void) {
-    var out = std.AutoHashMap(u128, void).init(arena);
+/// The identity of every path in `paths` that exists, read without
+/// following a symlink, so a dangling link still has one.
+pub fn inodesOf(arena: std.mem.Allocator, io: Io, paths: []const []const u8) !Kept {
+    var out = Kept.init(arena);
     for (paths) |p| {
-        const st = Io.Dir.cwd().statFile(io, p, .{ .follow_symlinks = false }) catch continue;
-        try out.put(@intCast(st.inode), {});
+        const id = identity.of(io, p, .no_follow) orelse continue;
+        try out.put(id, {});
     }
     return out;
 }

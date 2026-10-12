@@ -14,7 +14,9 @@ fn list(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
         return 0;
     }
     for (ids) |id| {
-        try ctx.out.print("{s}\n", .{id});
+        if (try mox.apply.snapshot.undoes(ctx.alloc, ctx.io, context.paths.snapshots_dir, id)) |of| {
+            try ctx.out.print("{s} (what rolling back {s} replaced)\n", .{ id, of });
+        } else try ctx.out.print("{s}\n", .{id});
     }
     return 0;
 }

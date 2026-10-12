@@ -332,6 +332,26 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             continue;
         };
 
+        // A planted link rollback put back: --overwrite replaces it.
+        if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) |target| {
+            try diffLinkReplace(ctx, sty, stat_mode, file.live_path, target, composed_bytes, prov.items, &total, &changed);
+            continue;
+        }
+
+        // A symlink mox planted where a file now belongs: apply replaces the
+        // link with the composed file.
+        if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, home, file.live_path)) |v| switch (v) {
+            .remove => |found| {
+                try diffLinkReplace(ctx, sty, stat_mode, file.live_path, found.link, composed_bytes, prov.items, &total, &changed);
+                continue;
+            },
+            .linked_parent => {
+                try ctx.err.print("mox diff: {f}: {s}\n", .{ display.of(file.live_path, home), mox.apply.parent_link.reason });
+                continue;
+            },
+            else => {},
+        };
+
         // A partial file diffs its owned subtree only: canonical composed-owned
         // vs canonical live-owned, as text, labeled with the live path.
         if (file.own_paths.len > 0) {
@@ -352,11 +372,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
         const links = try stale.managedLinks(ctx.alloc, tree.files);
+        const jc: mox.apply.removable.Ctx = .{ .home = home, .kept = &inodes, .ruleset = &ruleset, .links = &links };
+        const private_missing = stale.privateMissing(ctx.io, context.paths.private_dir);
         for (cands) |c| {
-            if (c.kind == .owned) continue;
-            const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
-            if (ruleset.isPathIgnored(rel, false)) continue;
-            if (try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links) != .remove) continue;
+            if (c.private and private_missing) continue;
+            if (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c)) != .remove) continue;
             if (c.kind == .symlink) {
                 try diffLinkRemoval(ctx, sty, stat_mode, c.live_path, c.target, &total, &changed);
             } else try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
@@ -397,6 +417,33 @@ fn diffLinkRemoval(
         return;
     }
     try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_lines, &.{}, hunks, &.{}, &.{}, sty));
+}
+
+/// Diff a symlink apply replaces with the composed file `composed_bytes`.
+fn diffLinkReplace(
+    ctx: *app.Ctx,
+    sty: style.Style,
+    stat_mode: bool,
+    live_path: []const u8,
+    target: []const u8,
+    composed_bytes: []const u8,
+    prov_segments: []const mox.provenance.map.Segment,
+    total: *Stat,
+    changed: *usize,
+) !void {
+    const a_lines = try mox.diff.lines.splitLines(ctx.alloc, try std.fmt.allocPrint(ctx.alloc, "symlink -> {s}\n", .{target}));
+    const b_lines = try mox.diff.lines.splitLines(ctx.alloc, composed_bytes);
+    const hunks = try mox.diff.lines.diff(ctx.alloc, a_lines, b_lines);
+    const s = statOf(hunks);
+    changed.* += 1;
+    total.added += s.added;
+    total.removed += s.removed;
+    if (stat_mode) {
+        try ctx.out.print(" {f} | +{d} -{d}\n", .{ display.of(live_path, ctx.context.?.paths.home), s.added, s.removed });
+        return;
+    }
+    const b_secret = try secretMask(ctx.alloc, b_lines.len, prov_segments);
+    try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, &.{}, b_secret, sty));
 }
 
 /// Diff one composed result against its live file, printing the rendered hunks

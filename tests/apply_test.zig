@@ -3545,7 +3545,7 @@ test "apply generator: a leaf drifted into a symlink is pruned without dereferen
     try std.testing.expect(!(try treeContainsBytes(io, a, c.state, "PRIVATE-DATA")));
 }
 
-test "apply generator: mox remove --purge retains the manifest when a leaf is refused" {
+test "apply generator: mox remove --purge forgets a leaf that is now a directory, removing nothing there" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3557,19 +3557,17 @@ test "apply generator: mox remove --purge retains the manifest when a leaf is re
     const c = try cliSetup(a, io, &tmp);
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    // Replace leaf b with a directory: pruneStale refuses it (never deletes a
-    // directory), so the manifest must be retained, not dropped -- else the
-    // refused leaf becomes a permanent un-prunable orphan.
+    // Leaf b is now a directory mox never wrote: never deleted, and its
+    // record is forgotten once rather than refused on every run.
     const leaf_b = try c.homePath(".config/id-b.inc");
     try Io.Dir.cwd().deleteFile(io, leaf_b);
     try Io.Dir.cwd().createDirPath(io, leaf_b);
 
     const r = try c.run(&.{ "mox", "remove", "--purge", ".config/gen.inc" });
-    try std.testing.expect(r.rc != 0); // a refused leaf -> nonzero exit
-
-    const gen_live = try c.homePath(".config/gen.inc");
-    const m = try mox.apply.generated.readManifest(a, io, c.state, gen_live);
-    try std.testing.expect(m.len > 0);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "now a directory mox did not write; its record is forgotten") != null);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf_b, .{})).kind == .directory);
+    try std.testing.expect((try mox.apply.applied.read(a, io, c.state, leaf_b)) == null);
 }
 
 /// True when some line of `out` contains both `needle_a` and `needle_b` -- used
@@ -7916,4 +7914,272 @@ test "add: a recursive add warns per file that is not strict JSON" {
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "t.json: warning: not strict JSON (src/.config/x/t.json:1:8: does not parse as json; remove the trailing comma)") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "ok.json: warning") == null);
+}
+
+test "apply: every delete, rename or truncating write sits where it was judged" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+
+    // Every call outside a test block that deletes, renames or truncates,
+    // by file and enclosing function, with how many such calls it makes. Of
+    // these only live_remove's `remove` deletes a live path; write.zig's
+    // atomic write renames onto its own target, snapshot.zig's restore puts
+    // a snapshot back, and every other site works on mox's own state, the
+    // repo, a temp file or the mox binary. A new call anywhere, or one more
+    // in a listed function, fails here until it is judged and listed.
+    const allowed = [_]struct { []const u8, []const u8, usize }{
+        .{ "src/apply/applied.zig", "forget", 4 },
+        .{ "src/apply/applied.zig", "forgetOwned", 1 },
+        .{ "src/apply/applied.zig", "forgetSymlink", 1 },
+        .{ "src/apply/applied.zig", "forgetWholeFile", 2 },
+        .{ "src/apply/applied.zig", "record", 3 },
+        .{ "src/apply/applied.zig", "recordContent", 1 },
+        .{ "src/apply/applied.zig", "recordOwned", 2 },
+        .{ "src/apply/applied.zig", "writeSymlinkRecord", 4 },
+        .{ "src/apply/generated.zig", "deleteManifest", 1 },
+        .{ "src/apply/generated.zig", "dropLeaf", 1 },
+        .{ "src/apply/generated.zig", "sweepOrphans", 2 },
+        .{ "src/apply/live_remove.zig", "remove", 2 },
+        .{ "src/apply/run_scripts.zig", "moxBinDir", 3 },
+        .{ "src/apply/run_scripts.zig", "runCheck", 1 },
+        .{ "src/apply/run_scripts.zig", "sweepCheckDirs", 2 },
+        .{ "src/apply/snapshot.zig", "notePlanted", 1 },
+        .{ "src/apply/snapshot.zig", "prune", 4 },
+        .{ "src/apply/snapshot.zig", "restoreDir", 1 },
+        .{ "src/apply/snapshot.zig", "saveSymlink", 1 },
+        .{ "src/apply/snapshot.zig", "saveTree", 1 },
+        .{ "src/apply/snapshot.zig", "take", 1 },
+        .{ "src/apply/stale.zig", "markTombstones", 1 },
+        .{ "src/apply/write.zig", "writeAtomicImpl", 3 },
+        .{ "src/classify/impact.zig", "seededThisAndState", 1 },
+        .{ "src/classify/impact.zig", "writeFile", 1 },
+        .{ "src/cli/apply.zig", "applyPass", 2 },
+        .{ "src/cli/apply.zig", "bootstrapBackends", 1 },
+        .{ "src/cli/apply.zig", "partialCheckAccepts", 3 },
+        .{ "src/cli/commit.zig", "restore", 3 },
+        .{ "src/cli/commit.zig", "runCouplingSim", 1 },
+        .{ "src/cli/commit.zig", "saveRecovery", 1 },
+        .{ "src/cli/commit.zig", "simulateCouplingImpact", 1 },
+        .{ "src/cli/commit.zig", "simulateWrite", 1 },
+        .{ "src/cli/commit.zig", "writeLayer", 1 },
+        .{ "src/cli/commit.zig", "writePlan", 2 },
+        .{ "src/cli/commit_struct.zig", "applyToLayer", 1 },
+        .{ "src/cli/export.zig", "run", 1 },
+        .{ "src/cli/init.zig", "initFresh", 1 },
+        .{ "src/cli/lock.zig", "acquire", 2 },
+        .{ "src/cli/lock.zig", "release", 1 },
+        .{ "src/cli/mv.zig", "run", 2 },
+        .{ "src/cli/remove.zig", "run", 2 },
+        .{ "src/cli/uninstall.zig", "deleteEntry", 2 },
+        .{ "src/cli/update.zig", "setupFixture", 1 },
+        .{ "src/cli/upgrade.zig", "installBinary", 1 },
+        .{ "src/cli/upgrade.zig", "replaceBinary", 9 },
+        .{ "src/cli/upgrade.zig", "run", 1 },
+        .{ "src/cli/upgrade.zig", "stageAsset", 1 },
+        .{ "src/cli/upgrade.zig", "writeSums", 1 },
+        .{ "src/coupling/store.zig", "writeJson", 1 },
+        .{ "src/machine/dimensions.zig", "writeFile", 1 },
+        .{ "src/machine/facts.zig", "factsPathAlloc", 1 },
+        .{ "src/machine/interview.zig", "persist", 1 },
+        .{ "src/machine/interview.zig", "remove", 1 },
+        .{ "src/machine/job.zig", "writtenToStderr", 1 },
+        .{ "src/packages/bootstrap.zig", "fetchVerified", 3 },
+        .{ "src/packages/bootstrap.zig", "run", 1 },
+        .{ "src/packages/brew.zig", "alias", 1 },
+        .{ "src/packages/brew.zig", "installedWith", 1 },
+        .{ "src/packages/exec.zig", "answer", 2 },
+        .{ "src/packages/exec.zig", "spawn", 2 },
+        .{ "src/packages/exec.zig", "sweepScratch", 1 },
+        .{ "src/packages/manifest.zig", "expectRefusal", 1 },
+        .{ "src/packages/plugin.zig", "bootstrapImpl", 2 },
+        .{ "src/packages/windows.zig", "installedExplicitImpl", 2 },
+        .{ "src/provenance/map.zig", "forget", 1 },
+        .{ "src/provenance/map.zig", "persist", 1 },
+        .{ "src/secret/resolver.zig", "resolveCmdViaScript", 2 },
+        .{ "src/source/attributes.zig", "loadText", 1 },
+        .{ "src/source/attributes.zig", "write", 2 },
+        .{ "src/source/axes.zig", "axesOfSingleFile", 1 },
+        .{ "src/source/axes.zig", "writeFile", 1 },
+        .{ "src/trigger/state.zig", "save", 2 },
+        .{ "src/trigger/state.zig", "settlePending", 2 },
+    };
+    const calls = [_][]const u8{ "deleteFile(", "deleteFileAbsolute(", "deleteDir(", "deleteDirAbsolute(", "deleteTree(", "deleteTreeAbsolute(", "rename(", "renameAbsolute(", "unlink(", "unlinkat(", "renameat(", "createFile(", "createFileAbsolute(", "writeFile(" };
+
+    var src = Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer src.close(io);
+    var found = std.StringHashMap(usize).init(a);
+    var walker = try src.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const rel = try std.mem.replaceOwned(u8, a, entry.path, "\\", "/");
+        const name = try std.fmt.allocPrint(a, "src/{s}", .{rel});
+        const text = try entry.dir.readFileAlloc(io, entry.basename, a, .limited(16 * 1024 * 1024));
+        var func: []const u8 = "(top)";
+        var in_test = false;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "test ") or std.mem.startsWith(u8, line, "test{")) {
+                in_test = true;
+                continue;
+            }
+            if (in_test) {
+                if (std.mem.startsWith(u8, line, "}")) in_test = false;
+                continue;
+            }
+            const t = std.mem.trimStart(u8, line, " \t");
+            if (std.mem.startsWith(u8, t, "//")) continue;
+            if (fnName(t)) |n| func = n;
+            const code = if (std.mem.indexOfScalar(u8, t, '"') == null) t[0 .. std.mem.indexOf(u8, t, "//") orelse t.len] else t;
+            for (calls) |c| {
+                var at: usize = 0;
+                while (std.mem.indexOfPos(u8, code, at, c)) |i| : (at = i + c.len) {
+                    if (i > 0 and (std.ascii.isAlphanumeric(code[i - 1]) or code[i - 1] == '_')) continue;
+                    if (std.mem.endsWith(u8, code[0..i], "fn ")) continue;
+                    const key = try std.fmt.allocPrint(a, "{s}\t{s}", .{ name, func });
+                    const gop = try found.getOrPut(key);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                }
+            }
+        }
+    }
+    var bad = false;
+    var it = found.iterator();
+    while (it.next()) |e| {
+        var want: usize = 0;
+        for (allowed) |al| {
+            if (std.mem.eql(u8, try std.fmt.allocPrint(a, "{s}\t{s}", .{ al[0], al[1] }), e.key_ptr.*)) want = al[2];
+        }
+        if (e.value_ptr.* != want) {
+            std.debug.print("\n{s}: {d} delete/rename/truncating calls, {d} listed\n", .{ e.key_ptr.*, e.value_ptr.*, want });
+            bad = true;
+        }
+    }
+    for (allowed) |al| {
+        if (!found.contains(try std.fmt.allocPrint(a, "{s}\t{s}", .{ al[0], al[1] }))) {
+            std.debug.print("\n{s}\t{s}: listed, but makes no such call\n", .{ al[0], al[1] });
+            bad = true;
+        }
+    }
+    try std.testing.expect(!bad);
+}
+
+/// The name a line declaring a function gives it, or null.
+fn fnName(t: []const u8) ?[]const u8 {
+    var rest = t;
+    for ([_][]const u8{ "pub ", "export ", "inline " }) |p| {
+        if (std.mem.startsWith(u8, rest, p)) rest = rest[p.len..];
+    }
+    if (std.mem.startsWith(u8, rest, "inline ")) rest = rest["inline ".len..];
+    if (!std.mem.startsWith(u8, rest, "fn ")) return null;
+    rest = rest["fn ".len..];
+    var n: usize = 0;
+    while (n < rest.len and (std.ascii.isAlphanumeric(rest[n]) or rest[n] == '_')) n += 1;
+    return if (n == 0) null else rest[0..n];
+}
+
+/// A generator g wrote Id-a and Id-b, Id-b was edited, then g left the tree
+/// and h took over Id-a without having been applied yet.
+fn handoffSetup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !Cli {
+    try put(io, tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n[[ids]]\nslug = \"b\"\n");
+    try put(io, tmp, "repo/data2/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try put(io, tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    const c = try cliSetup(a, io, tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(".config/Id-b.inc"), .data = "k=b\nedited\n" });
+    try tmp.dir.deleteFile(io, "repo/src/.config/g.inc");
+    try put(io, tmp, "repo/src/.config/h.inc", "# mox: for id in \"data2/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug> from h\n# mox: end\n");
+    return c;
+}
+
+test "apply: a named file another generator now produces is never removed as an orphan" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try handoffSetup(a, io, &tmp);
+    const id_a = try c.homePath(".config/Id-a.inc");
+
+    const preview = try c.run(&.{ "mox", "apply", "--dry-run", id_a });
+    try std.testing.expectEqual(@as(u8, 2), preview.rc);
+    try std.testing.expect(std.mem.indexOf(u8, preview.out, "would remove") == null);
+    const r = try c.run(&.{ "mox", "apply", id_a });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "h.inc generates it") != null);
+    try std.testing.expectEqualStrings("k=a\n", try read(io, a, id_a));
+}
+
+test "commit: a named file another generator now produces routes to that generator, not a release" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try handoffSetup(a, io, &tmp);
+    const id_a = try c.homePath(".config/Id-a.inc");
+    _ = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("k=a from h\n", try read(io, a, id_a));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = id_a, .data = "k=a from h\nuserline\n" });
+
+    const r = try c.run(&.{ "mox", "commit", "--yes", id_a });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "released") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "src/.config/h.inc") != null);
+    // Still mox's: the next apply judges it against h's output.
+    const s = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "Id-a.inc") != null);
+}
+
+test "apply and commit: a .moxignore'd file of a gone generator is left alone when named" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try handoffSetup(a, io, &tmp);
+    try put(io, &tmp, "repo/.moxignore", ".config/Id-b.inc\n");
+    const id_b = try c.homePath(".config/Id-b.inc");
+
+    const r = try c.run(&.{ "mox", "apply", "--overwrite", id_b });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "matched by .moxignore, left alone") != null);
+    try std.testing.expectEqualStrings("k=b\nedited\n", try read(io, a, id_b));
+
+    const cm = try c.run(&.{ "mox", "commit", "--yes", id_b });
+    try std.testing.expectEqual(@as(u8, 0), cm.rc);
+    try std.testing.expect(std.mem.indexOf(u8, cm.out, "released") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cm.out, "matched by .moxignore, left alone") != null);
+    // Its record stands: a later full apply still leaves it alone.
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("k=b\nedited\n", try read(io, a, id_b));
+}
+
+test "commit: a named .moxignore'd path whose source left the tree is left alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/.keep", "k\n");
+    try put(io, &tmp, "repo/src/.gone", "g\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try tmp.dir.deleteFile(io, "repo/src/.gone");
+    try put(io, &tmp, "repo/.moxignore", ".gone\n");
+    const live = try c.homePath(".gone");
+    const r = try c.run(&.{ "mox", "commit", "--yes", live });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "matched by .moxignore, left alone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "released") == null);
+    try std.testing.expect((try mox.apply.applied.read(a, io, c.state, live)) != null);
 }

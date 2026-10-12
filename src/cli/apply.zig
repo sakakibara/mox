@@ -414,6 +414,9 @@ fn applyPass(
             };
             if (fileops.findByLive(tree, live) != null) {
                 try managed_paths.append(ctx.alloc, p);
+            } else if (try scope.generatorProducing(ctx.alloc, ctx.io, tree.files, &bindings, &m_state, secrets, live)) |gen| {
+                try ctx.err.print("mox apply: {f}: not managed; {f} generates it, so name that file to apply it\n", .{ display.of(live, home), display.of(gen.live_path, home) });
+                return 2;
             } else if (mox.apply.stale.at(cands, live) != null) {
                 try stale_named.put(live, {});
             } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, false, &tree_live, live)) |m| {
@@ -462,6 +465,7 @@ fn applyPass(
 
     // A tombstone that matches nothing here is reported before any record
     // changes, so this run's own sweep cannot hide it.
+    if (!scoped) try warnPrivateMissing(ctx, ctx.out, repo_tag);
     if (!scoped) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree)) |u|
         try printUnmatched(ctx.out, u, home);
 
@@ -471,10 +475,14 @@ fn applyPass(
         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, home), e.err });
         counts.fail += 1;
     };
+    const private_tag = try mox.apply.applied.privateTag(ctx.alloc, repo_tag);
     for (files) |file| {
         // Every line about this file names it the way a human reads it; the
         // real path is still what gets composed, snapshotted, and written.
         const shown = try display.alloc(ctx.alloc, file.live_path, home);
+        // Records name the layer a file comes from, so a sweep can tell a
+        // private-only file while the private layer is absent.
+        const file_tag = if (fromPrivate(file)) private_tag else repo_tag;
         // A head declaration the walk could not honor is this file's error
         // alone; everything else still applies.
         if (file.head_error.len > 0) {
@@ -494,7 +502,7 @@ fn applyPass(
         // its own path. Each output flows through the SAME per-file write path
         // as a normal file. Pruning the prior set and recording the manifest are
         // deferred to a second pass against the global keep set below.
-        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home, repo_tag)) continue;
+        if (try applyGenerator(ctx, file, &bindings, &m_state, secrets, snap_id, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home, file_tag)) continue;
 
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never composed or written.
@@ -553,7 +561,7 @@ fn applyPass(
 
                 if (disposition == .unchanged) {
                     counts.unchanged += 1;
-                    if (!dry_run) try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, repo_tag);
+                    if (!dry_run) try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, file_tag);
                     try ctx.out.print("  unchanged {s} -> {s}\n", .{ shown, target });
                     continue;
                 }
@@ -573,17 +581,7 @@ fn applyPass(
                     // fifo/socket/device, or an unreadable entry) refuses the
                     // replace with nothing touched, rather than destroying a
                     // tree `mox rollback` could only partially restore.
-                    mox.apply.snapshot.saveTree(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, file.live_path) catch |e| {
-                        try ctx.err.print("mox apply: {s}: cannot fully back up the directory, refusing to replace it: {s}\n", .{ shown, @errorName(e) });
-                        counts.fail += 1;
-                        continue;
-                    };
-                    snapshotted = true;
-                    std.Io.Dir.cwd().deleteTree(ctx.io, file.live_path) catch |e| {
-                        try ctx.err.print("mox apply: {s}: could not remove the directory: {s}\n", .{ shown, @errorName(e) });
-                        counts.fail += 1;
-                        continue;
-                    };
+                    if (!try replaceLive(ctx, file.live_path, shown, snap_id, .tree, null, &counts, &snapshotted)) continue;
                     if (std.fs.path.dirname(file.live_path)) |parent| {
                         std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
                     }
@@ -592,29 +590,23 @@ fn applyPass(
                         counts.fail += 1;
                         continue;
                     };
-                    try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, repo_tag);
+                    try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, file_tag);
                     counts.ok += 1;
                     try ctx.out.print("  symlinked {s} -> {s} (directory backed up)\n", .{ shown, target });
                     continue;
                 }
                 // Snapshot whatever is there before destroying it, and refuse
                 // the replace if the snapshot cannot be taken.
-                if (disposition != .fresh_write) {
+                if (disposition != .fresh_write and site != .absent) {
                     // A live symlink is snapshotted AS a symlink so rollback
                     // restores a link, not a file holding the target text.
-                    const snap_res = switch (site) {
-                        .symlink => |old_target| mox.apply.snapshot.saveSymlink(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, file.live_path, old_target),
-                        else => mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, file.live_path, snapshotContentForSite(ctx.io, ctx.alloc, file.live_path, site)),
+                    const snap: mox.apply.live_remove.Snap = switch (site) {
+                        .symlink => |old_target| .{ .link = old_target },
+                        else => .{ .file = snapshotContentForSite(ctx.io, ctx.alloc, file.live_path, site) },
                     };
-                    snap_res catch |e| {
-                        try ctx.err.print("mox apply: {s}: snapshot failed, not replacing: {s}\n", .{ shown, @errorName(e) });
-                        counts.fail += 1;
-                        continue;
-                    };
-                    snapshotted = true;
+                    if (!try replaceLive(ctx, file.live_path, shown, snap_id, snap, null, &counts, &snapshotted)) continue;
                 }
 
-                std.Io.Dir.cwd().deleteFile(ctx.io, file.live_path) catch {};
                 if (std.fs.path.dirname(file.live_path)) |parent| {
                     std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
                 }
@@ -623,11 +615,11 @@ fn applyPass(
                     counts.fail += 1;
                     continue;
                 };
-                try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, repo_tag);
+                try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, target, file_tag);
                 counts.ok += 1;
                 try ctx.out.print("  symlinked {s} -> {s}\n", .{ shown, target });
             } else if (file.own_paths.len > 0) {
-                if (!dry_run) try dropPlantedLink(ctx, file.live_path, snap_id, &snapshotted);
+                if (!try dropPlantedLink(ctx, file.live_path, snap_id, dry_run, force, &units, &counts, &snapshotted)) continue;
                 try applyPartialFile(ctx, .{
                     .file = file,
                     .bytes = bytes,
@@ -641,12 +633,12 @@ fn applyPass(
                     .check_timeout_ms = check_timeout_ms,
                     .extra_path_dirs = mox_path_dirs.items,
                     .mox_bin_dir = mox_bin_dir,
-                    .repo = repo_tag,
+                    .repo = file_tag,
                 }, &counts, &snapshotted);
             } else {
-                if (!dry_run) try dropPlantedLink(ctx, file.live_path, snap_id, &snapshotted);
+                if (!try dropPlantedLink(ctx, file.live_path, snap_id, dry_run, force, &units, &counts, &snapshotted)) continue;
                 try applyRegularFile(ctx, .{
-                    .repo = repo_tag,
+                    .repo = file_tag,
                     .live_path = file.live_path,
                     .bytes = bytes,
                     .prov_items = prov.items,
@@ -722,7 +714,7 @@ fn applyPass(
             try units.append(ctx.alloc, mox.apply.drift.generatedSet(g.live_path));
             counts.drift += 1;
         }
-        if (!dry_run) try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, g.live_path, g.current, repo_tag);
+        if (!dry_run) try mox.apply.generated.writeManifest(ctx.alloc, ctx.io, context.paths.state_dir, g.live_path, g.current, g.tag);
     }
 
     // The sweeps below remove files whose source left the tree. A run that
@@ -769,7 +761,9 @@ fn applyPass(
     // A full run sweeps every stale path but removes an edited one only when
     // a scoped run names it; a scoped run sweeps only the stale paths it names.
     if (orphan_named.count() > 0 and counts.fail == 0) {
-        const opts = try orphanOptions(ctx, tree, &ruleset, snap_id, force, dry_run);
+        var opts = try orphanOptions(ctx, tree, &ruleset, snap_id, force, dry_run);
+        opts.keep = &keep_set;
+        opts.kept_inodes = &kept_inodes;
         var oit = orphan_named.iterator();
         while (oit.next()) |e| {
             const res = try mox.apply.generated.removeNamedLeaf(ctx.alloc, ctx.io, opts, e.value_ptr.*, e.key_ptr.*, ctx.out, ctx.err);
@@ -798,6 +792,7 @@ fn applyPass(
             .force = force and scoped,
             .only = if (scoped) &stale_named else null,
             .dry_run = dry_run,
+            .private_missing = mox.apply.stale.privateMissing(ctx.io, context.paths.private_dir),
         }, &units, &counts, &snapshotted);
     }
     if (!scoped and !dry_run) try mox.apply.stale.markTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree.released);
@@ -1802,6 +1797,8 @@ fn warnBadWholeFileGateAxis(ctx: *app.Ctx, file: mox.source.tree.ManagedFile) !v
 /// pruned against nothing and its manifest is left intact.
 const GenState = struct {
     live_path: []const u8,
+    /// The tag its manifest names.
+    tag: []const u8,
     prior: []const []const u8,
     current: []const []const u8,
     succeeded: bool,
@@ -1904,28 +1901,7 @@ fn omitFile(
     // Snapshot the prior content (secret lines redacted) before removing, and
     // refuse if the snapshot cannot be taken -- symmetric with an overwrite.
     const snap_content = try redactedPriorContent(ctx, live_path, live.?);
-    mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, live_path, snap_content) catch |e| {
-        try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ shown, @errorName(e) });
-        try ctx.err.flush();
-        counts.fail += 1;
-        return;
-    };
-    snapshotted.* = true;
-    // TOCTOU guard, as the overwrite path has before its write: an external
-    // writer landing between the read and the unlink would have its content
-    // destroyed with only the pre-edit bytes snapshotted. Re-check right before
-    // the delete and refuse when the live file changed since the initial read.
-    if (!liveMatchesInitial(ctx.io, ctx.alloc, live_path, live)) {
-        try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{shown});
-        counts.fail += 1;
-        return;
-    }
-    std.Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
-        try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ shown, @errorName(e) });
-        try ctx.err.flush();
-        counts.fail += 1;
-        return;
-    };
+    if (!try replaceLive(ctx, live_path, shown, snap_id, .{ .file = snap_content }, live, counts, snapshotted)) return;
     try mox.apply.applied.forgetWholeFile(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
     counts.removed += 1;
     try ctx.out.print("  removed {s} (composes to nothing)\n", .{shown});
@@ -1945,6 +1921,8 @@ const StaleInput = struct {
     /// When set, only these stale paths are judged.
     only: ?*const std.StringHashMap(void) = null,
     dry_run: bool,
+    /// The private layer is absent: its files are left in place.
+    private_missing: bool = false,
 };
 
 /// True after naming an attributes file, the repo's or the private
@@ -1983,7 +1961,17 @@ pub fn orphanOptions(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: 
         .released_live = released_live,
         .links = links,
         .ruleset = ruleset,
+        .private_missing = mox.apply.stale.privateMissing(ctx.io, context.paths.private_dir),
     };
+}
+
+/// Warn, in `out`, that the private layer is absent while records name it:
+/// the files it wrote are left in place until it is back.
+pub fn warnPrivateMissing(ctx: *app.Ctx, out: *std.Io.Writer, repo_tag: []const u8) !void {
+    const context = ctx.context.?;
+    if (!mox.apply.stale.privateMissing(ctx.io, context.paths.private_dir)) return;
+    if (!try mox.apply.stale.privateRecords(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, context.paths.home)) return;
+    try out.print("  WARN    private layer {f} is missing; its files are left in place\n", .{display.of(context.paths.private_dir, context.paths.home)});
 }
 
 /// Record in `scan` what status and diff learned of `live` by composing it
@@ -2015,22 +2003,87 @@ pub fn mergePrivate(ctx: *app.Ctx, cmd: []const u8, base_tree: mox.source.tree.M
     };
 }
 
-/// Remove the symlink mox planted at `live_path` (its target is the one the
-/// symlink record holds) when the target is now a file: snapshot the link,
-/// unlink it and drop its record, so the new kind is written as a regular
-/// file and never through the old link into the file it pointed at. A link
-/// the user made is left for the write to patch through.
-fn dropPlantedLink(ctx: *app.Ctx, live_path: []const u8, snap_id: []const u8, snapshotted: *bool) !void {
+/// Clear `live_path` through `live_remove` before mox writes something of
+/// another kind there. False after reporting why it could not be cleared:
+/// that file is skipped or failed, and the run goes on.
+fn replaceLive(ctx: *app.Ctx, live_path: []const u8, shown: []const u8, snap_id: []const u8, snap: mox.apply.live_remove.Snap, expect: ?[]const u8, counts: *Counts, snapshotted: *bool) !bool {
     const context = ctx.context.?;
-    const recorded = (try mox.apply.applied.readSymlink(ctx.alloc, ctx.io, context.paths.state_dir, live_path)) orelse return;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = std.Io.Dir.cwd().readLink(ctx.io, live_path, &buf) catch return;
-    if (!mox.apply.applied.sameSymlinkTarget(buf[0..n], recorded)) return;
-    try mox.apply.snapshot.saveSymlink(ctx.alloc, ctx.io, context.paths.snapshots_dir, snap_id, context.paths.home, live_path, buf[0..n]);
-    snapshotted.* = true;
-    try std.Io.Dir.cwd().deleteFile(ctx.io, live_path);
-    try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
-    try ctx.out.print("  unlinked {f} (the symlink mox planted there; it is a file now)\n", .{display.of(live_path, context.paths.home)});
+    switch (mox.apply.live_remove.remove(ctx.alloc, ctx.io, .{ .home = context.paths.home, .snapshots_dir = context.paths.snapshots_dir, .snap_id = snap_id, .expect = expect, .state_dir = context.paths.state_dir }, live_path, snap)) {
+        .removed => {
+            snapshotted.* = true;
+            return true;
+        },
+        .left => |why| {
+            counts.skip += 1;
+            try ctx.out.print("  {s}: {s}\n", .{ shown, why });
+            return false;
+        },
+        .failed => |why| {
+            counts.fail += 1;
+            try ctx.err.print("mox apply: {s}: {s}\n", .{ shown, why });
+            return false;
+        },
+        .changed => {
+            snapshotted.* = true;
+            counts.fail += 1;
+            try ctx.err.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{shown});
+            return false;
+        },
+    }
+}
+
+/// Replace the symlink mox planted at `live_path` (its target is the one
+/// the symlink record holds) when the target is now a file: the link is
+/// judged like any removal, then snapshotted, unlinked and forgotten, so the
+/// file is written in its place and never through it into the file it
+/// pointed at. A link the user made, or one mox planted that now points
+/// elsewhere, is left for the write to handle as before.
+/// False when the caller must not go on to write the file: the link could
+/// not be removed (reported, and counted failed), or under
+/// `dry_run` the replacement has been reported as the file's write.
+fn dropPlantedLink(ctx: *app.Ctx, live_path: []const u8, snap_id: []const u8, dry_run: bool, force: bool, units: *std.ArrayList(mox.apply.drift.Unit), counts: *Counts, snapshotted: *bool) !bool {
+    const context = ctx.context.?;
+    const shown = try display.alloc(ctx.alloc, live_path, context.paths.home);
+    // A planted link rollback put back is drift: only --overwrite replaces
+    // it, and nothing writes through it.
+    if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, live_path)) |target| {
+        if (!force) {
+            counts.drift += 1;
+            try units.append(ctx.alloc, .{ .path = live_path, .kind = .whole_file, .first_contact = true });
+            return false;
+        }
+        if (dry_run) {
+            counts.ok += 1;
+            try ctx.out.print("  would replace the symlink rollback put back at {s} with a file\n", .{shown});
+            return false;
+        }
+        if (!try replaceLive(ctx, live_path, shown, snap_id, .{ .link = target }, null, counts, snapshotted)) return false;
+        try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+        try ctx.out.print("  replaced the symlink rollback put back at {s} with a file\n", .{shown});
+        return true;
+    }
+    const verdict = (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.home, live_path)) orelse return true;
+    switch (verdict) {
+        .remove => |found| {
+            if (dry_run) {
+                counts.ok += 1;
+                try ctx.out.print("  would replace the symlink mox planted at {s} with a file\n", .{shown});
+                return false;
+            }
+            if (!try replaceLive(ctx, live_path, shown, snap_id, .{ .link = found.link }, null, counts, snapshotted)) return false;
+            try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+            try ctx.out.print("  replaced the symlink mox planted at {s} with a file\n", .{shown});
+            return true;
+        },
+        // The link is outside HOME's own tree now: mox can neither remove it
+        // nor write the file, so the file fails until the directory is fixed.
+        .linked_parent => {
+            counts.fail += 1;
+            try ctx.err.print("mox apply: {s}: {s}\n", .{ shown, mox.apply.parent_link.reason });
+            return false;
+        },
+        else => return true,
+    }
 }
 
 /// One tombstone this machine cannot match, as status and apply print it.
@@ -2056,24 +2109,29 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
     for (in.tree) |f| try live_paths.append(ctx.alloc, f.live_path);
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
     const links = try stale.managedLinks(ctx.alloc, in.tree);
+    const jc: mox.apply.removable.Ctx = .{ .home = home, .keep = in.keep, .kept = &inodes, .ruleset = in.ruleset, .links = &links };
     for (cands) |c| {
         if (in.only) |only| if (!only.contains(c.live_path)) continue;
+        if (c.private and in.private_missing) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         if (in.released.contains(try mox.apply.stale.foldCase(ctx.alloc, c.live_path))) {
             if (!in.dry_run) try forgetAll(ctx, c.live_path);
             continue;
         }
-        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
-        if (in.ruleset.isPathIgnored(rel, false)) continue;
-        const verdict = try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links);
-        switch (verdict) {
+        switch (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c))) {
+            .kept => {},
+            .ignored => if (in.only != null) try ctx.out.print("  {s}: matched by .moxignore, left alone\n", .{shown}),
             .gone, .same_file => if (!in.dry_run) try forgetAll(ctx, c.live_path),
+            .now_dir => if (!in.dry_run) {
+                try forgetAll(ctx, c.live_path);
+                try ctx.out.print("  {s}: now a directory mox did not write; its record is forgotten\n", .{shown});
+            },
             .linked_parent => {
                 if (!in.dry_run) try forgetAll(ctx, c.live_path);
                 try ctx.out.print("  {s}: {s}\n", .{ shown, mox.apply.parent_link.reason });
             },
-            .special => {
-                try ctx.err.print("mox apply: {s}: no longer managed, but not a file mox wrote; left in place\n", .{shown});
+            .refused => |why| {
+                try ctx.err.print("mox apply: {s}: no longer managed and {s}\n", .{ shown, why });
                 counts.fail += 1;
             },
             .leave => {
@@ -2084,56 +2142,27 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
                     try ctx.out.print("  left {s} in place (no longer managed)\n", .{shown});
                 }
             },
-            .drift => if (!in.force) {
+            .drift => |d| if (!in.force) {
                 counts.drift += 1;
                 try units.append(ctx.alloc, mox.apply.drift.vanished(c.live_path));
-            } else try removeStale(ctx, c, in, shown, units, counts, snapshotted),
-            .remove => try removeStale(ctx, c, in, shown, units, counts, snapshotted),
+            } else try removeStale(ctx, c, in, d.found, shown, counts, snapshotted),
+            .remove => |f| try removeStale(ctx, c, in, f, shown, counts, snapshotted),
         }
     }
 }
 
-/// Remove one stale file or symlink, snapshotting it first.
-fn removeStale(ctx: *app.Ctx, c: mox.apply.stale.Candidate, in: StaleInput, shown: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), counts: *Counts, snapshotted: *bool) !void {
-    const context = ctx.context.?;
+/// Remove one stale file or symlink as it was judged, snapshotting it first.
+fn removeStale(ctx: *app.Ctx, c: mox.apply.stale.Candidate, in: StaleInput, found: mox.apply.removable.Found, shown: []const u8, counts: *Counts, snapshotted: *bool) !void {
     if (in.dry_run) {
         counts.removed += 1;
         try ctx.out.print("  would remove {s} (no longer managed)\n", .{shown});
         return;
     }
-    const site = mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, c.live_path);
-    const snap_res = switch (site) {
-        .symlink => |target| mox.apply.snapshot.saveSymlink(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, c.live_path, target),
-        .directory, .absent => {
-            try forgetAll(ctx, c.live_path);
-            return;
-        },
-        .other => blk: {
-            const live = std.Io.Dir.cwd().readFileAlloc(ctx.io, c.live_path, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| {
-                try ctx.err.print("mox apply: {s}: cannot read to back up, not removing: {s}\n", .{ shown, @errorName(e) });
-                counts.fail += 1;
-                return;
-            };
-            // Edited since it was judged: drift, kept.
-            if (!in.force and c.kind == .whole and !std.mem.eql(u8, &mox.apply.applied.contentHashHex(live), &c.hash)) {
-                counts.drift += 1;
-                try units.append(ctx.alloc, mox.apply.drift.vanished(c.live_path));
-                return;
-            }
-            break :blk mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, in.snap_id, context.paths.home, c.live_path, try redactedPriorContent(ctx, c.live_path, live));
-        },
+    const snap: mox.apply.live_remove.Snap, const expect: ?[]const u8 = switch (found) {
+        .link => |target| .{ .{ .link = target }, null },
+        .file => |live| .{ .{ .file = try redactedPriorContent(ctx, c.live_path, live) }, live },
     };
-    snap_res catch |e| {
-        try ctx.err.print("mox apply: {s}: snapshot failed, not removing: {s}\n", .{ shown, @errorName(e) });
-        counts.fail += 1;
-        return;
-    };
-    snapshotted.* = true;
-    std.Io.Dir.cwd().deleteFile(ctx.io, c.live_path) catch |e| {
-        try ctx.err.print("mox apply: {s}: could not remove: {s}\n", .{ shown, @errorName(e) });
-        counts.fail += 1;
-        return;
-    };
+    if (!try replaceLive(ctx, c.live_path, shown, in.snap_id, snap, expect, counts, snapshotted)) return;
     try forgetAll(ctx, c.live_path);
     counts.removed += 1;
     try ctx.out.print("  removed {s} (no longer managed)\n", .{shown});
@@ -2831,6 +2860,7 @@ fn applyGenerator(
     const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, file.live_path);
     try gen_states.append(ctx.alloc, .{
         .live_path = file.live_path,
+        .tag = repo,
         .prior = prior,
         .current = try current.toOwnedSlice(ctx.alloc),
         .succeeded = true,
@@ -2843,7 +2873,7 @@ fn applyGenerator(
 /// leaves feed the global keep set so the sweep and other prunes leave them be.
 fn recordFailedGenerator(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, gen_states: *std.ArrayList(GenState)) !void {
     const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, file.live_path);
-    try gen_states.append(ctx.alloc, .{ .live_path = file.live_path, .prior = prior, .current = &.{}, .succeeded = false });
+    try gen_states.append(ctx.alloc, .{ .live_path = file.live_path, .tag = "", .prior = prior, .current = &.{}, .succeeded = false });
 }
 
 /// Reject a generated output whose path would reach outside the generator's
@@ -2861,6 +2891,11 @@ fn generatedParentEscapes(io: std.Io, base_dir: []const u8, live_path: []const u
         if (st.kind == .sym_link) return true;
     }
     return false;
+}
+
+/// True for a file only the private layer holds.
+fn fromPrivate(file: mox.source.tree.ManagedFile) bool {
+    return file.private_dir.len > 0 and file.has_base and std.mem.startsWith(u8, file.source_base_abs, file.private_dir);
 }
 
 /// The prior live content to snapshot before an overwrite, with any secret

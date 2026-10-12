@@ -140,10 +140,12 @@ pub fn orphanPlan(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *co
 
 /// One row per file of an untagged manifest whose generator is gone: mox
 /// never removes it, and it needs no attention, so it counts toward nothing.
-fn untaggedRows(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, rows: *std.Io.Writer) !void {
+fn untaggedRows(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, rows: *std.Io.Writer, scan: *const mox.apply.generated.OrphanScan) !void {
     const context = ctx.context.?;
     var tree_live: std.StringHashMap(void) = .init(ctx.alloc);
     for (tree.files) |f| try tree_live.put(f.live_path, {});
+    var kit = scan.keep.keyIterator();
+    while (kit.next()) |k| try tree_live.put(k.*, {});
     for (try mox.apply.generated.untaggedOrphanLeaves(ctx.alloc, ctx.io, context.paths.state_dir, &tree_live)) |leaf| {
         const shown = try display.alloc(ctx.alloc, leaf, context.paths.home);
         try rows.print("  {s:<8} {s} (generated before this version; its generator is gone: `mox commit {s}` forgets it, or delete it by hand)\n", .{ "ORPHAN", shown, shown });
@@ -165,7 +167,7 @@ fn orphanRows(
         for (m.leaves) |leaf| {
             const shown = try display.alloc(ctx.alloc, leaf.path, home);
             switch (leaf.verdict) {
-                .gone, .ignored, .same_file => {},
+                .kept, .gone, .now_dir, .ignored, .same_file, .leave => {},
                 .remove => {
                     tally.add(.stale);
                     try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.stale.text(), shown });
@@ -179,9 +181,9 @@ fn orphanRows(
                     try units.append(ctx.alloc, mox.apply.drift.vanished(leaf.path));
                     try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.drift.text(), shown });
                 },
-                .refused => {
+                .refused => |why| {
                     tally.add(.err);
-                    try rows.print("  {s:<8} {s} (its generator left the tree, not a file mox wrote)\n", .{ Label.err.text(), shown });
+                    try rows.print("  {s:<8} {s} (its generator left the tree; {s})\n", .{ Label.err.text(), shown, why });
                 },
             }
         }
@@ -208,12 +210,13 @@ fn staleRows(
     for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
     var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
     const links = try stale.managedLinks(ctx.alloc, tree.files);
+    const jc: mox.apply.removable.Ctx = .{ .home = home, .kept = &inodes, .ruleset = ruleset, .links = &links };
+    const private_missing = stale.privateMissing(ctx.io, context.paths.private_dir);
     for (cands) |c| {
-        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, c.live_path);
-        if (ruleset.isPathIgnored(rel, false)) continue;
+        if (c.private and private_missing) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
-        switch (try stale.judge(ctx.alloc, ctx.io, c, &inodes, home, &links)) {
-            .gone, .same_file => {},
+        switch (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c))) {
+            .kept, .gone, .now_dir, .same_file, .ignored => {},
             .linked_parent => {
                 tally.add(.stale);
                 try rows.print("  {s:<8} {s} (no longer managed; {s})\n", .{ Label.stale.text(), shown, mox.apply.parent_link.reason });
@@ -227,9 +230,9 @@ fn staleRows(
                 try units.append(ctx.alloc, mox.apply.drift.vanished(c.live_path));
                 try rows.print("  {s:<8} {s} (no longer managed)\n", .{ Label.drift.text(), shown });
             },
-            .special => {
+            .refused => |why| {
                 tally.add(.err);
-                try rows.print("  {s:<8} {s} (no longer managed, not a file mox wrote)\n", .{ Label.err.text(), shown });
+                try rows.print("  {s:<8} {s} (no longer managed; {s})\n", .{ Label.err.text(), shown, why });
             },
         }
     }
@@ -329,6 +332,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
+    if (a.paths.len == 0) try apply_cmd.warnPrivateMissing(ctx, rows, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
     if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home), tree)) |u|
         try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
@@ -483,6 +487,31 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             continue;
         }
 
+        // A planted link rollback put back is drift: only --overwrite
+        // replaces it with the file.
+        if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path) != null) {
+            tally.add(.drift);
+            try units.append(ctx.alloc, .{ .path = file.live_path, .kind = .whole_file, .first_contact = true });
+            try rows.print("  {s:<8} {s}{s}\n", .{ Label.drift.text(), shown, annot });
+            continue;
+        }
+
+        // A symlink mox planted where a file now belongs: apply replaces it
+        // without --overwrite, so it is an ordinary write.
+        if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, home, file.live_path)) |v| switch (v) {
+            .remove => {
+                tally.add(.outdated);
+                try rows.print("  {s:<8} {s}{s} (replace the symlink mox planted with a file)\n", .{ Label.outdated.text(), shown, annot });
+                continue;
+            },
+            .linked_parent => {
+                tally.add(.err);
+                try rows.print("  {s:<8} {s}{s} ({s})\n", .{ Label.err.text(), shown, annot, mox.apply.parent_link.reason });
+                continue;
+            },
+            else => {},
+        };
+
         // A partial file is classified on its owned subtree only;
         // program activity outside the declared paths can never surface.
         if (file.own_paths.len > 0) {
@@ -522,7 +551,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (a.paths.len == 0) {
         try staleRows(ctx, tree, &ruleset, rows, &tally, &units);
         try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
-        try untaggedRows(ctx, tree, rows);
+        try untaggedRows(ctx, tree, rows, &scan);
     }
 
     // One order for every consumer -- the report and both serializers -- so
@@ -1185,7 +1214,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR, ORPHAN. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR; an ORPHAN, a file of a generator gone before manifests named their repo, counts toward nothing. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift). A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR, ORPHAN. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR; an ORPHAN, a file of a generator gone before manifests named their repo, counts toward nothing. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift): the drift set alone, so an ERROR or STALE row, which the exit code still signals, and an ORPHAN row are not in them. A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
     .group = .general,
     .needs_context = true,
 }, run);

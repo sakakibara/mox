@@ -5966,7 +5966,7 @@ test "stale: a directory the tree now plants as a symlink into the repo loses no
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
     try std.testing.expect(lineWith(rb.err, "~/.config/nvim/init.lua", "not restored: a parent directory is a symlink; the snapshot copy is at"));
-    try std.testing.expect(lineWith(rb.err, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory", "remove the symlink and re-run mox rollback"));
+    try std.testing.expect(lineWith(rb.err, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory", "; the snapshot copy is at "));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
 }
 
@@ -6633,10 +6633,14 @@ test "orphans: a file of an untagged manifest whose generator is gone is listed,
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.state, "generated" }));
     const manifest = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/old-gen.inc")) });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
+    // A second old manifest naming the same file: still one row.
+    const manifest2 = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/older-gen.inc")) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest2, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
 
     const s = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 0), s.rc);
     try std.testing.expect(lineWith(s.out, "ORPHAN", "~/.config/old.inc (generated before this version; its generator is gone"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, s.out, "ORPHAN"));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, leaf));
     const c = try h.run(&.{ "mox", "commit", "--yes", "~/.config/old.inc" });
@@ -6645,4 +6649,259 @@ test "orphans: a file of an untagged manifest whose generator is gone is listed,
     try std.testing.expect(exists(io, leaf));
     const s2 = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, s2.out, "ORPHAN") == null);
+}
+
+/// A symlink mox planted at ~/.config/c.toml, pointing into the repo, whose
+/// source then became a file: `own` makes it a partial target.
+fn plantedThenFile(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, own: bool) !struct { h: Harness, inrepo: []const u8 } {
+    const h = try setup(a, io, tmp, null);
+    const inrepo = try std.fs.path.join(a, &.{ h.repo, "shared", "c.toml" });
+    try writeRepo(io, tmp, "repo/shared/c.toml", "a = 0\nb = \"keep\"\n");
+    try writeRepo(io, tmp, "repo/src/.config/c.toml", inrepo);
+    try writeRepo(io, tmp, "repo/.mox/attributes.toml", "[\".config/c.toml\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, tmp, "repo/src/.config/c.toml", if (own) "# mox: own a\na = 1\n" else "a = 1\n");
+    try writeRepo(io, tmp, "repo/.mox/attributes.toml", "");
+    return .{ .h = h, .inrepo = inrepo };
+}
+
+fn linkTarget(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try Io.Dir.cwd().readLink(io, path, &buf);
+    return a.dupe(u8, buf[0..n]);
+}
+
+test "apply: a planted link behind a symlinked directory is never removed, and the file fails" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try plantedThenFile(a, io, &tmp, false);
+    const h = s.h;
+    // The user moves ~/.config elsewhere and links it back.
+    const elsewhere = try std.fs.path.join(a, &.{ h.root, "elsewhere" });
+    try Io.Dir.rename(Io.Dir.cwd(), try h.liveOf(".config"), Io.Dir.cwd(), elsewhere, io);
+    try Io.Dir.cwd().symLink(io, elsewhere, try h.liveOf(".config"), .{});
+    const moved = try std.fs.path.join(a, &.{ elsewhere, "c.toml" });
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "ERROR    ~/.config/c.toml (left in place: a parent directory is a symlink)") != null);
+    const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(dry.rc, r.rc);
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "a parent directory is a symlink") != null);
+    try std.testing.expectEqualStrings(s.inrepo, try linkTarget(io, a, moved));
+    try std.testing.expectEqualStrings("a = 0\nb = \"keep\"\n", try read(io, a, s.inrepo));
+    // Nothing was taken, so rollback has nothing it would refuse.
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expect(std.mem.indexOf(u8, rb.err, "ERROR") == null);
+    try std.testing.expectEqualStrings(s.inrepo, try linkTarget(io, a, moved));
+}
+
+test "rollback: a planted link it puts back is drift, replaced only by --overwrite and never written through" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try plantedThenFile(a, io, &tmp, true);
+    const h = s.h;
+    const live = try h.liveOf(".config/c.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    try std.testing.expectEqualStrings(s.inrepo, try linkTarget(io, a, live));
+
+    // What rollback replaced, the file apply wrote, is kept in its own
+    // snapshot, which a bare rollback never picks.
+    const kept = std.mem.indexOf(u8, rb.out, "is kept in snapshot ") orelse return error.TestExpectedKeptSnapshot;
+    const undo_id = rb.out[kept + "is kept in snapshot ".len ..][0..mox.apply.snapshot.id_len];
+    const sl = try h.run(&.{ "mox", "snapshot" });
+    try std.testing.expect(std.mem.indexOf(u8, sl.out, "(what rolling back") != null);
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(st.out, "DRIFT", "~/.config/c.toml"));
+    const plain = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 1), plain.rc);
+    try std.testing.expectEqualStrings(s.inrepo, try linkTarget(io, a, live));
+    try std.testing.expectEqualStrings("a = 0\nb = \"keep\"\n", try read(io, a, s.inrepo));
+
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("a = 0\nb = \"keep\"\n", try read(io, a, s.inrepo));
+    const kind = (try Io.Dir.cwd().statFile(io, live, .{ .follow_symlinks = false })).kind;
+    try std.testing.expect(kind == .file);
+    try std.testing.expectEqualStrings("a = 1\n", try read(io, a, live));
+
+    // The kept snapshot is rolled back only when named.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "rollback", undo_id })).rc);
+}
+
+test "rollback: a user's link it puts back reads as drift, never re-pointed or swept" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const real = try std.fs.path.join(a, &.{ h.root, "elsewhere-real" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = real, .data = "user data\n" });
+    const live = try h.liveOf(".foo");
+    try Io.Dir.cwd().symLink(io, real, live, .{});
+    try writeRepo(io, &tmp, "repo/src/.keep", "k\n");
+    try writeRepo(io, &tmp, "repo/src/.foo", try std.fs.path.join(a, &.{ h.root, "treet", "x" }));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".foo\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "rollback" })).rc);
+    try std.testing.expectEqualStrings(real, try linkTarget(io, a, live));
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(st.out, "DRIFT", "~/.foo"));
+    try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings(real, try linkTarget(io, a, live));
+
+    // Its source leaves the tree: nothing of the user's is swept.
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".foo"));
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings(real, try linkTarget(io, a, live));
+    try std.testing.expectEqualStrings("user data\n", try read(io, a, real));
+}
+
+test "stale: a record whose path is now a directory mox never wrote is forgotten once, never refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.keep", "k\n");
+    try writeRepo(io, &tmp, "repo/src/.cfg", "c\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".cfg"));
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".cfg"));
+    try Io.Dir.cwd().createDirPath(io, try h.liveOf(".cfg"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg/mine"), .data = "m\n" });
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "~/.cfg: now a directory mox did not write; its record is forgotten") != null);
+    const again = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), again.rc);
+    try std.testing.expect(std.mem.indexOf(u8, again.out, "now a directory") == null);
+    try std.testing.expectEqualStrings("m\n", try read(io, a, try h.liveOf(".cfg/mine")));
+}
+
+test "private layer: while it is absent its files are left in place with a warning, and a symlinked one is followed" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.keep", "k\n");
+    try writeRepo(io, &tmp, "elsewhere/.netrc", "token\n");
+    const priv = try std.fs.path.join(a, &.{ h.state, "private" });
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    try Io.Dir.cwd().symLink(io, try std.fs.path.join(a, &.{ h.root, "elsewhere" }), priv, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("token\n", try read(io, a, try h.liveOf(".netrc")));
+
+    // The volume goes away.
+    try Io.Dir.cwd().deleteFile(io, priv);
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "is missing; its files are left in place") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "STALE") == null);
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "is missing; its files are left in place") != null);
+    try std.testing.expectEqualStrings("token\n", try read(io, a, try h.liveOf(".netrc")));
+}
+
+test "status, diff and apply --dry-run preview a planted link's replacement as the write apply makes" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try plantedThenFile(a, io, &tmp, true);
+    const h = s.h;
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "OUTDATED ~/.config/c.toml  (own 1) (replace the symlink mox planted with a file)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "DRIFT") == null);
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "-symlink -> ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "+a = 1") != null);
+    const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), dry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would replace the symlink mox planted at ~/.config/c.toml with a file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "1 would be written") != null);
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "1 written") != null);
+}
+
+test "apply: a link that cannot be removed fails that one file and the run goes on" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try plantedThenFile(a, io, &tmp, false);
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/zz.txt", "zz\n");
+    const dir = try h.liveOf(".config");
+    try Io.Dir.cwd().setFilePermissions(io, dir, Io.File.Permissions.fromMode(0o555), .{});
+    defer Io.Dir.cwd().setFilePermissions(io, dir, Io.File.Permissions.fromMode(0o755), .{}) catch {};
+    // Root may unlink anything; the case is about a refused unlink.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "~/.config/c.toml: could not remove") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "1 written") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "1 failed") != null);
+    try std.testing.expectEqualStrings("zz\n", try read(io, a, try h.liveOf("zz.txt")));
+    try std.testing.expectEqualStrings(s.inrepo, try linkTarget(io, a, try h.liveOf(".config/c.toml")));
+}
+
+test "apply: a dropped file that is a hard link to a managed one is forgotten, not removed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/keep.txt", "same\n");
+    try writeRepo(io, &tmp, "repo/src/gone.txt", "same\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // gone.txt becomes another name for keep.txt, then leaves the tree.
+    try tmp.dir.deleteFile(io, "home/gone.txt");
+    try testutil.hardLink(a, io, &tmp, "home/keep.txt", "home/gone.txt");
+    try tmp.dir.deleteFile(io, "repo/src/gone.txt");
+
+    const st = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "gone.txt") == null);
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("same\n", try read(io, a, try h.liveOf("gone.txt")));
+    try std.testing.expectEqualStrings("same\n", try read(io, a, try h.liveOf("keep.txt")));
 }

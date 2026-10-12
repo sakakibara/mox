@@ -236,7 +236,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // snapshotted AS a symlink (not its dereferenced target content), so
         // rollback restores a link; a dangling link is snapshotted and removed
         // too rather than followed or left behind.
-        switch (mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path)) {
+        var expect: ?[]const u8 = null;
+        const snap: mox.apply.live_remove.Snap = switch (mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path)) {
             .absent => {
                 try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
                 return 0;
@@ -245,30 +246,37 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 try ctx.err.print("mox remove: live path is a directory, not deleting: {f}\n", .{display.of(live_path, context.paths.home)});
                 return 1;
             },
-            .symlink => |target| {
-                mox.apply.snapshot.saveSymlink(ctx.alloc, ctx.io, context.paths.snapshots_dir, &id, context.paths.home, live_path, target) catch |e| {
-                    try ctx.err.print("mox remove: snapshot failed, not deleting live symlink: {s}\n", .{@errorName(e)});
-                    return 1;
-                };
-            },
-            .other => {
+            .symlink => |target| .{ .link = target },
+            .other => blk: {
                 const live = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
                     error.FileNotFound => {
                         try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
                         return 0;
                     },
-                    else => return e,
+                    else => {
+                        try ctx.err.print("mox remove: cannot read {f} to back it up, not deleting: {s}\n", .{ display.of(live_path, context.paths.home), @errorName(e) });
+                        return 1;
+                    },
                 };
-                mox.apply.snapshot.save(ctx.alloc, ctx.io, context.paths.snapshots_dir, &id, context.paths.home, live_path, live) catch |e| {
-                    try ctx.err.print("mox remove: snapshot failed, not deleting live file: {s}\n", .{@errorName(e)});
-                    return 1;
-                };
+                expect = live;
+                break :blk .{ .file = live };
+            },
+        };
+        switch (mox.apply.live_remove.remove(ctx.alloc, ctx.io, .{ .home = context.paths.home, .snapshots_dir = context.paths.snapshots_dir, .snap_id = &id, .expect = expect, .state_dir = context.paths.state_dir }, live_path, snap)) {
+            .removed => {},
+            .left => |why| {
+                try ctx.err.print("mox remove: {f}: {s}\n", .{ display.of(live_path, context.paths.home), why });
+                return 1;
+            },
+            .failed => |why| {
+                try ctx.err.print("mox remove: {f}: {s}\n", .{ display.of(live_path, context.paths.home), why });
+                return 1;
+            },
+            .changed => {
+                try ctx.err.print("mox remove: {f}: changed underneath mox, not deleting; re-run 'mox remove --purge'\n", .{display.of(live_path, context.paths.home)});
+                return 1;
             },
         }
-        Io.Dir.cwd().deleteFile(ctx.io, live_path) catch |e| {
-            try ctx.err.print("mox remove: could not delete live file {f}: {s}\n", .{ display.of(live_path, context.paths.home), @errorName(e) });
-            return 1;
-        };
         try ctx.out.print("  purged live file: {f}\n", .{display.of(live_path, context.paths.home)});
     } else {
         try ctx.out.print("  live file left in place: {f}\n", .{display.of(live_path, context.paths.home)});

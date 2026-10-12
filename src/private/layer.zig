@@ -28,6 +28,18 @@ pub fn merge(
         error.FileNotFound => return base_tree,
         else => return e,
     };
+    return mergeAt(arena, io, base_tree, try std.Io.Dir.realPathFileAbsoluteAlloc(io, private_dir, arena), home_dir);
+}
+
+/// `merge` with `private_dir` resolved: the walk does not follow a symlinked
+/// root, so a private layer that is a link to a directory is walked there.
+fn mergeAt(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    base_tree: ManagedTree,
+    private_dir: []const u8,
+    home_dir: []const u8,
+) !ManagedTree {
 
     // The private root's `data/` is data (`mox data`, loop sources, the
     // package manifest) and its `.mox/` holds its attributes, never a source:

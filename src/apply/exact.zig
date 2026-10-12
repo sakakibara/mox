@@ -16,6 +16,7 @@ const ignore_match = @import("../source/ignore/match.zig");
 const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
 const parent_link = @import("parent_link.zig");
+const live_remove = @import("live_remove.zig");
 
 /// Bound on how deep an unmanaged subdirectory is walked when snapshotting its
 /// files before removal. A pathologically deep foreign tree stops here rather
@@ -116,7 +117,7 @@ fn enforceOne(
         switch (e.kind) {
             .file => try sweepFile(arena, io, live_path, opts, stdout, stderr, result),
             .directory => try sweepDir(arena, io, live_path, opts, stdout, stderr, result, ruleset, home),
-            else => try sweepOther(io, live_path, opts, stdout, stderr, result),
+            else => try sweepOther(arena, io, live_path, opts, stdout, stderr, result),
         }
     }
 }
@@ -163,10 +164,30 @@ fn sweepFile(
         try stdout.print("  would remove {s} (unmanaged, exact dir)\n", .{live_path});
         return;
     }
-    try snapshot.save(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, content);
-    try Io.Dir.cwd().deleteFile(io, live_path);
-    result.removed += 1;
-    try stdout.print("  removed {s} (unmanaged, exact dir)\n", .{live_path});
+    try report(liveRemove(arena, io, opts, live_path, .{ .file = content }, content), live_path, "", stdout, stderr, result);
+}
+
+fn liveRemove(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8, snap: live_remove.Snap, expect: ?[]const u8) live_remove.Outcome {
+    return live_remove.remove(arena, io, .{ .home = opts.home, .snapshots_dir = opts.snapshots_dir, .snap_id = opts.snap_id, .links = opts.links, .expect = expect, .state_dir = opts.state_dir }, live_path, snap);
+}
+
+/// Count and print one exact-dir removal's outcome.
+fn report(outcome: live_remove.Outcome, live_path: []const u8, suffix: []const u8, stdout: *Io.Writer, stderr: *Io.Writer, result: *Result) !void {
+    switch (outcome) {
+        .removed => {
+            result.removed += 1;
+            try stdout.print("  removed {s}{s} (unmanaged, exact dir)\n", .{ live_path, suffix });
+        },
+        .left => |why| try stdout.print("  {s}{s}: {s}\n", .{ live_path, suffix, why }),
+        .failed => |why| {
+            result.error_refused += 1;
+            try stderr.print("  {s}{s}: {s}\n", .{ live_path, suffix, why });
+        },
+        .changed => {
+            result.error_refused += 1;
+            try stderr.print("  CONFLICT {s}{s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{ live_path, suffix });
+        },
+    }
 }
 
 fn sweepDir(
@@ -213,12 +234,11 @@ fn sweepDir(
         try stderr.print("  UNSNAPSHOTTABLE {s}/ (exact dir; not removing, would lose unsaved data)\n", .{live_path});
         return;
     }
-    try Io.Dir.cwd().deleteTree(io, live_path);
-    result.removed += 1;
-    try stdout.print("  removed {s}/ (unmanaged, exact dir)\n", .{live_path});
+    try report(liveRemove(arena, io, opts, live_path, .taken_tree, null), live_path, "/", stdout, stderr, result);
 }
 
 fn sweepOther(
+    arena: std.mem.Allocator,
     io: Io,
     live_path: []const u8,
     opts: Options,
@@ -236,9 +256,12 @@ fn sweepOther(
         try stdout.print("  would remove {s} (unmanaged, exact dir)\n", .{live_path});
         return;
     }
-    try Io.Dir.cwd().deleteFile(io, live_path);
-    result.removed += 1;
-    try stdout.print("  removed {s} (unmanaged, exact dir)\n", .{live_path});
+    // A symlink is kept as a link, so rollback can put it back.
+    const snap: live_remove.Snap = switch (applied.inspectSymSite(io, arena, live_path)) {
+        .symlink => |target| .{ .link = target },
+        else => .special,
+    };
+    try report(liveRemove(arena, io, opts, live_path, snap, null), live_path, "", stdout, stderr, result);
 }
 
 /// True if any entry under `dir_live`, at any depth, is ignored per `ruleset`

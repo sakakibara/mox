@@ -469,103 +469,6 @@ fn canonicalPath(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const u8
     }
 }
 
-/// What makes two paths one file: its device and inode, or on Windows its
-/// volume serial number and 128-bit file id. Every hard link to a file has it.
-const FileIdentity = struct { device: u64, inode: u128 };
-
-/// The identity of the existing file at `path`, or null when it cannot be
-/// read for any reason (an absent file, a refused open, no call the system
-/// allows); the caller then keys the file by its canonical real path. POSIX
-/// reads it without opening the file, so a FIFO never blocks.
-fn fileIdentity(io: Io, path: []const u8) ?FileIdentity {
-    switch (builtin.os.tag) {
-        .windows => {
-            const file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-            defer file.close(io);
-            return windowsFileId(file.handle) orelse windowsIndexIdentity(io, file);
-        },
-        .linux => {
-            const linux = std.os.linux;
-            const z = std.posix.toPosixPath(path) catch return null;
-            var stx: linux.Statx = undefined;
-            switch (linux.errno(linux.statx(linux.AT.FDCWD, &z, 0, .{ .INO = true }, &stx))) {
-                .SUCCESS => return .{ .device = (@as(u64, stx.dev_major) << 32) | stx.dev_minor, .inode = stx.ino },
-                // statx refused by a seccomp filter or missing from the kernel.
-                .NOSYS, .PERM => return linuxStatIdentity(&z),
-                else => return null,
-            }
-        },
-        else => {
-            const z = std.posix.toPosixPath(path) catch return null;
-            var st: std.c.Stat = undefined;
-            if (std.c.fstatat(std.c.AT.FDCWD, &z, &st, 0) != 0) return null;
-            const dev = st.dev;
-            const device: u64 = if (@typeInfo(@TypeOf(dev)).int.signedness == .signed) @bitCast(@as(i64, dev)) else dev;
-            return .{ .device = device, .inode = st.ino };
-        },
-    }
-}
-
-/// FILE_ID_INFORMATION: the volume serial number and the 128-bit file id
-/// ReFS needs, which NTFS fills from its 64-bit index.
-const WindowsFileIdInfo = extern struct {
-    VolumeSerialNumber: u64,
-    FileId: [16]u8,
-};
-
-/// A file's identity from its 128-bit id, or null when the file system does
-/// not report one (FAT and some network redirectors).
-fn windowsFileId(handle: std.os.windows.HANDLE) ?FileIdentity {
-    const windows = std.os.windows;
-    var info: WindowsFileIdInfo = undefined;
-    var iosb: windows.IO_STATUS_BLOCK = undefined;
-    if (windows.ntdll.NtQueryInformationFile(handle, &iosb, &info, @sizeOf(WindowsFileIdInfo), .Id) != .SUCCESS) return null;
-    return .{ .device = info.VolumeSerialNumber, .inode = std.mem.readInt(u128, &info.FileId, .little) };
-}
-
-/// A file's identity from its volume's 32-bit serial number and its 64-bit
-/// index, where no 128-bit id is available.
-fn windowsIndexIdentity(io: Io, file: Io.File) ?FileIdentity {
-    const windows = std.os.windows;
-    const st = file.stat(io) catch return null;
-    const Info = windows.FILE.FS_VOLUME_INFORMATION;
-    // The volume label follows the fixed fields; only the serial number is
-    // wanted, so a label that does not fit is fine.
-    var buf: [@sizeOf(Info) + 64]u8 align(@alignOf(Info)) = undefined;
-    var iosb: windows.IO_STATUS_BLOCK = undefined;
-    switch (windows.ntdll.NtQueryVolumeInformationFile(file.handle, &iosb, &buf, buf.len, .Volume)) {
-        .SUCCESS, .BUFFER_OVERFLOW => {},
-        else => return null,
-    }
-    const info: *const Info = @ptrCast(&buf);
-    return .{ .device = info.VolumeSerialNumber, .inode = @as(u64, @bitCast(st.inode)) };
-}
-
-/// A file's identity from `fstatat`, in the device numbering statx uses.
-/// Only 64-bit targets whose kernel `struct stat` opens with the 64-bit
-/// `st_dev` and `st_ino` are read; elsewhere the caller keys by path.
-fn linuxStatIdentity(z: [*:0]const u8) ?FileIdentity {
-    const linux = std.os.linux;
-    switch (builtin.cpu.arch) {
-        .x86_64, .aarch64, .aarch64_be, .riscv64, .loongarch64, .powerpc64, .powerpc64le, .s390x => {},
-        else => return null,
-    }
-    // Larger than any of those targets' `struct stat`.
-    var buf: [256]u8 align(8) = undefined;
-    const rc = linux.syscall4(.fstatat64, @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))), @intFromPtr(z), @intFromPtr(&buf), 0);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    const words: *const [2]u64 = @ptrCast(&buf);
-    return .{ .device = linuxDevice(words[0]), .inode = words[1] };
-}
-
-/// A `dev_t` as the major and minor numbers statx reports, each in its own
-/// 32-bit half.
-fn linuxDevice(dev: u64) u64 {
-    const major: u32 = @truncate(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(u64, 0xfff)));
-    const minor: u32 = @truncate((dev & 0xff) | ((dev >> 12) & ~@as(u64, 0xff)));
-    return (@as(u64, major) << 32) | minor;
-}
-
 /// Canonical source paths, each with the spelling it was first reached by,
 /// which is how messages name it. An existing file is one path whatever
 /// hard link reaches it: the real path first seen for its identity.
@@ -573,7 +476,7 @@ const PathIds = struct {
     arena: std.mem.Allocator,
     io: Io,
     spelling: std.StringHashMap([]const u8),
-    by_identity: std.AutoHashMap(FileIdentity, []const u8),
+    by_identity: std.AutoHashMap(mox.apply.identity.Identity, []const u8),
 
     fn init(arena: std.mem.Allocator, io: Io) PathIds {
         return .{ .arena = arena, .io = io, .spelling = .init(arena), .by_identity = .init(arena) };
@@ -582,7 +485,7 @@ const PathIds = struct {
     /// `path`'s canonical path, without recording how it was spelled.
     fn canonical(ids: *PathIds, path: []const u8) ![]const u8 {
         const real = try canonicalPath(ids.arena, ids.io, path);
-        const id = fileIdentity(ids.io, real) orelse return real;
+        const id = mox.apply.identity.of(ids.io, real, .follow) orelse return real;
         const gop = try ids.by_identity.getOrPut(id);
         if (!gop.found_existing) gop.value_ptr.* = real;
         return gop.value_ptr.*;
@@ -1250,13 +1153,13 @@ pub fn commitImpl(
 
 /// Forget each of `paths`, named stale paths of a run that commits: the
 /// live file keeps its edit and mox stops tracking it on this machine.
-fn releaseStale(ctx: *app.Ctx, paths: []const []const u8, home: []const u8, orphans: *const std.StringHashMap([]const u8)) !void {
+fn releaseStale(ctx: *app.Ctx, paths: []const []const u8, home: []const u8, orphans: *const std.StringHashMap([]const []const u8)) !void {
     const state_dir = ctx.context.?.paths.state_dir;
     for (paths) |lp| {
         try mox.apply.applied.forget(ctx.alloc, ctx.io, state_dir, lp);
         try mox.provenance.map.forget(ctx.alloc, ctx.io, state_dir, lp);
-        if (orphans.get(lp)) |m| {
-            try mox.apply.generated.dropLeaf(ctx.alloc, ctx.io, m, lp);
+        if (orphans.get(lp)) |ms| {
+            for (ms) |m| try mox.apply.generated.dropLeaf(ctx.alloc, ctx.io, m, lp);
             try ctx.out.print("  released {f} on this machine: its generator left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
         } else try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
     }
@@ -1356,7 +1259,7 @@ fn commitRun(
     // this machine forgets it once the run commits.
     var stale_named: []const []const u8 = &.{};
     // Those of them that a gone generator produced, with their manifests.
-    var orphan_manifests: std.StringHashMap([]const u8) = .init(ctx.alloc);
+    var orphan_manifests: std.StringHashMap([]const []const u8) = .init(ctx.alloc);
     var only_stale = false;
     if (paths.len > 0) {
         var direct: std.ArrayList([]const u8) = .empty;
@@ -1366,6 +1269,7 @@ fn commitRun(
         const cands = try mox.apply.stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, m_state.home, tree);
         var tree_live: std.StringHashMap(void) = .init(ctx.alloc);
         for (tree.files) |f| try tree_live.put(f.live_path, {});
+        var left_alone: usize = 0;
         for (paths) |p| {
             const live = edit_mod.liveTarget(ctx.alloc, m_state.home, context.cwd, p) catch |e| switch (e) {
                 error.OutOfMemory => return e,
@@ -1373,15 +1277,26 @@ fn commitRun(
             };
             if (findByLive(tree, live) != null) {
                 try direct.append(ctx.alloc, p);
+            } else if (try scope.generatorProducing(ctx.alloc, ctx.io, tree.files, &axis_resolver, &m_state, secrets, live) != null) {
+                try leaf_targets.append(ctx.alloc, live);
             } else if (mox.apply.stale.at(cands, live) != null) {
+                if (try ignoredStale(ctx, &axis_resolver, &m_state, live)) {
+                    left_alone += 1;
+                    continue;
+                }
                 try stale_live.append(ctx.alloc, live);
-            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, true, &tree_live, live)) |m| {
+            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, true, &tree_live, live) != null) {
+                if (try ignoredStale(ctx, &axis_resolver, &m_state, live)) {
+                    left_alone += 1;
+                    continue;
+                }
                 try stale_live.append(ctx.alloc, live);
-                try orphan_manifests.put(live, m);
+                try orphan_manifests.put(live, try mox.apply.generated.orphanManifestsOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, true, &tree_live, live));
             } else {
                 try leaf_targets.append(ctx.alloc, live);
             }
         }
+        if (left_alone == paths.len) return 0;
         var diag: scope.Diag = .{};
         const scoped_files = scope.filterTree(ctx.alloc, ctx.io, tree.files, m_state.home, context.cwd, direct.items, &diag) catch |e| switch (e) {
             error.NotManaged => {
@@ -1399,7 +1314,7 @@ fn commitRun(
         if (leaf_targets.items.len > 0) {
             var leaves: std.StringHashMap(std.StringHashMap(void)) = .init(ctx.alloc);
             for (leaf_targets.items) |lp| {
-                const gen = (try findGeneratorLeaf(ctx.alloc, ctx.io, tree.files, &axis_resolver, &m_state, secrets, lp)) orelse {
+                const gen = (try scope.generatorProducing(ctx.alloc, ctx.io, tree.files, &axis_resolver, &m_state, secrets, lp)) orelse {
                     try ctx.err.print("mox commit: {f}: not managed\n", .{display.of(lp, m_state.home)});
                     return 1;
                 };
@@ -2432,7 +2347,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target, try recordTag(ctx, s.live_path));
         try ctx.out.print("  committed {f}\n", .{display.of(s.live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2441,7 +2356,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live, try recordTag(ctx, gc.leaf_live_path));
         if (!r.secret) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
         try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.prov);
         try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
@@ -2483,7 +2398,7 @@ fn commitRun(
                     // no line provenance.
                     try advanceOwnedRecord(ctx, file, r.composed, r.prov);
                 } else {
-                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live, try recordTag(ctx, file.live_path));
                     // Never cache the cleartext of a secret-bearing composition.
                     if (!mox.provenance.map.hasSecret(r.prov)) {
                         try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
@@ -2646,8 +2561,25 @@ fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed
         .secret = any_secret,
         .own_paths = raws,
         .secret_paths = secret_raws.items,
-        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
+        .repo = try recordTag(ctx, file.live_path),
     });
+}
+
+/// True after saying so when `.moxignore` matches the named path whose
+/// source left the tree: it is left alone, records and all.
+fn ignoredStale(ctx: *app.Ctx, resolver: *const mox.dsl.resolver.Resolver, m_state: *const mox.machine.state.MachineState, live: []const u8) !bool {
+    const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, ctx.context.?.paths.repo_dir, resolver, m_state);
+    if (!ruleset.isPathIgnored(try mox.source.path.liveKeyRelToHome(ctx.alloc, m_state.home, live), false)) return false;
+    try ctx.out.print("  {f}: matched by .moxignore, left alone\n", .{display.of(live, m_state.home)});
+    return true;
+}
+
+/// The tag a record commit rewrites names: the layer its record already
+/// names, the private layer's or the repo's.
+fn recordTag(ctx: *app.Ctx, live_path: []const u8) ![]const u8 {
+    const context = ctx.context.?;
+    const repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
+    return mox.apply.applied.tagFor(ctx.alloc, ctx.io, context.paths.state_dir, live_path, repo);
 }
 
 /// How a routed file that passes verification stands: its recompose equals
@@ -7299,37 +7231,6 @@ fn findByLive(tree: mox.source.tree.ManagedTree, live_path: []const u8) ?mox.sou
     return null;
 }
 
-/// The generator (or `completions` set) whose current re-expansion produces
-/// `live_path` as one of its leaves, or null when no managed file's expansion
-/// does. Tried for a scoped `mox commit <path>` argument that named a leaf
-/// directly rather than the generator's own path -- a leaf is not itself in
-/// `tree_files`, so `scope.filterTree` cannot resolve it. Re-expands every
-/// candidate (there is no cheaper index), which is fine at the scale a repo's
-/// generator count runs at.
-fn findGeneratorLeaf(
-    arena: std.mem.Allocator,
-    io: Io,
-    tree_files: []const mox.source.tree.ManagedFile,
-    resolver: *const mox.dsl.resolver.Resolver,
-    m_state: *const mox.machine.state.MachineState,
-    secrets: mox.compose.catB.SecretCtx,
-    live_path: []const u8,
-) !?mox.source.tree.ManagedFile {
-    for (tree_files) |f| {
-        var diag: mox.compose.interp.Diag = .{};
-        const gen = mox.compose.catB.composeGenerator(arena, io, f, resolver, m_state, secrets, &diag) catch continue;
-        const outputs = gen orelse continue;
-        // A generator's produced path is `joinKeyOnto`'d, so it can carry `/`
-        // separators even on Windows, while `live_path` comes from a native
-        // path resolution. Compare in key form so the two agree on any OS.
-        const want = try mox.source.path.toKey(arena, live_path);
-        for (outputs) |o| {
-            if (std.mem.eql(u8, try mox.source.path.toKey(arena, o.live_path), want)) return f;
-        }
-    }
-    return null;
-}
-
 /// Ask where a shared-origin (base / universal-fragment) line edit belongs.
 ///
 /// Narrowing is an INTENT, not an impact fact: whether `export EDITOR=nvim`
@@ -9258,23 +9159,17 @@ test "PathIds: a file whose identity cannot be read is keyed by its path" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     const locked = try std.fs.path.join(a, &.{ root, "locked" });
     const path = try std.fs.path.join(a, &.{ locked, "data.toml" });
-    try std.testing.expect(fileIdentity(io, path) != null);
+    try std.testing.expect(mox.apply.identity.of(io, path, .follow) != null);
 
     // A directory that cannot be searched: the file exists, but neither its
     // real path nor its identity can be read.
     try Io.Dir.cwd().setFilePermissions(io, locked, Io.File.Permissions.fromMode(0o000), .{});
     defer Io.Dir.cwd().setFilePermissions(io, locked, Io.File.Permissions.fromMode(0o755), .{}) catch {};
     // Root searches anything; the fallback is about a refused read.
-    if (fileIdentity(io, path) != null) return error.SkipZigTest;
+    if (mox.apply.identity.of(io, path, .follow) != null) return error.SkipZigTest;
     var ids: PathIds = .init(a, io);
     try std.testing.expectEqualStrings(path, try ids.canonical(path));
     try std.testing.expectEqualStrings(path, try ids.of(path));
-}
-
-test "linuxDevice: a kernel dev_t splits into statx's major and minor halves" {
-    try std.testing.expectEqual((@as(u64, 8) << 32) | 1, linuxDevice(0x801));
-    // Major 259, minor 300: the minor's high bits sit above the major's.
-    try std.testing.expectEqual((@as(u64, 259) << 32) | 300, linuxDevice(44 | (259 << 8) | (256 << 12)));
 }
 
 test "Journal: an absent path under a regular file is unreadable on every platform" {
@@ -9292,21 +9187,6 @@ test "Journal: an absent path under a regular file is unreadable on every platfo
     const absent = try std.fs.path.join(a, &.{ base, "d", "sub", "leaf" });
     try j.record(a, io, absent);
     try std.testing.expectEqual(@as(?[]const u8, null), j.entries.get(absent).?.content);
-}
-
-test "fileIdentity: the fstatat fallback reads the identity statx does" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
-    const path = try tmp.dir.realPathFileAlloc(io, "f", a);
-    const z = try std.posix.toPosixPath(path);
-    const via_statx = fileIdentity(io, path) orelse return error.SkipZigTest;
-    try std.testing.expectEqual(via_statx, linuxStatIdentity(&z).?);
 }
 
 test "recoveryName: a path under neither root, or leaving its root, has no rooted name" {

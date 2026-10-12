@@ -60,6 +60,35 @@ pub fn repoTag(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, home: []c
     return std.fmt.allocPrint(arena, "{s}\x00{s}", .{ try realOrGiven(arena, io, repo_dir), try realOrGiven(arena, io, home) });
 }
 
+/// The tag of a record written for a file only the private layer holds:
+/// the repo's tag with the layer named, so a sweep can leave such a file in
+/// place while the private layer is absent.
+pub fn privateTag(arena: std.mem.Allocator, repo_tag: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}\x00private", .{repo_tag});
+}
+
+/// Which layer of `repo_tag` the record tag `rec` names, or null when it
+/// names another repo or HOME, or none.
+pub const Layer = enum { repo, private };
+pub fn layerOf(rec: ?[]const u8, repo_tag: []const u8) ?Layer {
+    const r = rec orelse return null;
+    if (std.mem.eql(u8, r, repo_tag)) return .repo;
+    if (r.len == repo_tag.len + "\x00private".len and std.mem.startsWith(u8, r, repo_tag) and std.mem.eql(u8, r[repo_tag.len..], "\x00private")) return .private;
+    return null;
+}
+
+/// The tag to record `live_path` under for `repo_tag`: the private layer's
+/// when the record there now names it, else the repo's.
+pub fn tagFor(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, repo_tag: []const u8) ![]const u8 {
+    const prior: ?[]const u8 = blk: {
+        if (try readSymlinkRecord(arena, io, state_dir, live_path)) |r| break :blk r.repo;
+        if (try readOwned(arena, io, state_dir, live_path)) |r| break :blk r.repo;
+        const bytes = Io.Dir.cwd().readFileAlloc(io, try recordPath(arena, state_dir, live_path), arena, .limited(max_record_bytes)) catch break :blk null;
+        break :blk if (try parseWhole(arena, bytes)) |w| w.repo else null;
+    };
+    return if (layerOf(prior, repo_tag) == .private) privateTag(arena, repo_tag) else repo_tag;
+}
+
 fn realOrGiven(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
     return Io.Dir.realPathFileAbsoluteAlloc(io, path, arena) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -342,13 +371,25 @@ fn ownedPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const
 /// "the user put something here" (drift), mirroring the content-hash record
 /// for regular files. Three named lines, each value percent-encoded.
 pub fn recordSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, target: []const u8, repo: []const u8) !void {
+    return writeSymlinkRecord(arena, io, state_dir, live_path, target, repo, false);
+}
+
+/// Record that rollback put back, at `live_path`, a symlink to `target` that
+/// mox had planted. Until it is applied again it is drift: nothing re-points,
+/// removes or writes through it without `--overwrite`.
+pub fn recordRolledBackLink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, target: []const u8, repo: []const u8) !void {
+    return writeSymlinkRecord(arena, io, state_dir, live_path, target, repo, true);
+}
+
+fn writeSymlinkRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, target: []const u8, repo: []const u8, rolled_back: bool) !void {
     if (std.mem.indexOfScalar(u8, live_path, '\n') != null) return error.NewlineInLivePath;
     const path = try symlinkPath(arena, state_dir, live_path);
     if (std.fs.path.dirname(path)) |parent| {
         try Io.Dir.cwd().createDirPath(io, parent);
     }
-    const body = try std.fmt.allocPrint(arena, "target {s}\npath {s}\nrepo {s}\n", .{
-        try pctEncode(arena, target), try pctEncode(arena, live_path), try pctEncode(arena, repo),
+    const body = try std.fmt.allocPrint(arena, "target {s}\npath {s}\nrepo {s}\n{s}", .{
+        try pctEncode(arena, target),                   try pctEncode(arena, live_path), try pctEncode(arena, repo),
+        if (rolled_back) "state rolled-back\n" else "",
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
     // One record family per path: a link is no longer a whole file or a
@@ -364,6 +405,8 @@ pub const SymlinkRecord = struct {
     target: []const u8,
     live_path: ?[]const u8 = null,
     repo: ?[]const u8 = null,
+    /// Put back by rollback: drift until it is applied again.
+    rolled_back: bool = false,
 };
 
 pub fn parseSymlink(arena: std.mem.Allocator, bytes: []const u8) !SymlinkRecord {
@@ -371,21 +414,51 @@ pub fn parseSymlink(arena: std.mem.Allocator, bytes: []const u8) !SymlinkRecord 
     const l1 = lines.next() orelse return .{ .target = bytes };
     const l2 = lines.next() orelse return .{ .target = bytes };
     const l3 = lines.next() orelse return .{ .target = bytes };
+    const l4 = lines.next();
     if (lines.next() != null) return .{ .target = bytes };
     const target = (try namedValue(arena, l1, "target")) orelse return .{ .target = bytes };
     const live = (try namedValue(arena, l2, "path")) orelse return .{ .target = bytes };
     const repo = (try namedValue(arena, l3, "repo")) orelse return .{ .target = bytes };
-    return .{ .target = target, .live_path = live, .repo = repo };
+    if (l4) |l| if (!std.mem.eql(u8, l, "state rolled-back")) return .{ .target = bytes };
+    return .{ .target = target, .live_path = live, .repo = repo, .rolled_back = l4 != null };
+}
+
+/// The target of the symlink at `live_path` when mox planted it (its target
+/// is the one the symlink record holds), or null when there is no such link.
+pub fn plantedLink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?[]const u8 {
+    const recorded = (try readSymlink(arena, io, state_dir, live_path)) orelse return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = Io.Dir.cwd().readLink(io, live_path, &buf) catch return null;
+    if (!sameSymlinkTarget(buf[0..n], recorded)) return null;
+    return try arena.dupe(u8, buf[0..n]);
 }
 
 /// Read the last-applied symlink target for `live_path`, or null when none.
+/// A link rollback put back is not one mox applied: it reads as none.
 pub fn readSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?[]const u8 {
+    const rec = (try readSymlinkRecord(arena, io, state_dir, live_path)) orelse return null;
+    return if (rec.rolled_back) null else rec.target;
+}
+
+/// The symlink record for `live_path`, rolled back or not.
+pub fn readSymlinkRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?SymlinkRecord {
     const path = try symlinkPath(arena, state_dir, live_path);
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_record_bytes)) catch |e| switch (e) {
         error.FileNotFound => return null,
         else => return e,
     };
-    return (try parseSymlink(arena, bytes)).target;
+    return try parseSymlink(arena, bytes);
+}
+
+/// The target of the symlink at `live_path` when it is one mox planted that
+/// rollback put back, or null.
+pub fn rolledBackLink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?[]const u8 {
+    const rec = (try readSymlinkRecord(arena, io, state_dir, live_path)) orelse return null;
+    if (!rec.rolled_back) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = Io.Dir.cwd().readLink(io, live_path, &buf) catch return null;
+    if (!sameSymlinkTarget(buf[0..n], rec.target)) return null;
+    return try arena.dupe(u8, buf[0..n]);
 }
 
 fn symlinkPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const u8) ![]u8 {
@@ -403,6 +476,11 @@ pub fn forget(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path
     Io.Dir.cwd().deleteFile(io, try contentPath(arena, state_dir, live_path)) catch {};
     Io.Dir.cwd().deleteFile(io, try symlinkPath(arena, state_dir, live_path)) catch {};
     Io.Dir.cwd().deleteFile(io, try ownedPath(arena, state_dir, live_path)) catch {};
+}
+
+/// Delete only the symlink record for `live_path`: a file is there now.
+pub fn forgetSymlink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !void {
+    Io.Dir.cwd().deleteFile(io, try symlinkPath(arena, state_dir, live_path)) catch {};
 }
 
 /// Delete only the owned record for `live_path`. Whole-file apply calls this

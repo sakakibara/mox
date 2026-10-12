@@ -21,6 +21,8 @@ const Io = std.Io;
 const applied = @import("applied.zig");
 const snapshot = @import("snapshot.zig");
 const stale = @import("stale.zig");
+const live_remove = @import("live_remove.zig");
+const removable = @import("removable.zig");
 const parent_link = @import("parent_link.zig");
 const write = @import("write.zig");
 const prov_map = @import("../provenance/root.zig").map;
@@ -60,7 +62,12 @@ pub const Options = struct {
     ruleset: ?*const ignore_match.RuleSet = null,
     /// The inodes of every path still produced or managed: a dropped file
     /// that is the same file as one of them is forgotten, never removed.
-    kept_inodes: ?*const std.AutoHashMap(u128, void) = null,
+    kept_inodes: ?*const stale.Kept = null,
+    /// Live paths still produced or managed: never removed.
+    keep: ?*const std.StringHashMap(void) = null,
+    /// The private layer is absent: a manifest written for a generator only
+    /// it holds is left alone.
+    private_missing: bool = false,
 };
 
 pub const Result = struct {
@@ -72,6 +79,8 @@ pub const Result = struct {
     /// Leaves refused for a reason `--overwrite` cannot resolve
     /// (unsnapshottable, undeletable, or now a directory/special file).
     error_refused: usize = 0,
+    /// Leaves `.moxignore` matches: left alone, records and all.
+    ignored: usize = 0,
 };
 
 fn manifestPath(arena: std.mem.Allocator, state_dir: []const u8, gen_live: []const u8) ![]u8 {
@@ -133,7 +142,7 @@ pub fn allGenerators(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![
 }
 
 /// The repo a manifest's bytes name, or null for an untagged one.
-fn repoOf(arena: std.mem.Allocator, bytes: []const u8) !?[]const u8 {
+pub fn repoOf(arena: std.mem.Allocator, bytes: []const u8) !?[]const u8 {
     const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len;
     const first = bytes[0..nl];
     if (!std.mem.startsWith(u8, first, "repo ")) return null;
@@ -217,26 +226,7 @@ pub const OrphanScan = struct {
     }
 };
 
-/// How the orphan sweep judges one file of an orphaned generator.
-pub const LeafVerdict = enum {
-    /// Already gone: its records are forgotten.
-    gone,
-    /// Below a symlinked directory: left in place, its records forgotten.
-    linked_parent,
-    /// The same file as a path still produced or managed (a case-only
-    /// rename, a hardlink): its records forgotten, nothing removed.
-    same_file,
-    /// A path `.moxignore` matches: not mox's to touch.
-    ignored,
-    /// Now a directory, a special file, or unreadable: refused.
-    refused,
-    /// Now a symlink, or edited since mox wrote it: drift.
-    drift,
-    /// Unedited: removed, snapshot-first.
-    remove,
-};
-
-pub const PlannedLeaf = struct { path: []const u8, verdict: LeafVerdict };
+pub const PlannedLeaf = struct { path: []const u8, verdict: removable.Verdict };
 
 /// One orphaned manifest: released by a tombstone (its records forgotten,
 /// its files kept), or its files as the sweep would judge them.
@@ -246,28 +236,15 @@ pub const OrphanManifest = struct {
     leaves: []const PlannedLeaf,
 };
 
-/// Judge one file the way `removeLeaf` acts on it.
-pub fn judgeLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8) !LeafVerdict {
-    if (parent_link.through(io, opts.home, live_path, opts.links)) return .linked_parent;
-    if (opts.kept_inodes) |k| if (stale.sameFile(io, live_path, k)) return .same_file;
-    if (opts.ruleset) |rs| {
-        if (rs.isPathIgnored(try source_path.liveKeyRelToHome(arena, opts.home, live_path), false)) return .ignored;
-    }
-    switch (applied.inspectSymSite(io, arena, live_path)) {
-        .absent => return .gone,
-        .directory => return .refused,
-        .symlink => return .drift,
-        .other => {},
-    }
-    if (write.guardLiveRead(io, live_path) == .special) return .refused;
-    const content = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(max_content_bytes)) catch |e| switch (e) {
-        error.FileNotFound => return .gone,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return .refused,
-    };
-    const rec = try applied.read(arena, io, opts.state_dir, live_path);
-    const clean = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
-    return if (clean) .remove else .drift;
+/// Judge one generated file the way `removeLeaf` acts on it.
+pub fn judgeLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8) !removable.Verdict {
+    return removable.judge(arena, io, .{
+        .home = opts.home,
+        .keep = opts.keep,
+        .kept = opts.kept_inodes,
+        .ruleset = opts.ruleset,
+        .links = opts.links,
+    }, live_path, .{ .whole = try applied.read(arena, io, opts.state_dir, live_path) });
 }
 
 /// Every orphaned manifest in `<state>/generated/` and what the sweep would
@@ -279,9 +256,10 @@ pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *co
     var kept: std.ArrayList([]const u8) = .empty;
     var kit = scan.keep.keyIterator();
     while (kit.next()) |k| try kept.append(arena, k.*);
-    const inodes = try arena.create(std.AutoHashMap(u128, void));
+    const inodes = try arena.create(stale.Kept);
     inodes.* = try stale.inodesOf(arena, io, kept.items);
     opts.kept_inodes = inodes;
+    opts.keep = &scan.keep;
     var out: std.ArrayList(OrphanManifest) = .empty;
     const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
     const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
@@ -290,7 +268,8 @@ pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *co
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
         const r = (try repoOf(arena, bytes)) orelse continue;
-        if (!std.mem.eql(u8, r, opts.repo)) continue;
+        const layer = applied.layerOf(r, opts.repo) orelse continue;
+        if (layer == .private and opts.private_missing) continue;
         const leaves = try leavesOf(arena, bytes);
         for (leaves) |leaf| if (!parent_link.underHome(leaf, opts.home)) continue :outer;
         const released = if (try generatorOf(arena, bytes)) |g|
@@ -331,17 +310,9 @@ pub fn sweepOrphans(
         }
         var all_removed = true;
         for (m.leaves) |leaf| {
-            if (leaf.verdict == .ignored) {
-                all_removed = false;
-                continue;
-            }
-            if (leaf.verdict == .same_file) {
-                if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, leaf.path);
-                continue;
-            }
-            const before = result.drift_refused + result.error_refused;
-            try removeLeaf(arena, io, opts, leaf.path, stdout, stderr, &result);
-            if (result.drift_refused + result.error_refused > before) all_removed = false;
+            const before = result.drift_refused + result.error_refused + result.ignored;
+            try actOnLeaf(arena, io, opts, leaf.path, leaf.verdict, stdout, stderr, &result);
+            if (result.drift_refused + result.error_refused + result.ignored > before) all_removed = false;
         }
         if (all_removed and !opts.dry_run) Io.Dir.cwd().deleteFile(io, m.path) catch {};
     }
@@ -362,11 +333,34 @@ pub fn orphanManifestOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8,
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
         if (try repoOf(arena, bytes)) |r| {
-            if (!std.mem.eql(u8, r, repo)) continue;
+            if (applied.layerOf(r, repo) == null) continue;
         } else if (!untagged) continue;
         for (try leavesOf(arena, bytes)) |l| if (std.mem.eql(u8, l, leaf)) return path;
     }
     return null;
+}
+
+/// Every manifest `orphanManifestOf` would consider that lists `leaf`.
+pub fn orphanManifestsOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, untagged: bool, tree_live: *const std.StringHashMap(void), leaf: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var tree_names = std.StringHashMap(void).init(arena);
+    var it = tree_live.keyIterator();
+    while (it.next()) |p| try tree_names.put(try arena.dupe(u8, &manifestName(p.*)), {});
+    const gen_dir_path = try std.fs.path.join(arena, &.{ state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
+    for (entries) |entry| {
+        if (entry.kind != .file or tree_names.contains(entry.name)) continue;
+        const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
+        if (try repoOf(arena, bytes)) |r| {
+            if (applied.layerOf(r, repo) == null) continue;
+        } else if (!untagged) continue;
+        for (try leavesOf(arena, bytes)) |l| if (std.mem.eql(u8, l, leaf)) {
+            try out.append(arena, path);
+            break;
+        };
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Every existing file an untagged manifest -- written before manifests
@@ -377,6 +371,8 @@ pub fn untaggedOrphanLeaves(arena: std.mem.Allocator, io: Io, state_dir: []const
     var it = tree_live.keyIterator();
     while (it.next()) |p| try tree_names.put(try arena.dupe(u8, &manifestName(p.*)), {});
     var out: std.ArrayList([]const u8) = .empty;
+    // One file two old manifests both list is still one file.
+    var seen = std.StringHashMap(void).init(arena);
     const gen_dir_path = try std.fs.path.join(arena, &.{ state_dir, "generated" });
     const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
     for (entries) |entry| {
@@ -384,6 +380,7 @@ pub fn untaggedOrphanLeaves(arena: std.mem.Allocator, io: Io, state_dir: []const
         const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ gen_dir_path, entry.name }), arena, .limited(max_content_bytes)) catch continue;
         if ((try repoOf(arena, bytes)) != null) continue;
         for (try leavesOf(arena, bytes)) |leaf| {
+            if (tree_live.contains(leaf) or (try seen.getOrPut(leaf)).found_existing) continue;
             Io.Dir.cwd().access(io, leaf, .{}) catch continue;
             try out.append(arena, leaf);
         }
@@ -423,6 +420,10 @@ pub fn dropLeaf(arena: std.mem.Allocator, io: Io, manifest_path: []const u8, lea
 pub fn removeNamedLeaf(arena: std.mem.Allocator, io: Io, opts: Options, manifest_path: []const u8, leaf: []const u8, stdout: *Io.Writer, stderr: *Io.Writer) !Result {
     var result: Result = .{};
     try removeLeaf(arena, io, opts, leaf, stdout, stderr, &result);
+    if (result.ignored > 0) {
+        try stdout.print("  {s}: matched by .moxignore, left alone\n", .{try tilde(arena, opts.home, leaf)});
+        return result;
+    }
     if (!opts.dry_run and result.drift_refused + result.error_refused == 0) try dropLeaf(arena, io, manifest_path, leaf);
     return result;
 }
@@ -448,8 +449,9 @@ pub fn pruneStale(
     return result;
 }
 
-/// Remove one generated leaf that is no longer produced. Snapshot-first, and
-/// refuse rather than delete anything unrecoverable or drifted (without force).
+/// Remove one generated leaf that is no longer produced, as `judgeLeaf`
+/// judges it: snapshot first, and refused rather than deleted when it is
+/// unrecoverable, or drifted without `--overwrite`.
 fn removeLeaf(
     arena: std.mem.Allocator,
     io: Io,
@@ -459,125 +461,90 @@ fn removeLeaf(
     stderr: *Io.Writer,
     result: *Result,
 ) !void {
-    if (opts.kept_inodes) |k| if (stale.sameFile(io, live_path, k)) {
-        if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
-        return;
+    try actOnLeaf(arena, io, opts, live_path, try judgeLeaf(arena, io, opts, live_path), stdout, stderr, result);
+}
+
+/// Act on one leaf as `verdict` judged it.
+fn actOnLeaf(
+    arena: std.mem.Allocator,
+    io: Io,
+    opts: Options,
+    live_path: []const u8,
+    verdict: removable.Verdict,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    result: *Result,
+) !void {
+    const shown = try tilde(arena, opts.home, live_path);
+    const found: removable.Found = switch (verdict) {
+        .kept, .leave => return,
+        .ignored => {
+            result.ignored += 1;
+            return;
+        },
+        .same_file, .gone => {
+            if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
+            return;
+        },
+        .now_dir => {
+            if (opts.dry_run) return;
+            try forgetRecords(arena, io, opts.state_dir, live_path);
+            try stdout.print("  {s}: now a directory mox did not write; its record is forgotten\n", .{shown});
+            return;
+        },
+        .linked_parent => {
+            if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
+            try stdout.print("  {s}: {s}\n", .{ shown, parent_link.reason });
+            return;
+        },
+        .refused => |why| {
+            result.error_refused += 1;
+            try stderr.print("  {s}: generated leaf {s}\n", .{ shown, why });
+            return;
+        },
+        .drift => |d| blk: {
+            if (opts.force) break :blk d.found;
+            result.drift_refused += 1;
+            if (!opts.mute_drift_message)
+                try stderr.print("  DRIFT {s} (generated leaf {s}; 'mox commit' or re-run with --overwrite to prune)\n", .{ shown, d.why });
+            return;
+        },
+        .remove => |f| f,
     };
-    if (parent_link.through(io, opts.home, live_path, opts.links)) {
-        if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
-        try stdout.print("  {s}: {s}\n", .{ try tilde(arena, opts.home, live_path), parent_link.reason });
-        return;
-    }
-    // Inspect the leaf WITHOUT following a symlink. A leaf that drifted into a
-    // link must be snapshotted AS a link and removed -- never dereferenced,
-    // which would back up an unrelated target's content and change the entry's
-    // type on rollback.
-    switch (applied.inspectSymSite(io, arena, live_path)) {
-        // Already gone: nothing to remove, but clear its stale records so a
-        // later unrelated file at this path is not read as mox-written.
-        .absent => {
-            try forgetRecords(arena, io, opts.state_dir, live_path);
-            return;
-        },
-        // Never delete a directory that appeared where a leaf was. `--overwrite`
-        // does not resolve this (there is no directory-replace primitive
-        // here), so it is an error, not drift needing a decision.
-        .directory => {
-            result.error_refused += 1;
-            try stderr.print("  {s}: generated leaf is now a directory, not removing\n", .{try tilde(arena, opts.home, live_path)});
-            return;
-        },
-        // mox only ever wrote a regular file as a generated leaf, so a symlink
-        // here is drift: refuse without --overwrite, else snapshot the LINK (its
-        // target string, not the dereferenced content) and remove it.
-        .symlink => |target| {
-            if (!opts.force) {
-                result.drift_refused += 1;
-                if (!opts.mute_drift_message)
-                    try stderr.print("  DRIFT {s} (generated leaf is now a symlink; 'mox commit' or re-run with --overwrite to prune)\n", .{try tilde(arena, opts.home, live_path)});
-                return;
-            }
-            if (opts.dry_run) {
-                result.removed += 1;
-                try stdout.print("  would remove {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
-                return;
-            }
-            snapshot.saveSymlink(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, target) catch |e| {
-                result.error_refused += 1;
-                try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
-                return;
-            };
-            Io.Dir.cwd().deleteFile(io, live_path) catch |e| {
-                result.error_refused += 1;
-                try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
-                return;
-            };
-            try forgetRecords(arena, io, opts.state_dir, live_path);
-            result.removed += 1;
-            try stdout.print("  removed {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
-            return;
-        },
-        // Not a symlink, directory, or absent entry: usually a regular file.
-        // The kind guard below refuses the special inodes this also covers.
-        .other => {},
-    }
-
-    // A FIFO/socket/device where a leaf was: mox never wrote it, cannot back
-    // it up, and opening a FIFO to read would block -- refuse, never delete.
-    switch (write.guardLiveRead(io, live_path)) {
-        .readable, .absent => {},
-        .special => {
-            result.error_refused += 1;
-            try stderr.print("  {s}: generated leaf is not a regular file, not removing\n", .{try tilde(arena, opts.home, live_path)});
-            return;
-        },
-    }
-
-    const content = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(max_content_bytes)) catch |e| switch (e) {
-        error.FileNotFound => {
-            try forgetRecords(arena, io, opts.state_dir, live_path);
-            return;
-        },
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            result.error_refused += 1;
-            try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; not removing, cannot read to back up)\n", .{try tilde(arena, opts.home, live_path)});
-            return;
-        },
-    };
-
-    // A clean leaf is exactly what mox last wrote here. A drifted one (edited,
-    // or never recorded) is refused without --overwrite, mirroring the exact sweep.
-    const rec = try applied.read(arena, io, opts.state_dir, live_path);
-    const clean = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
-    if (!clean and !opts.force) {
-        result.drift_refused += 1;
-        if (!opts.mute_drift_message)
-            try stderr.print("  DRIFT {s} (generated leaf edited; 'mox commit' or re-run with --overwrite to prune)\n", .{try tilde(arena, opts.home, live_path)});
-        return;
-    }
     if (opts.dry_run) {
         result.removed += 1;
-        try stdout.print("  would remove {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
+        try stdout.print("  would remove {s} (generated, no longer produced)\n", .{shown});
         return;
     }
+    switch (found) {
+        .link => |target| try finishLeaf(arena, io, opts, live_path, .{ .link = target }, null, stdout, stderr, result),
+        // The snapshot keeps the content with secret lines redacted.
+        .file => |content| try finishLeaf(arena, io, opts, live_path, .{ .file = try redactedContent(arena, io, opts.state_dir, live_path, content) }, content, stdout, stderr, result),
+    }
+}
 
-    // Snapshot the prior content (secret lines redacted from its provenance)
-    // before deleting, and refuse the delete if the snapshot cannot be taken.
-    const snap_content = try redactedContent(arena, io, opts.state_dir, live_path, content);
-    snapshot.save(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path, snap_content) catch |e| {
-        result.error_refused += 1;
-        try stderr.print("  UNSNAPSHOTTABLE {s} (generated leaf; snapshot failed, not removing: {s})\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
-        return;
-    };
-    Io.Dir.cwd().deleteFile(io, live_path) catch |e| {
-        result.error_refused += 1;
-        try stderr.print("  {s}: could not remove generated leaf: {s}\n", .{ try tilde(arena, opts.home, live_path), @errorName(e) });
-        return;
-    };
-    try forgetRecords(arena, io, opts.state_dir, live_path);
-    result.removed += 1;
-    try stdout.print("  removed {s} (generated, no longer produced)\n", .{try tilde(arena, opts.home, live_path)});
+/// Remove one leaf through `live_remove`, forgetting its records once gone.
+fn finishLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8, snap: live_remove.Snap, expect: ?[]const u8, stdout: *Io.Writer, stderr: *Io.Writer, result: *Result) !void {
+    const shown = try tilde(arena, opts.home, live_path);
+    switch (live_remove.remove(arena, io, .{ .home = opts.home, .snapshots_dir = opts.snapshots_dir, .snap_id = opts.snap_id, .links = opts.links, .expect = expect, .state_dir = opts.state_dir }, live_path, snap)) {
+        .removed => {
+            try forgetRecords(arena, io, opts.state_dir, live_path);
+            result.removed += 1;
+            try stdout.print("  removed {s} (generated, no longer produced)\n", .{shown});
+        },
+        .left => |why| {
+            try forgetRecords(arena, io, opts.state_dir, live_path);
+            try stdout.print("  {s}: {s}\n", .{ shown, why });
+        },
+        .failed => |why| {
+            result.error_refused += 1;
+            try stderr.print("  {s}: generated leaf {s}\n", .{ shown, why });
+        },
+        .changed => {
+            result.error_refused += 1;
+            try stderr.print("  CONFLICT {s} (changed underneath mox mid-apply; re-run 'mox apply')\n", .{shown});
+        },
+    }
 }
 
 /// `path` as reports name it, a leading HOME written `~`.

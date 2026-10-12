@@ -92,6 +92,37 @@ fn findByLive(tree_files: []const ManagedFile, live: []const u8) ?ManagedFile {
     return null;
 }
 
+/// The generator (or `completions` set) whose current re-expansion produces
+/// `live_path` as one of its leaves, or null when no managed file's expansion
+/// does. Tried for a scoped `mox apply` or `mox commit` argument that named a leaf
+/// directly rather than the generator's own path -- a leaf is not itself in
+/// `tree_files`, so `scope.filterTree` cannot resolve it. Re-expands every
+/// candidate (there is no cheaper index), which is fine at the scale a repo's
+/// generator count runs at.
+pub fn generatorProducing(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    tree_files: []const mox.source.tree.ManagedFile,
+    resolver: *const mox.dsl.resolver.Resolver,
+    m_state: *const mox.machine.state.MachineState,
+    secrets: mox.compose.catB.SecretCtx,
+    live_path: []const u8,
+) !?mox.source.tree.ManagedFile {
+    for (tree_files) |f| {
+        var diag: mox.compose.interp.Diag = .{};
+        const gen = mox.compose.catB.composeGenerator(arena, io, f, resolver, m_state, secrets, &diag) catch continue;
+        const outputs = gen orelse continue;
+        // A generator's produced path is `joinKeyOnto`'d, so it can carry `/`
+        // separators even on Windows, while `live_path` comes from a native
+        // path resolution. Compare in key form so the two agree on any OS.
+        const want = try mox.source.path.toKey(arena, live_path);
+        for (outputs) |o| {
+            if (std.mem.eql(u8, try mox.source.path.toKey(arena, o.live_path), want)) return f;
+        }
+    }
+    return null;
+}
+
 const testing = std.testing;
 
 /// A home root that is absolute on the HOST. `std.fs.path.isAbsolute` is
