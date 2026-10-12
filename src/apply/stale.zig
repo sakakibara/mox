@@ -249,7 +249,7 @@ pub fn judge(
         error.FileNotFound, error.NotDir => return .gone,
         else => return .special,
     };
-    if (tree_inodes.contains(@intCast(st.inode))) return .same_file;
+    if (inodeIn(st.inode, tree_inodes)) return .same_file;
     switch (c.kind) {
         .owned => return .leave,
         .symlink => {
@@ -266,6 +266,18 @@ pub fn judge(
             return if (std.mem.eql(u8, &h, &c.hash)) .remove else .drift;
         },
     }
+}
+
+/// True when `path` is the same file as one whose inode `kept` holds: a
+/// case-only rename on a case-insensitive filesystem, or a hardlink. Both
+/// sweeps then forget the record and remove nothing.
+pub fn sameFile(io: Io, path: []const u8, kept: *const std.AutoHashMap(u128, void)) bool {
+    const st = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return inodeIn(st.inode, kept);
+}
+
+fn inodeIn(inode: anytype, kept: *const std.AutoHashMap(u128, void)) bool {
+    return kept.contains(@intCast(inode));
 }
 
 /// The inode of every path in `paths` that exists, read without following

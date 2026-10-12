@@ -6531,3 +6531,28 @@ test "apply partial: a user's symlink is patched through and rolled back through
     const st = try Io.Dir.cwd().statFile(io, try h.liveOf("app.toml"), .{ .follow_symlinks = false });
     try std.testing.expect(st.kind == .sym_link);
 }
+
+test "generated: a case-only rename of a generated file keeps the file on a case-insensitive system" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("k=a\n", try read(io, a, try h.liveOf(".config/id-a.inc")));
+    // A generator gone entirely while another produces the same file by case.
+    try writeRepo(io, &tmp, "repo/src/.config/h.inc", "# mox: for id in \"data/ids.toml\" into \"ID-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    const r2 = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expectEqualStrings("k=a\n", try read(io, a, try h.liveOf(".config/ID-a.inc")));
+}

@@ -680,6 +680,10 @@ fn applyPass(
     // drops any: the stale-record sweep below never touches one.
     const manifest_leaves = try mox.apply.generated.allLeaves(ctx.alloc, ctx.io, context.paths.state_dir);
     const tree_links = try mox.apply.stale.managedLinks(ctx.alloc, tree.files);
+    var kept_list: std.ArrayList([]const u8) = .empty;
+    var kept_it = keep_set.keyIterator();
+    while (kept_it.next()) |k| try kept_list.append(ctx.alloc, k.*);
+    const kept_inodes = try mox.apply.stale.inodesOf(ctx.alloc, ctx.io, kept_list.items);
 
     // Second pass: prune each SUCCEEDED generator's dropped leaves against the
     // global keep, then record its current set. A failed generator prunes
@@ -697,6 +701,7 @@ fn applyPass(
             .dry_run = dry_run,
             .mute_drift_message = true,
             .links = &tree_links,
+            .kept_inodes = &kept_inodes,
         }, g.prior, &keep_set, ctx.out, ctx.err);
         counts.removed += prune.removed;
         if (prune.removed > 0 and !dry_run) snapshotted = true;

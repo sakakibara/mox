@@ -58,6 +58,9 @@ pub const Options = struct {
     /// The ignore rules: an orphaned generator's file they match is left
     /// alone, as the stale sweep leaves one.
     ruleset: ?*const ignore_match.RuleSet = null,
+    /// The inodes of every path still produced or managed: a dropped file
+    /// that is the same file as one of them is forgotten, never removed.
+    kept_inodes: ?*const std.AutoHashMap(u128, void) = null,
 };
 
 pub const Result = struct {
@@ -220,6 +223,9 @@ pub const LeafVerdict = enum {
     gone,
     /// Below a symlinked directory: left in place, its records forgotten.
     linked_parent,
+    /// The same file as a path still produced or managed (a case-only
+    /// rename, a hardlink): its records forgotten, nothing removed.
+    same_file,
     /// A path `.moxignore` matches: not mox's to touch.
     ignored,
     /// Now a directory, a special file, or unreadable: refused.
@@ -243,6 +249,7 @@ pub const OrphanManifest = struct {
 /// Judge one file the way `removeLeaf` acts on it.
 pub fn judgeLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8) !LeafVerdict {
     if (parent_link.through(io, opts.home, live_path, opts.links)) return .linked_parent;
+    if (opts.kept_inodes) |k| if (stale.sameFile(io, live_path, k)) return .same_file;
     if (opts.ruleset) |rs| {
         if (rs.isPathIgnored(try source_path.liveKeyRelToHome(arena, opts.home, live_path), false)) return .ignored;
     }
@@ -267,7 +274,14 @@ pub fn judgeLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []c
 /// do with it: a manifest `scan` does not know, tagged with `opts.repo`.
 /// An untagged manifest, another repo's or HOME's, or one listing a file
 /// outside this run's HOME is never an orphan here.
-pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts: Options, scan: *const OrphanScan) ![]const OrphanManifest {
+pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *const OrphanScan) ![]const OrphanManifest {
+    var opts = opts_in;
+    var kept: std.ArrayList([]const u8) = .empty;
+    var kit = scan.keep.keyIterator();
+    while (kit.next()) |k| try kept.append(arena, k.*);
+    const inodes = try arena.create(std.AutoHashMap(u128, void));
+    inodes.* = try stale.inodesOf(arena, io, kept.items);
+    opts.kept_inodes = inodes;
     var out: std.ArrayList(OrphanManifest) = .empty;
     const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
     const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
@@ -321,6 +335,10 @@ pub fn sweepOrphans(
                 all_removed = false;
                 continue;
             }
+            if (leaf.verdict == .same_file) {
+                if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, leaf.path);
+                continue;
+            }
             const before = result.drift_refused + result.error_refused;
             try removeLeaf(arena, io, opts, leaf.path, stdout, stderr, &result);
             if (result.drift_refused + result.error_refused > before) all_removed = false;
@@ -362,6 +380,10 @@ fn removeLeaf(
     stderr: *Io.Writer,
     result: *Result,
 ) !void {
+    if (opts.kept_inodes) |k| if (stale.sameFile(io, live_path, k)) {
+        if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
+        return;
+    };
     if (parent_link.through(io, opts.home, live_path, opts.links)) {
         if (!opts.dry_run) try forgetRecords(arena, io, opts.state_dir, live_path);
         try stdout.print("  {s}: {s}\n", .{ try tilde(arena, opts.home, live_path), parent_link.reason });

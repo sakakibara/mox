@@ -879,10 +879,11 @@ sweep would.
 - A released path is forgotten and never removed -- on macOS and Windows,
   whose filesystems ignore case, whatever the ASCII case its record or its
   generator spells (other case differences, and Unicode normalization, are
-  not folded; see the warning below) -- a
-  `.moxignore`-matched one left alone, and one that is the same file as a
-  managed path (a case-only rename on a case-insensitive filesystem, or a
-  hardlink) forgotten with nothing removed.
+  not folded; see the warning below) -- a `.moxignore`-matched one left
+  alone, and one that is the same file as a managed or produced path (a
+  case-only rename on a case-insensitive filesystem, or a hardlink)
+  forgotten with nothing removed. A generator's dropped file is judged the
+  same way.
 
 `mox status` reports such a file `STALE` (an edited one `DRIFT`), and `mox
 diff` shows a pending removal. Nothing is swept -- by this sweep or by the

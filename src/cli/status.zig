@@ -153,7 +153,7 @@ fn orphanRows(
         for (m.leaves) |leaf| {
             const shown = try display.alloc(ctx.alloc, leaf.path, home);
             switch (leaf.verdict) {
-                .gone, .ignored => {},
+                .gone, .ignored, .same_file => {},
                 .remove => {
                     tally.add(.stale);
                     try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.stale.text(), shown });
