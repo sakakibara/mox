@@ -70,13 +70,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
 
-    // An attributes file that is not valid TOML stops every command.
-    for ([_][2][]const u8{ .{ context.paths.repo_dir, ".mox/attributes.toml" }, .{ context.paths.private_dir, "private .mox/attributes.toml" } }) |f| {
-        if (try mox.source.attributes.tomlFailure(ctx.alloc, ctx.io, f[0], f[1])) |why| {
-            try ctx.err.print("mox doctor: {s}\n", .{why});
-            return 2;
-        }
-    }
+    if (try apply_cmd.attributesFailure(ctx, "mox doctor")) return 2;
 
     // A dedicated capture solely for the legacy-extras notice: every other
     // capture in this command tolerates its own failure independently (a

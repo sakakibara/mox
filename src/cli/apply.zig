@@ -22,6 +22,7 @@ pub const Spec = struct {
 };
 
 pub fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+    if (try attributesFailure(ctx, "mox apply")) return 2;
     return applyImpl(ctx, a.overwrite, a.dry_run, a.skip_scripts, a.defaults, a.color orelse .auto, a.paths, null);
 }
 
@@ -1945,6 +1946,20 @@ const StaleInput = struct {
     only: ?*const std.StringHashMap(void) = null,
     dry_run: bool,
 };
+
+/// True after naming an attributes file, the repo's or the private
+/// layer's, that cannot be read or is not valid TOML: every command but
+/// rollback then exits 2.
+pub fn attributesFailure(ctx: *app.Ctx, cmd: []const u8) !bool {
+    const context = ctx.context orelse return false;
+    for ([_][2][]const u8{ .{ context.paths.repo_dir, ".mox/attributes.toml" }, .{ context.paths.private_dir, "private .mox/attributes.toml" } }) |f| {
+        if (try mox.source.attributes.unusable(ctx.alloc, ctx.io, f[0], f[1])) |why| {
+            try ctx.err.print("{s}: {s}\n", .{ cmd, why });
+            return true;
+        }
+    }
+    return false;
+}
 
 /// The options every orphan sweep and its preview judge with.
 pub fn orphanOptions(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, snap_id: []const u8, force: bool, dry_run: bool) !mox.apply.generated.Options {

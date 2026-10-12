@@ -718,7 +718,8 @@ does not parse in its format is an `ERROR` line on stderr, as apply
 reports it. Read-only and takes no lock. A difference is not
 an error, so a run that completes exits 0 whether or not anything
 differs. An `attributes.toml`, the repo's or the private layer's, that is
-not valid TOML stops the run with exit 2, as it does in every command. A
+not valid TOML or cannot be read stops the run with exit 2, as it does in
+every command except rollback, which warns and still restores whole files. A
 refusal exits 1: a path that is not managed, a head ownership declaration
 that does not parse, and an attributes entry that breaks the schema, with
 or without a source. A file's own `ERROR` that does not come from an

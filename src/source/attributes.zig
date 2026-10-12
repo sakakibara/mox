@@ -475,6 +475,21 @@ pub fn parseFailure(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]c
     return parseFailureNamed(arena, io, repo_dir, ".mox/attributes.toml");
 }
 
+/// Why the attributes file under `root`, named `name`, stops every command:
+/// it cannot be read ("cannot read <name>: <reason>"), or it is not valid
+/// TOML (its line, column and reason). Null when it is absent or parses.
+pub fn unusable(arena: std.mem.Allocator, io: Io, root: []const u8, name: []const u8) !?[]const u8 {
+    const path = try std.fs.path.join(arena, &.{ root, ".mox", "attributes.toml" });
+    _ = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        error.OutOfMemory => return e,
+        error.IsDir => return try std.fmt.allocPrint(arena, "cannot read {s}: it is a directory", .{name}),
+        error.AccessDenied, error.PermissionDenied => return try std.fmt.allocPrint(arena, "cannot read {s}: permission denied", .{name}),
+        else => return try std.fmt.allocPrint(arena, "cannot read {s}: {s}", .{ name, @errorName(e) }),
+    };
+    return tomlFailure(arena, io, root, name);
+}
+
 /// Where and why the attributes file under `root` is not valid TOML, named
 /// `name`, or null when it is absent or parses.
 pub fn tomlFailure(arena: std.mem.Allocator, io: Io, root: []const u8, name: []const u8) !?[]const u8 {

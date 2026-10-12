@@ -60,7 +60,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     {
         const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
         var walk_diag: mox.source.tree.Diag = .{};
-        const base_tree: ?mox.source.tree.ManagedTree = mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, context.paths.home, &walk_diag) catch |e| switch (e) {
+        // An attributes file that cannot be read or parsed leaves the
+        // whole-file restores to run: recovery must stay possible.
+        var unusable: ?[]const u8 = null;
+        for ([_][2][]const u8{ .{ context.paths.repo_dir, ".mox/attributes.toml" }, .{ context.paths.private_dir, "private .mox/attributes.toml" } }) |f| {
+            if (unusable == null) unusable = try mox.source.attributes.unusable(ctx.alloc, ctx.io, f[0], f[1]);
+        }
+        if (unusable) |why| try ctx.err.print("mox rollback: warning: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{why});
+        const base_tree: ?mox.source.tree.ManagedTree = if (unusable != null) null else mox.source.tree.walkDiag(ctx.alloc, ctx.io, src_dir, context.paths.home, &walk_diag) catch |e| switch (e) {
             error.FileNotFound => null,
             error.OwnOnSymlink,
             error.OwnOnSeedOnce,

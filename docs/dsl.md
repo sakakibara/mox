@@ -644,8 +644,10 @@ key on a target that is not strict JSON -- is that file's error alone: it is
 reported as the file's `ERROR`, and every other file still applies. One with
 no source at its path, such as a mistyped tombstone, is reported at that path
 the same way, and nothing is swept while it stands. A file that is not valid
-TOML, the repo's or the private layer's, stops the run in every command with
-exit 2, named with its line, column and reason.
+TOML, the repo's or the private layer's, stops every command except rollback
+with exit 2, named with its line, column and reason; one that cannot be read
+(a directory, no permission) stops them the same way with `cannot read
+<file>: <reason>`. rollback warns and still restores whole files.
 
 The file is maintained by mox (`add`, `mv`, `remove`): commands that write
 entries rewrite it deterministically, so it carries no comments. A command

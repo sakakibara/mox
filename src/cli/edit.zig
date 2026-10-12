@@ -140,6 +140,7 @@ const Spec = struct {
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+    if (try apply_cmd.attributesFailure(ctx, "mox edit")) return 2;
     const context = ctx.context.?;
     const name = a.name;
     const axis_str: ?[]const u8 = a.axis;

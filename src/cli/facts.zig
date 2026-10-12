@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
@@ -22,6 +23,7 @@ const BareSpec = struct {
 /// listing as facts sees only `name = "value"` lines, and a listing copied
 /// into facts.toml does not pin a value the repo derives on each machine.
 fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
+    if (try apply_cmd.attributesFailure(ctx, "mox facts")) return 2;
     const context = ctx.context.?;
     var facts_diag: mox.machine.facts.Diag = .{};
     const current = mox.machine.facts.load(ctx.alloc, ctx.io, context.paths.facts_path, &facts_diag) catch |e| switch (e) {
@@ -306,6 +308,7 @@ fn findDimension(dims: []const mox.machine.dimensions.Dimension, name: []const u
 /// Refuses on a non-TTY (no `scripted_input` seam either): there is no
 /// meaningful non-interactive form of "ask again".
 fn askRun(ctx: *app.Ctx, a: cli.Args(AskSpec)) anyerror!u8 {
+    if (try apply_cmd.attributesFailure(ctx, "mox facts ask")) return 2;
     const context = ctx.context.?;
     const scripted_input = app.stdin_override;
     if (scripted_input == null and !tty.isInteractive(0)) {

@@ -112,8 +112,9 @@ All notable changes to mox are documented here. The format follows
 - `rollback` replaces a symlink mox planted at a live path, as before, but
   refuses one it did not plant, naming the snapshot copy left in place and
   exiting 1, instead of destroying the user's link with no copy kept.
-- An attributes file that is not valid TOML, the repo's or the private
-  layer's, stops every command with exit 2.
+- An attributes file that is not valid TOML or cannot be read, the repo's or
+  the private layer's, stops every command except rollback with exit 2,
+  naming the file; rollback warns and still restores whole files.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
   run where any file failed to compose or write or carried a head error.
 

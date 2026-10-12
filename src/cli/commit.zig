@@ -1220,6 +1220,7 @@ fn reconcilePackages(
 }
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+    if (try apply_cmd.attributesFailure(ctx, "mox commit")) return 2;
     return commitImpl(ctx, a.dry_run, a.yes, a.abort_on_prompt, a.color orelse .auto, a.paths);
 }
 

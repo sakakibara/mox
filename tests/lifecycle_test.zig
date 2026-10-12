@@ -6424,17 +6424,28 @@ test "attributes: a repo or private attributes file that is not valid TOML exits
 
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".new"), .data = "n\n" });
+    const cmds = [_][]const []const u8{ &.{"apply"}, &.{"status"}, &.{"diff"}, &.{"commit"}, &.{"doctor"}, &.{ "add", "~/.new" }, &.{ "edit", "~/.a" }, &.{"facts"} };
     for ([_][]const u8{ "repo/.mox/attributes.toml", "state/private/.mox/attributes.toml" }) |where| {
-        try writeRepo(io, &tmp, where, "[\".a\"]\nmode =\n");
-        for ([_][]const u8{ "apply", "status", "diff", "commit", "doctor" }) |cmd| {
-            const r = try h.run(&.{ "mox", cmd });
-            if (r.rc != 2 or std.mem.indexOf(u8, r.err, "attributes.toml:2:") == null) {
-                std.debug.print("{s} {s}: rc {d}\n{s}\n{s}\n", .{ where, cmd, r.rc, r.out, r.err });
-                return error.WrongExit;
+        for ([_]bool{ false, true }) |as_dir| {
+            const full = try std.fs.path.join(a, &.{ h.root, where });
+            if (as_dir) try Io.Dir.cwd().createDirPath(io, full) else try writeRepo(io, &tmp, where, "[\".a\"]\nmode =\n");
+            const want = if (as_dir) "attributes.toml: it is a directory" else "attributes.toml:2:";
+            for (cmds) |args| {
+                var argv: std.ArrayList([]const u8) = .empty;
+                try argv.append(a, "mox");
+                try argv.appendSlice(a, args);
+                const r = try h.run(argv.items);
+                if (r.rc != 2 or std.mem.indexOf(u8, r.err, want) == null) {
+                    std.debug.print("{s} {s}: rc {d}\n{s}\n{s}\n", .{ where, args[0], r.rc, r.out, r.err });
+                    return error.WrongExit;
+                }
+                try std.testing.expect(std.mem.indexOf(u8, r.out, "rebuilt provenance") == null);
             }
-            try std.testing.expect(std.mem.indexOf(u8, r.out, "rebuilt provenance") == null);
+            const rb = try h.run(&.{ "mox", "rollback" });
+            try std.testing.expect(std.mem.indexOf(u8, rb.err, "whole-file restores proceed") != null or std.mem.indexOf(u8, rb.err, "no snapshots") != null);
+            if (as_dir) try Io.Dir.cwd().deleteTree(io, full) else try Io.Dir.cwd().deleteFile(io, full);
         }
-        try Io.Dir.cwd().deleteFile(io, try std.fs.path.join(a, &.{ h.root, where }));
     }
     const fix = try h.run(&.{ "mox", "doctor", "--rebuild-provenance" });
     try std.testing.expect(fix.rc != 2);

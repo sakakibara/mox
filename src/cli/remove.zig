@@ -27,6 +27,7 @@ const Spec = struct {
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+    if (try apply_cmd.attributesFailure(ctx, "mox remove")) return 2;
     const context = ctx.context.?;
     const name = a.name;
     const purge = a.purge;

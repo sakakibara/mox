@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const edit = @import("edit.zig");
 const lock_mod = @import("lock.zig");
@@ -673,6 +674,7 @@ fn collectRepeated(alloc: std.mem.Allocator, argv: []const []const u8, long: []c
 }
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+    if (try apply_cmd.attributesFailure(ctx, "mox add")) return 2;
     const context = ctx.context.?;
     if (!context.paths.home_named) {
         try ctx.err.writeAll("mox add: neither HOME nor USERPROFILE is set\n");
