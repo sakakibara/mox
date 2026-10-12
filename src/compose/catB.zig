@@ -693,9 +693,11 @@ pub fn composeGenerator(
         // typed and escaped, as an ordinary file of its format does.
         const leaf_format = source.format.resolve(rendered, file.format == .jsonc and source.format.isJsonPath(rendered));
         var json_state: json_interp.ScanState = .{};
+        var captured_keys = std.StringHashMap(void).init(arena);
         if (leaf_format) |f| if (f.isJson()) {
             json_state.dialect = f.jsonDialect();
             json_state.generator = true;
+            json_state.captured_keys = &captured_keys;
             row_ctx.json = &json_state;
         };
 
@@ -717,7 +719,7 @@ pub fn composeGenerator(
         const contains_secret = prov_mod.map.hasSecret(prov.items);
         const content = try out.toOwnedSlice(arena);
         try outputs.append(arena, .{
-            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null, row_diag.json_key_capture, json_interp.hasBareDefault(loop.body_template)) else null,
+            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null, &captured_keys, json_interp.hasBareDefault(loop.body_template)) else null,
             .live_path = live_path,
             .content = content,
             .prov = try prov.toOwnedSlice(arena),
@@ -741,7 +743,7 @@ pub fn composeGenerator(
 /// generator that composed it; null when it parses. Off the resolving path a
 /// secret placeholder stands in for an unknown value, so such a file is not
 /// judged.
-fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool, key_capture: bool, bare_default: bool) !?[]const u8 {
+fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool, captured_keys: *const std.StringHashMap(void), bare_default: bool) !?[]const u8 {
     if (!resolving and std.mem.indexOf(u8, content, "<SECRET:") != null) return null;
     const layers = [_][]const u8{catA.layerDisplay(arena, file, file.source_base_abs)};
     var d: interp.Diag = .{};
@@ -756,7 +758,7 @@ fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.forma
     };
     // A duplicate the template spells is passed as written, as a single
     // layer's is; only one a key capture made is refused.
-    if (format.isJson() and key_capture) validate.checkDuplicateKeys(arena, format, content, "", &layers, has_secret, &d) catch |e| switch (e) {
+    if (format.isJson() and captured_keys.count() > 0) validate.checkDuplicateKeysAmong(arena, format, content, "", &layers, has_secret, captured_keys, &d) catch |e| switch (e) {
         error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "duplicate key"),
         else => |x| return x,
     };

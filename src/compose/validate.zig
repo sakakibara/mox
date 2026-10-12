@@ -99,7 +99,22 @@ pub fn checkDuplicateKeys(
     has_secret: bool,
     diag: ?*interp.Diag,
 ) Error!void {
-    const hit = (try duplicateKey(arena, format.jsonDialect(), bytes)) orelse return;
+    return checkDuplicateKeysAmong(arena, format, bytes, display, layers, has_secret, null, diag);
+}
+
+/// `checkDuplicateKeys`, reporting only a duplicate of a key in `only` when
+/// set: the keys a key capture made.
+pub fn checkDuplicateKeysAmong(
+    arena: std.mem.Allocator,
+    format: Format,
+    bytes: []const u8,
+    display: []const u8,
+    layers: []const []const u8,
+    has_secret: bool,
+    only: ?*const std.StringHashMap(void),
+    diag: ?*interp.Diag,
+) Error!void {
+    const hit = (try duplicateKeyAmong(arena, format.jsonDialect(), bytes, only)) orelse return;
     const lc = lineCol(bytes, hit.offset);
     const loc = if (layers.len > 0)
         try std.fmt.allocPrint(arena, "composed output line {d} from {s}", .{ lc.line, try layerList(arena, layers) })
@@ -499,6 +514,10 @@ pub const DupHit = struct { key: []const u8, offset: usize, first_offset: usize 
 /// The first object key that repeats within its object, or null. Keys are
 /// compared decoded, so `"a"` and `"\u0061"` are one key.
 pub fn duplicateKey(arena: std.mem.Allocator, dialect: json.Dialect, text: []const u8) !?DupHit {
+    return duplicateKeyAmong(arena, dialect, text, null);
+}
+
+fn duplicateKeyAmong(arena: std.mem.Allocator, dialect: json.Dialect, text: []const u8, only: ?*const std.StringHashMap(void)) !?DupHit {
     const Frame = struct { object: bool, want_key: bool, keys: std.StringHashMap(usize) };
     var stack: std.ArrayList(Frame) = .empty;
     var t = json.Tokenizer.init(text, dialect);
@@ -519,7 +538,10 @@ pub fn duplicateKey(arena: std.mem.Allocator, dialect: json.Dialect, text: []con
                     const decoded = json.parse(arena, slice, .{}) catch continue;
                     if (decoded != .string) continue;
                     const gop = try top.keys.getOrPut(decoded.string);
-                    if (gop.found_existing) return .{ .key = decoded.string, .offset = @intCast(tok.span.start), .first_offset = gop.value_ptr.* };
+                    if (gop.found_existing) {
+                        const counts = if (only) |o| o.contains(decoded.string) else true;
+                        if (counts) return .{ .key = decoded.string, .offset = @intCast(tok.span.start), .first_offset = gop.value_ptr.* };
+                    }
                     gop.value_ptr.* = @intCast(tok.span.start);
                 }
             },

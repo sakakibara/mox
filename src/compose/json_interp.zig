@@ -26,6 +26,8 @@ pub const ScanState = struct {
     /// emits its value as typed JSON, and a string token that is one loop-row
     /// capture is typed as a data capture is.
     generator: bool = false,
+    /// When set, collects every key a key capture made.
+    captured_keys: ?*std.StringHashMap(void) = null,
 };
 
 pub const Result = struct {
@@ -232,6 +234,7 @@ pub fn expand(
         if (is_key) {
             res.key_capture = true;
             if (ctx.diag) |d| d.json_key_capture = true;
+            if (state.captured_keys) |ck| try ck.put(exp.bytes, {});
         }
     }
     try out.appendSlice(arena, text[copied..]);

@@ -8528,3 +8528,18 @@ test "generator: a leaf that does not parse names that a bare capture's default 
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/g-a.json", "a bare capture's default is written as a JSON string"));
     try std.testing.expectEqualStrings("{\"n\": \"null\"}\n", try read(io, a, try c.homePath("ok-a.json")));
 }
+
+test "generator: with a key capture, only a duplicate the capture made is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\nk = \"y\"\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"g-<id.slug>.json\"\n{\"<id.k>\": 1, \"a\": 1, \"a\": 2}\n// mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("{\"y\": 1, \"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("g-a.json")));
+}
