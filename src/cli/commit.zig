@@ -1623,7 +1623,11 @@ fn commitRun(
             continue;
         }
 
-        const last_content = (try mox.apply.applied.readContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
+        const cached = try mox.apply.applied.readContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+        // A cache that is not what the record hashes is older than it: a
+        // secret-bearing composition since replaced it and was never cached.
+        const fresh_cache = if (cached) |c| std.mem.eql(u8, &mox.apply.applied.contentHashHex(c), &recorded.?) else false;
+        const last_content = (if (fresh_cache) cached else null) orelse {
             // A record (content hash) exists, but a secret-bearing
             // composition's cleartext is deliberately never cached: recompose
             // to rebuild a verifiable baseline instead of skipping outright.

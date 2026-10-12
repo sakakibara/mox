@@ -1143,6 +1143,32 @@ test "commit: a hunk contained in one secret segment is shown without its old re
     try std.testing.expectEqualStrings("token = \"<secret:env:MOX_TEST_TOKEN>\"\n", src);
 }
 
+test "commit --dry-run: a content cache older than a secret-bearing composition never shows the secret" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.envrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t-cache" }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    // The cache keeps the first composition: the second resolves a secret and
+    // is never cached.
+    try writeRepo(io, &tmp, "repo/src/.envrc", "export A=1\nexport T=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".envrc");
+    try editLive(io, a, live, "A=1", "A=2");
+
+    const res = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "s3cr3t-cache") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res.err, "s3cr3t-cache") == null);
+    try std.testing.expectEqualStrings("export A=1\nexport T=<secret:env:MOX_TEST_TOKEN>\n", try read(io, a, try h.srcOf(".envrc")));
+}
+
 fn chmodPath(path: []const u8, mode: u32) void {
     var zbuf: [4096]u8 = undefined;
     @memcpy(zbuf[0..path.len], path);
