@@ -5406,9 +5406,20 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
     try std.testing.expectEqual(@as(u8, 1), bad.rc);
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "~/.edited" });
-    try std.testing.expectEqual(@as(u8, 0), dry.rc);
+    try std.testing.expectEqual(@as(u8, 1), dry.rc);
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
-    const c = try h.run(&.{ "mox", "commit", "~/.edited" });
+    // Without --yes off a terminal, commit only reports.
+    const report = try h.run(&.{ "mox", "commit", "~/.edited" });
+    try std.testing.expectEqual(@as(u8, 1), report.rc);
+    try std.testing.expect(std.mem.indexOf(u8, report.out, "would release ~/.edited") != null);
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    // A run that aborts on a prompt releases nothing.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".other"), .data = "o, edited\n" });
+    const strict = try h.run(&.{ "mox", "commit", "--abort-on-prompt", "~/.edited", "~/.other" });
+    try std.testing.expectEqual(@as(u8, 2), strict.rc);
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".other"), .data = "o\n" });
+    const c = try h.run(&.{ "mox", "commit", "--yes", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 0), c.rc);
     try std.testing.expect(std.mem.indexOf(u8, c.out, "released ~/.edited on this machine") != null);
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) == null);

@@ -1247,6 +1247,17 @@ pub fn commitImpl(
     };
 }
 
+/// Forget each of `paths`, named stale paths of a run that commits: the
+/// live file keeps its edit and mox stops tracking it on this machine.
+fn releaseStale(ctx: *app.Ctx, paths: []const []const u8, home: []const u8) !void {
+    const state_dir = ctx.context.?.paths.state_dir;
+    for (paths) |lp| {
+        try mox.apply.applied.forget(ctx.alloc, ctx.io, state_dir, lp);
+        try mox.provenance.map.forget(ctx.alloc, ctx.io, state_dir, lp);
+        try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
+    }
+}
+
 /// `commitImpl`'s run; `package_rows` is set to the package rows recorded
 /// once they are.
 fn commitRun(
@@ -1337,6 +1348,10 @@ fn commitRun(
     // leaves instead of its whole set.
     var scoped_live: ?std.StringHashMap(void) = null;
     var scoped_leaves: ?std.StringHashMap(std.StringHashMap(void)) = null;
+    // Named paths whose source left the tree: each keeps its live edit, and
+    // this machine forgets it once the run commits.
+    var stale_named: []const []const u8 = &.{};
+    var only_stale = false;
     if (paths.len > 0) {
         var direct: std.ArrayList([]const u8) = .empty;
         var leaf_targets: std.ArrayList([]const u8) = .empty;
@@ -1388,20 +1403,8 @@ fn commitRun(
         }
         scoped_live = set;
 
-        // A named path whose source left the tree keeps its live edit: this
-        // machine forgets it, once every other named path is known to be
-        // managed, and no other file is committed for it.
-        for (stale_live.items) |lp| {
-            const shown = display.of(lp, m_state.home);
-            if (dry_run) {
-                try ctx.out.print("  would release {f} on this machine (its source left the tree; the file is kept)\n", .{shown});
-                continue;
-            }
-            try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, lp);
-            try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, lp);
-            try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{shown});
-        }
-        if (stale_live.items.len > 0 and direct.items.len == 0 and leaf_targets.items.len == 0) return 0;
+        stale_named = stale_live.items;
+        only_stale = stale_live.items.len > 0 and direct.items.len == 0 and leaf_targets.items.len == 0;
     }
 
     const scripted_input = app.stdin_override;
@@ -1413,6 +1416,13 @@ fn commitRun(
     const strict = abort_on_prompt and !dry_run;
     const interactive = ((scripted_input != null or tty.isInteractive(0)) and !dry_run and !yes) or strict;
     const report_mode = dry_run or (!interactive and !yes);
+    if (report_mode) for (stale_named) |lp|
+        try ctx.out.print("  would release {f} on this machine (its source left the tree; the file is kept)\n", .{display.of(lp, m_state.home)});
+    if (only_stale) {
+        if (report_mode) return 1;
+        try releaseStale(ctx, stale_named, m_state.home);
+        return 0;
+    }
     // `--yes` takes every default without reading input.
     const ask_mode: prompt.Mode = if (abort_on_prompt)
         .abort_on_prompt
@@ -2489,6 +2499,8 @@ fn commitRun(
     mox.coupling.store.saveGraph(ctx.alloc, ctx.io, coupling_dir, &(try buildCouplingGraph(ctx.alloc, ctx.io, v.tree_now))) catch |e| {
         try ctx.err.print("mox commit: coupling graph not updated: {s}\n", .{@errorName(e)});
     };
+
+    if (!report_mode) try releaseStale(ctx, stale_named, m_state.home);
 
     // The counts are what SURVIVED settling, never what was attempted: an
     // accepted coupled update whose path was restored was not committed.

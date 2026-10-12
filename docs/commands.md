@@ -380,8 +380,9 @@ prompt. Exit codes are listed at the end of this section.
 
 A named path whose source left the tree (a `STALE` or edited stale file)
 has no source to route into: `mox commit <path>` keeps the live file and
-forgets the path on this machine (`released ~/x on this machine`), and
-`--dry-run` says it would.
+forgets the path on this machine (`released ~/x on this machine`) once the
+run commits; a run that only reports (`--dry-run`, or no terminal without
+`--yes`) says it would, and one that aborts releases nothing.
 
 <!-- generated: flags commit -->
 | Flag | Description |
