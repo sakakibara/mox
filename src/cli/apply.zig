@@ -2158,7 +2158,7 @@ fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.dri
             .gone, .same_file => if (!in.dry_run) try forgetAll(ctx, c.live_path),
             .now_dir => if (!in.dry_run) {
                 try forgetAll(ctx, c.live_path);
-                try ctx.out.print("  {s}: now a directory mox did not write; its record is forgotten\n", .{shown});
+                try ctx.out.print("  {s}: now a directory; its record is forgotten\n", .{shown});
             },
             .linked_parent => {
                 if (!in.dry_run) try forgetAll(ctx, c.live_path);

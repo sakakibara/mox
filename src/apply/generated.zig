@@ -485,7 +485,7 @@ fn actOnLeaf(
         .now_dir => {
             if (opts.dry_run) return;
             try forgetRecords(arena, io, opts.state_dir, live_path);
-            try stdout.print("  {s}: now a directory mox did not write; its record is forgotten\n", .{shown});
+            try stdout.print("  {s}: now a directory; its record is forgotten\n", .{shown});
             return;
         },
         .linked_parent => {

@@ -58,7 +58,7 @@ pub const Verdict = union(enum) {
     linked_parent,
     /// Nothing there any more: forget its records.
     gone,
-    /// A directory now, which mox never wrote at this path: its records are
+    /// A directory now, where mox recorded a file or a link: its records are
     /// forgotten, nothing is removed.
     now_dir,
     /// A partially owned file: left in place, its records forgotten.

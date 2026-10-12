@@ -6799,7 +6799,7 @@ test "stale: a record whose path is now a directory mox never wrote is forgotten
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "~/.cfg: now a directory mox did not write; its record is forgotten") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "~/.cfg: now a directory; its record is forgotten") != null);
     const again = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), again.rc);
     try std.testing.expect(std.mem.indexOf(u8, again.out, "now a directory") == null);

@@ -69,9 +69,16 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
     saved catch |e| return .{ .failed = reasonOf(arena, "snapshot failed, not removing", e) };
     if (snap == .link) if (c.state_dir) |sd| notePlanted(arena, io, c, sd, live_path, snap.link) catch |e|
         return .{ .failed = reasonOf(arena, "snapshot failed, not removing", e) };
+    // The snapshot took time: the directories above may have moved since.
+    if (parent_link.through(io, c.home, live_path, c.links)) return .{ .left = parent_link.reason };
     if (c.expect) |want| if (!holds(arena, io, live_path, want)) return .changed;
-    // A link or a directory must still be what was snapshotted.
+    // A file, link or directory must still be what was snapshotted, read
+    // without following a link.
     switch (snap) {
+        .file, .taken_file => switch (applied.inspectSymSite(io, arena, live_path)) {
+            .symlink, .directory => return .changed,
+            .absent, .other => {},
+        },
         .link => |target| switch (applied.inspectSymSite(io, arena, live_path)) {
             .symlink => |now| if (!applied.sameSymlinkTarget(now, target)) return .changed,
             else => return .changed,
@@ -93,6 +100,7 @@ fn notePlanted(arena: std.mem.Allocator, io: Io, c: Ctx, state_dir: []const u8, 
 }
 
 fn holds(arena: std.mem.Allocator, io: Io, live_path: []const u8, want: []const u8) bool {
+    if (applied.inspectSymSite(io, arena, live_path) != .other) return false;
     if (write.guardLiveRead(io, live_path) != .readable) return false;
     const now = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(64 * 1024 * 1024)) catch return false;
     return std.mem.eql(u8, now, want);
@@ -138,5 +146,11 @@ test "remove: a path behind a symlinked directory is left in place, and a failur
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.readLink(io, "h/real/l", &buf);
     try testing.expectEqualStrings("../elsewhere/f", buf[0..n]);
+
+    // A file judged as a file that is a link by the time it is removed is
+    // left as changed, link and target both.
+    try tmp.dir.symLink(io, try std.fs.path.join(a, &.{ root, "elsewhere", "f" }), "h/real/fl", .{});
+    try testing.expect(remove(a, io, c, try std.fs.path.join(a, &.{ home, "real", "fl" }), .{ .file = "x\n" }) == .changed);
+    try testing.expectEqualStrings("x\n", try tmp.dir.readFileAlloc(io, "elsewhere/f", a, .limited(64)));
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "h/real/f", .{}));
 }

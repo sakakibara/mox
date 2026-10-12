@@ -3565,7 +3565,7 @@ test "apply generator: mox remove --purge forgets a leaf that is now a directory
 
     const r = try c.run(&.{ "mox", "remove", "--purge", ".config/gen.inc" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "now a directory mox did not write; its record is forgotten") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "now a directory; its record is forgotten") != null);
     try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf_b, .{})).kind == .directory);
     try std.testing.expect((try mox.apply.applied.read(a, io, c.state, leaf_b)) == null);
 }
