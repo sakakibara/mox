@@ -8468,3 +8468,19 @@ test "generator: a JSON template's string row value expands its own captures, a 
     // The secret is kept out of mox's own content cache.
     try std.testing.expect((try mox.apply.applied.readContent(a, io, c.state, try c.homePath("id-a.json"))) == null);
 }
+
+test "generator: a literal duplicate key is passed as written, one a key capture made is refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\nk = \"x\"\n");
+    try put(io, &tmp, "repo/src/lit.json", "// mox: for id in \"data/ids.toml\" into \"lit-<id.slug>.json\"\n{\"a\": 1, \"a\": 2}\n// mox: end\n");
+    try put(io, &tmp, "repo/src/cap.json", "// mox: for id in \"data/ids.toml\" into \"cap-<id.slug>.json\"\n{\"<id.k>\": 1, \"x\": 2}\n// mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("{\"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("lit-a.json")));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/cap-a.json", "duplicate key"));
+}

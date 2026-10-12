@@ -717,7 +717,7 @@ pub fn composeGenerator(
         const contains_secret = prov_mod.map.hasSecret(prov.items);
         const content = try out.toOwnedSlice(arena);
         try outputs.append(arena, .{
-            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null) else null,
+            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null, row_diag.json_key_capture) else null,
             .live_path = live_path,
             .content = content,
             .prov = try prov.toOwnedSlice(arena),
@@ -736,11 +736,12 @@ pub fn composeGenerator(
     return try outputs.toOwnedSlice(arena);
 }
 
-/// Why a generated file does not parse in `format`, located against the
+/// Why a generated file does not parse in `format`, or holds a duplicate key
+/// a key capture made, located against the
 /// generator that composed it; null when it parses. Off the resolving path a
 /// secret placeholder stands in for an unknown value, so such a file is not
 /// judged.
-fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool) !?[]const u8 {
+fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool, key_capture: bool) !?[]const u8 {
     if (!resolving and std.mem.indexOf(u8, content, "<SECRET:") != null) return null;
     const layers = [_][]const u8{catA.layerDisplay(arena, file, file.source_base_abs)};
     var d: interp.Diag = .{};
@@ -748,7 +749,9 @@ fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.forma
         error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "does not parse"),
         else => |x| return x,
     };
-    if (format.isJson()) validate.checkDuplicateKeys(arena, format, content, "", &layers, has_secret, &d) catch |e| switch (e) {
+    // A duplicate the template spells is passed as written, as a single
+    // layer's is; only one a key capture made is refused.
+    if (format.isJson() and key_capture) validate.checkDuplicateKeys(arena, format, content, "", &layers, has_secret, &d) catch |e| switch (e) {
         error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "duplicate key"),
         else => |x| return x,
     };

@@ -382,12 +382,24 @@ is refused (see Validation). A capture written outside a string
 (`"port": <data.server.port>`) is not JSON and is refused, with the hint to
 quote it.
 
+#### Captures in a JSON generator
+
 A generator source keyed for the JSON family is a template, not a parsed
-layer, so its loop body may also hold a capture outside a string: `"port":
-<id.port>` emits the value as JSON in its own type, a string quoted and
-escaped. A string value that is exactly one loop-row capture (`"<id.port>"`)
-is typed the same way, as a `<data...>` capture is: a row field written
-`port = 1` gives `1`, `port = "1"` gives `"1"`, and `on = true` gives `true`.
+layer. Its files follow the rules above, with these differences, and this
+is the one place they are stated:
+
+- A capture may stand outside a string (`"port": <id.port>`). It emits its
+  value as JSON: a number or bool row field, or a `<data...>` number or
+  bool, in its own type; anything else as a JSON string, quoted and escaped.
+- A string value that is exactly one loop-row capture (`"<id.port>"`) is
+  typed as a `<data...>` capture is: a row field written `port = 1` gives
+  `1`, and `on = true` gives `true`.
+- A string row value (`port = "1"`, `dir = "<machine.os>/bin"`) is always
+  a string, and is expanded first, so the captures it holds -- a machine
+  fact, a `<secret:...>` -- resolve, and a resolved secret stays out of
+  mox's own state.
+- A duplicate key the template spells is passed as written, as a single
+  layer's is; one a key capture made is refused.
 
 A resolved secret is kept out of mox's own on-disk state, but `mox export`
 bakes the resolved cleartext into every file it writes -- that flat tree is the
@@ -847,8 +859,8 @@ Only a source whose bytes compose into the target in its format is checked
 as a layer: a symlink source holds a link target and a generator source holds
 a loop, so neither is parsed as its key's format. Each file a generator
 produces is checked through its output instead, in the format its own path
-names: its captures expand per string token in the JSON family, typed and
-escaped as in any JSON file, and a file that does not parse is that file's
+names: in the JSON family its captures expand as Captures in a JSON
+generator describes, and a file that does not parse is that file's
 `ERROR` -- it is not written, and its generator's other files are.
 
 A layer of a merge is read before captures expand, so a bare capture in a

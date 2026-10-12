@@ -80,7 +80,10 @@ All notable changes to mox are documented here. The format follows
   files expand their captures the same way, and since a generator source is
   a template, a capture outside a string there emits its value as typed
   JSON, and a string that is one loop-row capture is typed as a data
-  capture is (`v = 1` gives `1`, `v = "1"` gives `"1"`).
+  capture is (`v = 1` gives `1`, `v = "1"` gives `"1"`); a string row value
+  is expanded first, so a machine fact or a secret it holds resolves. A
+  duplicate key a generator's template spells is passed as written; one a
+  key capture made is refused.
 - A repeated key in a YAML mapping, which YAML forbids, is refused in any
   layer or output, as TOML's already is.
 - A generic INI file may hold a bare key everywhere mox reads it.
