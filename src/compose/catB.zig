@@ -12,6 +12,7 @@ const secret = @import("../secret/root.zig");
 const prov_mod = @import("../provenance/root.zig");
 const validate = @import("validate.zig");
 const catA = @import("catA.zig");
+const capture = @import("capture.zig");
 
 const Io = std.Io;
 const ManagedFile = source.tree.ManagedFile;
@@ -224,6 +225,9 @@ pub const ComposeError = error{
     GeneratedPathEscapes,
     /// Two generator rows rendered the same `into` path.
     DuplicateGeneratedPath,
+    /// A capture in a generator's `into` path resolves a secret, which a
+    /// file name must never hold.
+    SecretInGeneratedPath,
     /// A `completions` directive reached the normal (single-file) composer.
     /// It is only valid as a file's sole top-level directive with no other
     /// content, intercepted by the generator path; reaching inline emission
@@ -677,6 +681,10 @@ pub fn composeGenerator(
         // Render the path template in the row scope, then guard it: an absolute
         // or `..`-bearing (or empty) result must never join outside the target
         // dir. This is the data-safety gate on where a generated file can land.
+        if (try secretInPath(arena, template, record_ptr, ctx)) |col| {
+            if (ctx.diag) |d| d.set(try std.fmt.allocPrint(arena, "the into path's capture at column {d} resolves a secret, which a file name must not hold", .{col}));
+            return error.SecretInGeneratedPath;
+        }
         const rendered = try interp.expand(arena, template, record_ptr, ctx);
         if (rendered.len == 0 or source.path.keyEscapes(rendered)) {
             if (ctx.diag) |d| d.set(if (rendered.len == 0) template else rendered);
@@ -769,6 +777,28 @@ fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.forma
         error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "duplicate key"),
         else => |x| return x,
     };
+    return null;
+}
+
+/// The 1-based column of the first capture in the `into` path `template`
+/// that resolves a secret -- written there, or held by a row field -- or
+/// null. A `<secret:...>` capture is found without resolving it.
+fn secretInPath(arena: std.mem.Allocator, template: []const u8, record: *const RecordMap, ctx: interp.Ctx) !?usize {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, template, i, '<')) |open| {
+        const close = capture.closeIndex(template, open) orelse return null;
+        const cap = template[open .. close + 1];
+        if (std.mem.startsWith(u8, cap, "<secret:")) return open + 1;
+        var quiet: interp.Diag = .{};
+        var c = ctx;
+        c.diag = &quiet;
+        const exp = interp.expandTracked(arena, cap, record, c) catch {
+            i = close + 1;
+            continue;
+        };
+        if (exp.secret or exp.placeholder) return open + 1;
+        i = close + 1;
+    }
     return null;
 }
 

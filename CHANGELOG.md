@@ -193,6 +193,9 @@ All notable changes to mox are documented here. The format follows
   `ORPHAN`, and `mox commit <file>` forgets one.
 
 ### Fixed
+- A secret in a generator's `into` path -- a `<secret:...>` capture, or a row
+  field holding one -- is a compose error naming the capture's column, never
+  a file name holding the secret.
 - Rollback no longer writes `<mox:redacted-secret>` into a live file: an
   entry whose snapshot holds a redacted secret line is refused, with the
   advice to run `mox apply` to resolve it again, and exits 1.

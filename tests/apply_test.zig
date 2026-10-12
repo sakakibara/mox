@@ -8594,3 +8594,27 @@ test "partial: a live YAML file with a repeated key is refused in fixed text, ne
     try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
     try std.testing.expectEqualStrings("a: 0\nb: hunter2\nb: 3\n", try read(io, a, live));
 }
+
+test "generator: a secret in the into path is a compose error naming its position, never a file name" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\ntok = \"<secret:cmd:printf hunter3>\"\n");
+    try put(io, &tmp, "repo/src/d.inc", "# mox: for id in \"data/ids.toml\" into \"id-<secret:cmd:printf hunter2>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try put(io, &tmp, "repo/src/n.inc", "# mox: for id in \"data/ids.toml\" into \"n-<id.slug>-<id.tok>.inc\"\nk=<id.slug>\n# mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(lineHasBoth(r.err, "~/d.inc", "SecretInGeneratedPath"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "the into path's capture at column 4 resolves a secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "the into path's capture at column 13 resolves a secret") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter") == null);
+    var dir = try Io.Dir.cwd().openDir(io, c.home, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| try std.testing.expect(std.mem.indexOf(u8, e.name, "hunter") == null);
+}
