@@ -634,11 +634,13 @@ directives -- where the format has comments. Strict JSON has none, so a
 | symlink source (`symlink = true`, any key) | not allowed | head directive, its marker (`//` for a `.json` key) | line directive, its marker |
 | any other text file | not allowed | head directive, its marker | line directive, its marker |
 
-Each file has one home for its directives: a directive attribute on any
-target but strict JSON is refused ("write it as a head directive in the
-file"), as it is on a symlink of any key, whose directives live in the head
-of its source; and a `mox:` comment in a strict-JSON layer is refused naming
-its attribute. A generator source holds only its loop, so a directive outside
+Each file has one home for its directives. A directive attribute on any
+target but strict JSON is refused, as it is on a symlink of any key: `when`
+or `defaults` with the advice to write it as a head directive (in a
+symlink's source, whatever its key), and `own`, `disown` or `check` -- on a
+symlink or an unstructured file, where no ownership is possible -- as not
+allowed on that target. A `mox:` comment in a strict-JSON layer is refused
+naming its attribute. A generator source holds only its loop, so a directive outside
 it is refused with the advice to gate the loop instead.
 
 ### Attributes (`.mox/attributes.toml`)

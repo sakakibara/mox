@@ -8559,3 +8559,21 @@ test "generator: each file is checked in the format its own path names, its json
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/x-a.json", "set format = \"jsonc\" for [\".config/x-a.json\"] in .mox/attributes.toml"));
     try std.testing.expectEqualStrings("{\"k\": \"b\" /* note */}\n", try read(io, a, try c.homePath(".config/x-b.json")));
 }
+
+test "attributes: an ownership key where ownership is not possible is not allowed, a gate points to the head" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"l.json\"]\nsymlink = true\nown = [\"a\"]\n\n[\".zshrc\"]\nown = [\"a\"]\n\n[\".bashrc\"]\nwhen = \"os=plan9\"\n");
+    try put(io, &tmp, "repo/src/l.json", "/etc/hosts\n");
+    try put(io, &tmp, "repo/src/.zshrc", "z\n");
+    try put(io, &tmp, "repo/src/.bashrc", "b\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/l.json", "own is not allowed on this target"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.zshrc", "own is not allowed on this target"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.bashrc", "when is a directive key, which only a strict-JSON target takes; write it as a head directive in the file"));
+}
