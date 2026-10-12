@@ -134,7 +134,13 @@ pub const OwnedDoc = struct {
         const root: AnyValue = switch (format) {
             .toml => .{ .toml = toml.parse(arena, text, .{}) catch |e| return parseFail(e) },
             .json, .jsonc => .{ .json = json.parse(arena, text, .{ .dialect = format.jsonDialect() }) catch |e| return parseFail(e) },
-            .yaml => .{ .yaml = yaml.parse(arena, text, .{}) catch |e| return parseFail(e) },
+            .yaml => blk: {
+                const v = yaml.parse(arena, text, .{}) catch |e| return parseFail(e);
+                // YAML forbids a repeated key, which the parser keeps: a
+                // document holding one is no document to patch.
+                if (validate.yamlRepeatsKey(arena, v) catch return error.OutOfMemory) return error.OwnedUnparseable;
+                break :blk .{ .yaml = v };
+            },
             .ini, .gitconfig => .{ .ini = ini.parse(arena, text, .{ .dialect = iniDialect(format) }) catch |e| return parseFail(e) },
         };
         return .{ .format = format, .root = root };

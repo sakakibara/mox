@@ -285,6 +285,11 @@ const YamlDup = struct { key: []const u8, path: []const u8 };
 
 /// The first string key a YAML mapping repeats, with the dotted path of its
 /// value, or null.
+/// True when a YAML value repeats a key in one of its mappings.
+pub fn yamlRepeatsKey(arena: std.mem.Allocator, v: yaml.Value) !bool {
+    return (try yamlDuplicate(arena, v, "")) != null;
+}
+
 fn yamlDuplicate(arena: std.mem.Allocator, v: yaml.Value, path: []const u8) !?YamlDup {
     switch (v) {
         .map => |entries| {

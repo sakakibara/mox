@@ -8577,3 +8577,20 @@ test "attributes: an ownership key where ownership is not possible is not allowe
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.zshrc", "own is not allowed on this target"));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.bashrc", "when is a directive key, which only a strict-JSON target takes; write it as a head directive in the file"));
 }
+
+test "partial: a live YAML file with a repeated key is refused in fixed text, never written back" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/c.yaml", "# mox: own a\na: 1\n");
+    const c = try cliSetup(a, io, &tmp);
+    const live = try c.homePath("c.yaml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a: 0\nb: hunter2\nb: 3\n" });
+    const r = try c.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "live ~/c.yaml:3:1: duplicate key <redacted>"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
+    try std.testing.expectEqualStrings("a: 0\nb: hunter2\nb: 3\n", try read(io, a, live));
+}
