@@ -1917,12 +1917,6 @@ const StaleInput = struct {
     dry_run: bool,
 };
 
-/// Converge files whose source left the tree: an unedited whole file or
-/// symlink mox wrote is removed snapshot-first, an edited one is drift, one
-/// already gone is forgotten, and a partially owned one is left in place
-/// with its records forgotten. A released path is forgotten and never
-/// removed; an ignored one is left alone; the same file as a managed path
-/// (a case-only rename) is forgotten, nothing removed.
 /// The options every orphan sweep and its preview judge with.
 pub fn orphanOptions(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, snap_id: []const u8, force: bool, dry_run: bool) !mox.apply.generated.Options {
     const context = ctx.context.?;
@@ -1984,6 +1978,12 @@ pub fn printUnmatched(out: *std.Io.Writer, u: mox.apply.stale.Unmatched, home: [
     try out.writeAll("\n");
 }
 
+/// Converge files whose source left the tree: an unedited whole file or
+/// symlink mox wrote is removed snapshot-first, an edited one is drift, one
+/// already gone is forgotten, and a partially owned one is left in place
+/// with its records forgotten. A released path is forgotten and never
+/// removed; an ignored one is left alone; the same file as a managed path
+/// (a case-only rename) is forgotten, nothing removed.
 fn sweepStale(ctx: *app.Ctx, in: StaleInput, units: *std.ArrayList(mox.apply.drift.Unit), counts: *Counts, snapshotted: *bool) !void {
     const context = ctx.context.?;
     const stale = mox.apply.stale;
