@@ -166,6 +166,12 @@ All notable changes to mox are documented here. The format follows
   once, with a note, instead of failing every run.
 
 ### Upgrading
+- In a JSON-family generator template, a capture outside a string with a
+  default emits the default as a JSON string: `{"n": <id.nm | default
+  "null">}` gave `{"n": null}` in 0.12.4 and gives `{"n": "null"}` now. A
+  default literal is a string; to emit another JSON type, give the row the
+  value itself (`nm = 1`, `nm = true`). A leaf that then does not parse says
+  so in its error.
 - The private layer is first expected by the first apply that finds it
   holding a source. Before that, a missing private layer behaves as in
   0.12.4: the files only it provided are removed as sources that left the

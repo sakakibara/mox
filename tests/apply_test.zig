@@ -8512,3 +8512,19 @@ test "captures in JSON: a default with raw or escaped quotes is one capture, in 
     try std.testing.expectEqualStrings("// c\n{\"o\": \"z\"}\n", try read(io, a, try c.homePath("raw.jsonc")));
     try std.testing.expectEqualStrings("{\"o\": \"z\"}\n", try read(io, a, try c.homePath("g-a.json")));
 }
+
+test "generator: a leaf that does not parse names that a bare capture's default is a JSON string" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"g-<id.slug>.json\"\n{\"n\": <id.nm | default \"null\">,}\n// mox: end\n");
+    try put(io, &tmp, "repo/src/ok.json", "// mox: for id in \"data/ids.toml\" into \"ok-<id.slug>.json\"\n{\"n\": <id.nm | default \"null\">}\n// mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/g-a.json", "a bare capture's default is written as a JSON string"));
+    try std.testing.expectEqualStrings("{\"n\": \"null\"}\n", try read(io, a, try c.homePath("ok-a.json")));
+}

@@ -119,6 +119,28 @@ test "escapeCaptureQuotes: a raw-quoted default is escaped, an escaped one is le
     try std.testing.expectEqualStrings("{\"a\": \"x < y\"}", try escapeCaptureQuotes(arena.allocator(), "{\"a\": \"x < y\"}"));
 }
 
+/// True when `text` holds a capture outside any string with a `| default`.
+pub fn hasBareDefault(text: []const u8) bool {
+    var i: usize = 0;
+    var in_string = false;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (c == '\\') i += 1 else if (c == '"' or c == '\n') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c != '<') continue;
+        const close = capture.closeIndex(text, i) orelse continue;
+        if (std.mem.indexOf(u8, text[i..close], "| default") != null) return true;
+        i = close;
+    }
+    return false;
+}
+
 /// Expand every capture-bearing string token of `text`. `ctx.json` is
 /// ignored: a decoded string's own captures expand as plain text.
 pub fn expand(

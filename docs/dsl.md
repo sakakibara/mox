@@ -395,6 +395,8 @@ is the one place they are stated:
 - A capture may stand outside a string (`"port": <id.port>`). It emits its
   value as JSON: a number or bool row field, or a `<data...>` number or
   bool, in its own type; anything else as a JSON string, quoted and escaped.
+  A default literal is a string too: `<id.nm | default "null">` gives
+  `"null"`, never `null`.
 - A string value that is exactly one loop-row capture (`"<id.port>"`) is
   typed as a `<data...>` capture is: a row field written `port = 1` gives
   `1`, and `on = true` gives `true`.

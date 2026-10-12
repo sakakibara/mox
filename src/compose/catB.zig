@@ -717,7 +717,7 @@ pub fn composeGenerator(
         const contains_secret = prov_mod.map.hasSecret(prov.items);
         const content = try out.toOwnedSlice(arena);
         try outputs.append(arena, .{
-            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null, row_diag.json_key_capture) else null,
+            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null, row_diag.json_key_capture, json_interp.hasBareDefault(loop.body_template)) else null,
             .live_path = live_path,
             .content = content,
             .prov = try prov.toOwnedSlice(arena),
@@ -741,12 +741,17 @@ pub fn composeGenerator(
 /// generator that composed it; null when it parses. Off the resolving path a
 /// secret placeholder stands in for an unknown value, so such a file is not
 /// judged.
-fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool, key_capture: bool) !?[]const u8 {
+fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool, key_capture: bool, bare_default: bool) !?[]const u8 {
     if (!resolving and std.mem.indexOf(u8, content, "<SECRET:") != null) return null;
     const layers = [_][]const u8{catA.layerDisplay(arena, file, file.source_base_abs)};
     var d: interp.Diag = .{};
     validate.checkOutput(arena, format, content, &layers, has_secret, &d) catch |e| switch (e) {
-        error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "does not parse"),
+        error.FormatViolation => {
+            const why = d.capture() orelse "does not parse";
+            // A typed default reads as its type in 0.12.4; here it is a string.
+            if (bare_default and format.isJson()) return try std.fmt.allocPrint(arena, "{s}; a bare capture's default is written as a JSON string", .{why});
+            return try arena.dupe(u8, why);
+        },
         else => |x| return x,
     };
     // A duplicate the template spells is passed as written, as a single
