@@ -329,8 +329,8 @@ fn splitId(id: []const u8) struct { base: []const u8, n: u64 } {
 }
 
 /// Delete the oldest snapshots so at most `keep` remain. A snapshot a
-/// rollback took of what it replaced does not count, and goes with the
-/// snapshot it undoes.
+/// rollback took of what it replaced does not count, and goes when the
+/// chain of snapshots it undoes ends at one pruned here.
 pub fn prune(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, keep: usize) !void {
     var own: std.ArrayList([]const u8) = .empty;
     var undos: std.ArrayList(struct { id: []const u8, of: []const u8 }) = .empty;
@@ -340,12 +340,20 @@ pub fn prune(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, keep: 
     };
     var drop: std.ArrayList([]const u8) = .empty;
     if (own.items.len > keep) try drop.appendSlice(arena, own.items[0 .. own.items.len - keep]);
-    const kept = own.items[if (own.items.len > keep) own.items.len - keep else 0..];
+    var dropped = std.StringHashMap(void).init(arena);
+    for (drop.items) |d| try dropped.put(d, {});
+    var undo_of = std.StringHashMap([]const u8).init(arena);
+    for (undos.items) |u| try undo_of.put(u.id, u.of);
+    // An undo goes only when the chain of snapshots it undoes ends at one
+    // pruned now. A link that is missing, or a chain that loops, keeps it.
     for (undos.items) |u| {
-        const alive = for (kept) |k| {
-            if (std.mem.eql(u8, k, u.of)) break true;
+        var at = u.of;
+        var steps: usize = 0;
+        const goes = while (steps <= undos.items.len) : (steps += 1) {
+            if (dropped.contains(at)) break true;
+            at = undo_of.get(at) orelse break false;
         } else false;
-        if (!alive) try drop.append(arena, u.id);
+        if (goes) try drop.append(arena, u.id);
     }
     if (drop.items.len == 0) return;
 
@@ -1054,4 +1062,29 @@ test "restore: a planted link is recorded with the tag its snapshot noted, and a
     try std.testing.expectEqual(@as(usize, 1), bad.count);
     try std.testing.expect(bad.warnings.len == 1);
     try std.testing.expect((try applied.readSymlinkRecord(a, io, state, link)) == null);
+}
+
+test "prune: an undo of an undo is kept while its chain reaches a kept snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "20260101T000000Z", "20260101T000001Z", "20260101T000002Z", "20260101T000003Z", "20260101T000004Z" }) |id| try tmp.dir.createDirPath(io, id);
+    // 01 undoes 00; 02 undoes 01; 04 undoes a snapshot that is gone; 03 is
+    // the snapshot kept.
+    try tmp.dir.writeFile(io, .{ .sub_path = "20260101T000001Z.undo", .data = "20260101T000000Z\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "20260101T000002Z.undo", .data = "20260101T000001Z\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "20260101T000004Z.undo", .data = "20250101T000000Z\n" });
+    const snaps = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try prune(a, io, snaps, 2);
+    const left = try list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 5), left.len);
+    // Keep only one own snapshot: 00 goes, and the chain 01 <- 02 with it.
+    try prune(a, io, snaps, 1);
+    const after = try list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 2), after.len);
+    try std.testing.expectEqualStrings("20260101T000003Z", after[0]);
+    try std.testing.expectEqualStrings("20260101T000004Z", after[1]);
 }

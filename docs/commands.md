@@ -1096,7 +1096,8 @@ Before rollback replaces anything at a live path, it keeps what is there in
 a snapshot of its own, named in its report and in `mox snapshot`;
 `rollback` with no id never picks such a snapshot, and `mox rollback
 <id>` puts it back; it does not count toward `MOX_SNAPSHOT_RETENTION`, and
-goes when the snapshot it undoes is pruned. An entry that cannot be
+goes when the chain of snapshots it undoes (it may undo another such
+snapshot) ends at one that is pruned; a chain with a missing link keeps it. An entry that cannot be
 restored is that entry's `ERROR`, naming its snapshot copy, and the rest
 are still restored; a link already as the snapshot has it is left alone
 and not counted. Notes rollback cannot read (a snapshot's planted links,
