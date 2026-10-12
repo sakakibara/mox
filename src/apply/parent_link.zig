@@ -32,8 +32,23 @@ pub fn through(io: Io, home: []const u8, live_path: []const u8, managed_links: ?
         if (managed_links) |m| if (m.contains(dir)) return true;
         const st = Io.Dir.cwd().statFile(io, dir, .{ .follow_symlinks = false }) catch return false;
         if (st.kind == .sym_link) return true;
+        if (builtin.os.tag == .windows and st.kind == .directory and redirected(io, dir)) return true;
     }
     return false;
+}
+
+/// True when the directory `dir` resolves somewhere other than beneath its
+/// own parent: a junction or other reparse point Windows reports as a
+/// directory.
+fn redirected(io: Io, dir: []const u8) bool {
+    var buf: [4 * std.fs.max_path_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    const parent = std.fs.path.dirname(dir) orelse return false;
+    const real_dir = Io.Dir.cwd().realPathFileAlloc(io, dir, a) catch return false;
+    const real_parent = Io.Dir.cwd().realPathFileAlloc(io, parent, a) catch return false;
+    const expected = std.fs.path.join(a, &.{ real_parent, std.fs.path.basename(dir) }) catch return false;
+    return !std.ascii.eqlIgnoreCase(real_dir, expected);
 }
 
 test "through: a symlinked or managed-link parent, or a path outside home" {
@@ -61,4 +76,27 @@ test "through: a symlinked or managed-link parent, or a path outside home" {
     try links.put(try std.fs.path.join(a, &.{ home, "real" }), {});
     try testing.expect(through(io, home, try std.fs.path.join(a, &.{ home, "real", "sub", "f" }), &links));
     try testing.expect(!through(io, home, try std.fs.path.join(a, &.{ home, "real" }), &links));
+}
+
+test "through: a directory junction is refused on Windows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const home = try std.fs.path.join(a, &.{ root, "h" });
+    try tmp.dir.createDirPath(io, "h/real");
+    try tmp.dir.createDirPath(io, "elsewhere");
+    const junction = try std.fs.path.join(a, &.{ home, "j" });
+    const target = try std.fs.path.join(a, &.{ root, "elsewhere" });
+    const res = try std.process.run(a, io, .{ .argv = &.{ "cmd.exe", "/c", "mklink", "/J", junction, target } });
+    if (res.term != .exited or res.term.exited != 0) return error.SkipZigTest;
+
+    try testing.expect(through(io, home, try std.fs.path.join(a, &.{ junction, "f" }), null));
+    try testing.expect(!through(io, home, try std.fs.path.join(a, &.{ home, "real", "f" }), null));
 }
