@@ -727,6 +727,37 @@ pub fn soleDataCapture(arena: std.mem.Allocator, template: []const u8, ctx: Ctx)
     };
 }
 
+/// The scalar a template that is exactly one loop-row capture (`<var>` or
+/// `<var.field>`, no chain, no default) resolves to, typed by how the data
+/// wrote it, or null when the template is anything else or the field is
+/// not a scalar.
+pub fn soleRowCapture(arena: std.mem.Allocator, template: []const u8, ctx: Ctx) std.mem.Allocator.Error!?data.source.Scalar {
+    if (template.len < 2 or template[0] != '<' or template[template.len - 1] != '>') return null;
+    const close = capture.closeIndex(template, 0) orelse return null;
+    if (close != template.len - 1) return null;
+    const inner = template[1..close];
+    if (std.mem.indexOfAny(u8, inner, "| ") != null) return null;
+    const dot = std.mem.indexOfScalar(u8, inner, '.');
+    const head = if (dot) |d| inner[0..d] else inner;
+    for (ctx.scope) |frame| {
+        if (!std.mem.eql(u8, frame.name, head)) continue;
+        switch (frame.value) {
+            .scalar => |s| return if (dot == null) .{ .text = s, .kind = .string } else null,
+            .record => |r| {
+                const d = dot orelse return null;
+                const v = r.get(inner[d + 1 ..]) orelse return null;
+                return switch (v) {
+                    .string => |s| .{ .text = s, .kind = .string },
+                    .int => |i| .{ .text = try std.fmt.allocPrint(arena, "{d}", .{i}), .kind = .integer },
+                    .bool => |b| .{ .text = if (b) "true" else "false", .kind = .boolean },
+                    .array_of_strings => null,
+                };
+            },
+        }
+    }
+    return null;
+}
+
 /// Parse the segments after `data.` into a spec, or null when the depth is
 /// wrong (must be FILE.KEY or FILE.TABLE.KEY -- rejects `<data.x>` and anything
 /// deeper) or a segment is malformed. FILE, TABLE, and KEY all match

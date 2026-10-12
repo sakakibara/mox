@@ -2839,6 +2839,12 @@ fn applyGenerator(
         }
         try current.append(ctx.alloc, o.live_path);
         try produced.put(o.live_path, {});
+        // Not written, but still this generator's: kept, never pruned.
+        if (o.invalid) |why| {
+            counts.fail += 1;
+            try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
+            continue;
+        }
         try applyRegularFile(ctx, .{
             .repo = repo,
             .live_path = o.live_path,

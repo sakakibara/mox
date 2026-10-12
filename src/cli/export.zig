@@ -268,6 +268,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             };
             if (gen) |outputs| {
                 for (outputs) |o| {
+                    if (o.invalid) |why| {
+                        try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, ctx.context.?.paths.home), why });
+                        failed += 1;
+                        continue;
+                    }
                     const dest = (try exportDest(ctx.alloc, out_dir, m_state.home, o.live_path)) orelse {
                         try ctx.err.print("mox export: {f}: outside HOME, cannot place in export tree\n", .{display.of(o.live_path, ctx.context.?.paths.home)});
                         failed += 1;

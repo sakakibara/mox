@@ -54,9 +54,14 @@ pub fn composeFileTracked(
 ) !?[]u8 {
     // A symlink source holds its link target: text, never a document of its
     // key's format.
+    // Its attributes' `when` still decides whether the link is here at all.
     if (file.is_symlink and file.format != null) {
+        if (file.gate) |g| {
+            if (!dsl.axis.evaluate(try dsl.axis.parseString(arena, g), bindings)) return null;
+        }
         var as_text = file;
         as_text.format = null;
+        as_text.gate = null;
         return composeFileTracked(arena, io, as_text, bindings, machine_state_opt, secrets, prov, diag);
     }
     const cat = (try categoryOf(arena, io, file)) orelse return null;
@@ -107,6 +112,11 @@ pub fn wholeFileGateAxisExpr(
     file: ManagedFile,
 ) !?*const dsl.ast.AxisExpr {
     if (file.gate != null) return catA.wholeFileGateAxisExpr(arena, io, file);
+    if (file.is_symlink and file.format != null) {
+        var as_text = file;
+        as_text.format = null;
+        return wholeFileGateAxisExpr(arena, io, as_text);
+    }
     if (!file.has_base) return null;
     const sample = try peekFile(io, arena, file.source_base_abs);
     const cat = category.detect(file.format, file.source_base_path, sample);

@@ -1524,8 +1524,22 @@ fn commitRun(
                 pending = true;
                 continue;
             };
-            if (gen) |outputs| {
+            if (gen) |all_outputs| {
+                // A file that does not parse was never written, so its live
+                // copy holds no edit of this composition to route.
                 const only_leaves = if (scoped_leaves) |*m| m.getPtr(file.live_path) else null;
+                var valid: std.ArrayList(mox.compose.catB.GeneratedFile) = .empty;
+                for (all_outputs) |o| {
+                    if (o.invalid) |why| {
+                        // Reported only when this run was asked about it.
+                        const asked = if (only_leaves) |m| m.contains(try mox.source.path.toKey(ctx.alloc, o.live_path)) else true;
+                        if (asked) {
+                            try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, m_state.home), why });
+                            pending = true;
+                        }
+                    } else try valid.append(ctx.alloc, o);
+                }
+                const outputs = valid.items;
                 switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, context.paths.state_dir, &generated)) {
                     .cont => {},
                     .abort => {

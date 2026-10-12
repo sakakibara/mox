@@ -8163,6 +8163,91 @@ test "apply and commit: a .moxignore'd file of a gone generator is left alone wh
     try std.testing.expectEqualStrings("k=b\nedited\n", try read(io, a, id_b));
 }
 
+test "apply: a symlink of every key format honours a false when gate" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/.mox/attributes.toml",
+        \\["a.json"]
+        \\symlink = true
+        \\when = "os=plan9"
+        \\
+        \\["b.json"]
+        \\symlink = true
+        \\
+        \\["c.toml"]
+        \\symlink = true
+        \\
+        \\["d.yaml"]
+        \\symlink = true
+        \\
+    );
+    try put(io, &tmp, "repo/src/a.json", "/etc/hosts\n");
+    try put(io, &tmp, "repo/src/b.json", "// mox: when os=plan9\n/etc/hosts\n");
+    try put(io, &tmp, "repo/src/c.toml", "# mox: when os=plan9\n/etc/hosts\n");
+    try put(io, &tmp, "repo/src/d.yaml", "# mox: when os=plan9\n/etc/hosts\n");
+    const c = try cliSetup(a, io, &tmp);
+
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "0 clean, 4 gated") != null);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    for ([_][]const u8{ "a.json", "b.json", "c.toml", "d.yaml" }) |k| {
+        try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "skipped ~/{s} (axis-gated off)", .{k})) != null);
+        try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath(k), .{ .follow_symlinks = false }));
+    }
+}
+
+test "generator: a JSON-family file escapes and types its captures, and one that does not parse fails alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\nq = \"x\\\"y\\\\z\"\n");
+    try put(io, &tmp, "repo/data/u.toml", "n = 5\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{\"q\": \"<id.q>\", \"n\": \"<data.u.n>\"}\n// mox: end\n");
+    try put(io, &tmp, "repo/src/g.jsonc", "// mox: for id in \"data/ids.toml\" into \"j-<id.slug>.jsonc\"\n{\"q\": \"<id.q>\", // kept\n\"n\": \"<data.u.n>\"}\n// mox: end\n");
+    try put(io, &tmp, "repo/src/bad.json", "// mox: for id in \"data/ids.toml\" into \"bad-<id.slug>.json\"\n// a comment\n{\"id\": \"<id.slug>\",}\n// mox: end\n");
+    if (builtin.os.tag != .windows) {
+        try put(io, &tmp, "repo/src/s.json", "// mox: for id in \"data/ids.toml\" into \"s-<id.slug>.json\"\n{\"s\": \"<secret:cmd:printf \\\"%s\\\" 'p\\\"w'>\"}\n// mox: end\n");
+    }
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+
+    try std.testing.expectEqualStrings("{\"q\": \"x\\\"y\\\\z\", \"n\": 5}\n", try read(io, a, try c.homePath("id-a.json")));
+    try std.testing.expectEqualStrings("{\"q\": \"x\\\"y\\\\z\", // kept\n\"n\": 5}\n", try read(io, a, try c.homePath("j-a.jsonc")));
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqualStrings("{\"s\": \"p\\\"w\"}\n", try read(io, a, try c.homePath("s-a.json")));
+    }
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/bad-a.json", "composed output line 1 from src/bad.json"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath("bad-a.json"), .{}));
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(lineHasBoth(st.out, "ERROR    ~/bad-a.json", "src/bad.json"));
+}
+
+test "generator: a JSON template types a bare capture and a whole-string loop capture" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"s\"\nb = \"1\"\nq = \"1\"\n[[ids]]\nslug = \"i\"\nb = 1\nq = 1\n[[ids]]\nslug = \"t\"\nb = true\nq = true\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{\"bare\": <id.b>, \"quoted\": \"<id.q>\"}\n// mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("{\"bare\": \"1\", \"quoted\": \"1\"}\n", try read(io, a, try c.homePath("id-s.json")));
+    try std.testing.expectEqualStrings("{\"bare\": 1, \"quoted\": 1}\n", try read(io, a, try c.homePath("id-i.json")));
+    try std.testing.expectEqualStrings("{\"bare\": true, \"quoted\": true}\n", try read(io, a, try c.homePath("id-t.json")));
+}
+
 test "commit: a named .moxignore'd path whose source left the tree is left alone" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

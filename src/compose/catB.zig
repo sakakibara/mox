@@ -10,6 +10,8 @@ const json_interp = @import("json_interp.zig");
 const machine = @import("../machine/root.zig");
 const secret = @import("../secret/root.zig");
 const prov_mod = @import("../provenance/root.zig");
+const validate = @import("validate.zig");
+const catA = @import("catA.zig");
 
 const Io = std.Io;
 const ManagedFile = source.tree.ManagedFile;
@@ -572,6 +574,9 @@ pub const GeneratedFile = struct {
     variable: []const u8 = "",
     where: ?*const dsl.ast.RowExpr = null,
     into: []const u8 = "",
+    /// Why this file does not parse in its key's format, with a location:
+    /// it is not written, and its generator's other files are unaffected.
+    invalid: ?[]const u8 = null,
 };
 
 /// Compose a GENERATOR: a managed file whose SOLE top-level directive is a
@@ -684,6 +689,15 @@ pub fn composeGenerator(
         var row_diag: interp.Diag = .{};
         var row_ctx = ctx;
         row_ctx.diag = &row_diag;
+        // A file in the JSON family expands each capture per string token,
+        // typed and escaped, as an ordinary file of its format does.
+        const leaf_format = source.format.resolve(rendered, file.format == .jsonc and source.format.isJsonPath(rendered));
+        var json_state: json_interp.ScanState = .{};
+        if (leaf_format) |f| if (f.isJson()) {
+            json_state.dialect = f.jsonDialect();
+            json_state.generator = true;
+            row_ctx.json = &json_state;
+        };
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(arena);
@@ -701,9 +715,11 @@ pub fn composeGenerator(
         prov_mod.map.truncateTo(&prov, prov_mod.map.lineCount(out.items));
 
         const contains_secret = prov_mod.map.hasSecret(prov.items);
+        const content = try out.toOwnedSlice(arena);
         try outputs.append(arena, .{
+            .invalid = if (leaf_format) |f| try leafFailure(arena, file, f, content, contains_secret, secrets != null) else null,
             .live_path = live_path,
-            .content = try out.toOwnedSlice(arena),
+            .content = content,
             .prov = try prov.toOwnedSlice(arena),
             .contains_secret = contains_secret,
             .manager_secret = row_diag.manager_secret,
@@ -718,6 +734,25 @@ pub fn composeGenerator(
     }
 
     return try outputs.toOwnedSlice(arena);
+}
+
+/// Why a generated file does not parse in `format`, located against the
+/// generator that composed it; null when it parses. Off the resolving path a
+/// secret placeholder stands in for an unknown value, so such a file is not
+/// judged.
+fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.format.Format, content: []const u8, has_secret: bool, resolving: bool) !?[]const u8 {
+    if (!resolving and std.mem.indexOf(u8, content, "<SECRET:") != null) return null;
+    const layers = [_][]const u8{catA.layerDisplay(arena, file, file.source_base_abs)};
+    var d: interp.Diag = .{};
+    validate.checkOutput(arena, format, content, &layers, has_secret, &d) catch |e| switch (e) {
+        error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "does not parse"),
+        else => |x| return x,
+    };
+    if (format.isJson()) validate.checkDuplicateKeys(arena, format, content, "", &layers, has_secret, &d) catch |e| switch (e) {
+        error.FormatViolation => return try arena.dupe(u8, d.capture() orelse "duplicate key"),
+        else => |x| return x,
+    };
+    return null;
 }
 
 /// One validated completions-registry row, resolved for a target shell.

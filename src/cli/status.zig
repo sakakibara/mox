@@ -376,6 +376,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 var gen_drifted = false;
                 for (outputs) |o| {
                     const leaf_shown = try display.alloc(ctx.alloc, o.live_path, home);
+                    if (o.invalid) |why| {
+                        tally.add(.err);
+                        try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), leaf_shown, why });
+                        continue;
+                    }
                     // Kind guard BEFORE the open: a FIFO here would block the
                     // read and brick the whole report.
                     if (mox.apply.write.guardLiveRead(ctx.io, o.live_path) == .special) {

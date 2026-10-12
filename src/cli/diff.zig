@@ -297,6 +297,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 continue;
             }) |outputs| {
                 for (outputs) |o| {
+                    if (o.invalid) |why| {
+                        try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
+                        continue;
+                    }
                     try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.live_path, o.content, o.prov, &total, &changed);
                 }
                 continue;

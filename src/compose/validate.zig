@@ -366,6 +366,7 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     var check: ?[]const []const u8 = null;
     var gate: ?[]const u8 = null;
     var defaults: std.ArrayList(source.attributes.Default) = .empty;
+    var generator = false;
     while (t.next()) |tok| {
         if (tok.kind != .comment) {
             seen_value = true;
@@ -379,6 +380,7 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
         const verb = args[0..verb_end];
         const rest = std.mem.trim(u8, args[verb_end..], " \t");
         if (std.mem.eql(u8, verb, "end")) has_end = true;
+        if (std.mem.eql(u8, verb, "for") and std.mem.indexOf(u8, rest, " into \"") != null) generator = true;
         if (first == null) first = .{ .verb = verb, .start = start, .leading = !seen_value };
         if (std.mem.eql(u8, verb, "own")) {
             try own.append(arena, rest);
@@ -397,7 +399,11 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     const lc = lineCol(text, hit.start);
     const v = hit.verb;
     const head_verb = eqAny(v, &.{ "own", "disown", "check", "default" }) or (std.mem.eql(u8, v, "when") and hit.leading and !has_end);
-    const hint: []const u8 = if (head_verb) blk: {
+    // A generator with anything beside its loop is judged as the generator
+    // it was meant to be, whatever line is first.
+    const hint: []const u8 = if (generator)
+        generator_hint
+    else if (head_verb) blk: {
         const where = try attributesWhere(arena, display, key);
         var entry: std.ArrayList(u8) = .empty;
         try entry.print(arena, "declare it in {s} and remove the comments:\n{s}", .{ where.file, where.table });
@@ -418,6 +424,10 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     const message = try std.fmt.allocPrint(arena, "mox directive \"{s}\" in strict JSON, which has no comments", .{v});
     return .{ .line = lc.line, .col = lc.col, .message = message, .hint = hint, .hint_quotes = true };
 }
+
+/// A generator template that is not one because something stands outside
+/// its loop: the loop's own clauses and its body are where it varies.
+const generator_hint = "a generator source holds only its `for ... into` loop: move anything else into its body, and gate it with the loop's own `when` or a `when` nested in the body";
 
 const Where = struct { file: []const u8, table: []const u8 };
 
@@ -550,6 +560,13 @@ fn expectFailure(format: Format, text: []const u8, want: []const []const u8) !vo
 
 test "strict JSON: a directive head is refused naming its attributes key" {
     try expectFailure(.json, "// mox: disown a\n{\"a\": 1}\n", &.{ "src/s.json:1:1:", "mox directive \"disown\"", "declare it in .mox/attributes.toml and remove the comments:\n[\"s.json\"]\ndisown = [\"a\"]" });
+}
+
+test "strict JSON: anything beside a generator loop is advised toward the loop" {
+    try expectFailure(.json, "// mox: when os=darwin\n// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{}\n// mox: end\n", &.{ "s.json:1:1:", "a generator source holds only its `for ... into` loop" });
+    try expectFailure(.json, "{}\n// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{}\n// mox: end\n", &.{"a generator source holds only its `for ... into` loop"});
+    try expectFailure(.json, "// a comment\n// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{}\n// mox: end\n", &.{"a generator source holds only its `for ... into` loop"});
+    try expectFailure(.json, "// mox: for id in \"data/ids.toml\" into \"id-<id.slug>.json\"\n{}\n// mox: end\n// mox: keep-empty\n", &.{"a generator source holds only its `for ... into` loop"});
 }
 
 test "strict JSON: each directive kind names its replacement" {

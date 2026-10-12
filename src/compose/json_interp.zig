@@ -12,6 +12,7 @@ const std = @import("std");
 const json = @import("json");
 const interp = @import("interp.zig");
 const data = @import("../data/root.zig");
+const capture = @import("capture.zig");
 
 /// Scanner state carried between chunks of one document expanded piecewise
 /// (Cat B emits a JSONC file line by line and body by body): whether the
@@ -21,6 +22,10 @@ const data = @import("../data/root.zig");
 pub const ScanState = struct {
     in_block_comment: bool = false,
     dialect: json.Dialect = .jsonc,
+    /// A generator template, not a parsed layer: a capture outside a string
+    /// emits its value as typed JSON, and a string token that is one loop-row
+    /// capture is typed as a data capture is.
+    generator: bool = false,
 };
 
 pub const Result = struct {
@@ -37,7 +42,7 @@ pub const Result = struct {
 /// ignored: a decoded string's own captures expand as plain text.
 pub fn expand(
     arena: std.mem.Allocator,
-    text: []const u8,
+    text_in: []const u8,
     dialect: json.Dialect,
     record: ?*const std.StringHashMap(data.value.Value),
     ctx: interp.Ctx,
@@ -45,11 +50,14 @@ pub fn expand(
 ) interp.InterpError!Result {
     var inner_ctx = ctx;
     inner_ctx.json = null;
+    var text = text_in;
 
     const line_count = std.mem.count(u8, text, "\n") + 1;
     const line_secret = try arena.alloc(bool, line_count);
     @memset(line_secret, false);
     var res: Result = .{ .bytes = &.{}, .line_secret = line_secret };
+
+    if (state.generator) text = try typeBareCaptures(arena, text, record, inner_ctx, state.in_block_comment, &res);
 
     var start: usize = 0;
     if (state.in_block_comment) {
@@ -97,7 +105,9 @@ pub fn expand(
         try out.appendSlice(arena, text[copied..s]);
         copied = e;
         if (!is_key) {
-            if (try interp.soleDataCapture(arena, content, inner_ctx)) |sc| {
+            const sole = (try interp.soleDataCapture(arena, content, inner_ctx)) orelse
+                if (state.generator) try interp.soleRowCapture(arena, content, inner_ctx) else null;
+            if (sole) |sc| {
                 switch (sc.kind) {
                     .integer, .boolean => try out.appendSlice(arena, sc.text),
                     .float => if (finiteNumber(sc.text))
@@ -124,6 +134,104 @@ pub fn expand(
     try out.appendSlice(arena, text[copied..]);
     res.bytes = try out.toOwnedSlice(arena);
     return res;
+}
+
+/// `text` with every capture outside a string and a comment replaced by its
+/// value as JSON: a scalar in its own type, anything else a JSON string.
+fn typeBareCaptures(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    record: ?*const std.StringHashMap(data.value.Value),
+    ctx: interp.Ctx,
+    in_block_comment: bool,
+    res: *Result,
+) interp.InterpError![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    var block = in_block_comment;
+    while (i < text.len) {
+        const c = text[i];
+        if (block) {
+            if (std.mem.startsWith(u8, text[i..], "*/")) {
+                block = false;
+                try out.appendSlice(arena, "*/");
+                i += 2;
+            } else {
+                try out.append(arena, c);
+                i += 1;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], "//")) {
+            const end = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+            try out.appendSlice(arena, text[i..end]);
+            i = end;
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], "/*")) {
+            block = true;
+            try out.appendSlice(arena, "/*");
+            i += 2;
+            continue;
+        }
+        if (c == '"') {
+            var j = i + 1;
+            while (j < text.len and text[j] != '"' and text[j] != '\n') : (j += 1) {
+                if (text[j] == '\\') j += 1;
+            }
+            const end = @min(j + 1, text.len);
+            try out.appendSlice(arena, text[i..end]);
+            i = end;
+            continue;
+        }
+        if (c == '<' and captureAt(text, i, ctx)) if (capture_close(text, i)) |close| {
+            const cap = text[i .. close + 1];
+            const sole = (try interp.soleDataCapture(arena, cap, ctx)) orelse try interp.soleRowCapture(arena, cap, ctx);
+            if (sole) |sc| {
+                switch (sc.kind) {
+                    .integer, .boolean => try out.appendSlice(arena, sc.text),
+                    .float => if (finiteNumber(sc.text))
+                        try out.appendSlice(arena, try jsNumber(arena, std.fmt.parseFloat(f64, sc.text) catch unreachable))
+                    else {
+                        if (ctx.diag) |d| d.set(try std.fmt.allocPrint(arena, "{s} is {s}, not representable in JSON", .{ cap[1 .. cap.len - 1], sc.text }));
+                        return error.NotRepresentableInJson;
+                    },
+                    .string, .datetime => try appendJsonString(arena, &out, sc.text),
+                }
+            } else {
+                const exp = try interp.expandTracked(arena, cap, record, ctx);
+                try appendJsonString(arena, &out, exp.bytes);
+                if (exp.secret) {
+                    res.secret = true;
+                    res.line_secret[std.mem.count(u8, text[0..i], "\n")] = true;
+                }
+                if (exp.placeholder) res.placeholder = true;
+            }
+            i = close + 1;
+            continue;
+        };
+        try out.append(arena, c);
+        i += 1;
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// True when the `<` at `open` opens a capture: a secret, a namespace, or a
+/// loop variable in scope.
+fn captureAt(text: []const u8, open: usize, ctx: interp.Ctx) bool {
+    const rest = text[open + 1 ..];
+    if (std.mem.startsWith(u8, rest, "secret:") or capture.hasNamespace(rest)) return true;
+    var n: usize = 0;
+    while (n < rest.len and (std.ascii.isAlphanumeric(rest[n]) or rest[n] == '_')) n += 1;
+    if (n == 0) return false;
+    for (ctx.scope) |f| if (std.mem.eql(u8, f.name, rest[0..n])) return true;
+    return false;
+}
+
+fn capture_close(text: []const u8, open: usize) ?usize {
+    const close = capture.closeIndex(text, open) orelse return null;
+    if (std.mem.indexOfScalar(u8, text[open..close], '\n') != null) return null;
+    return close;
 }
 
 fn nextIsColon(rest: []const json.Token) bool {
