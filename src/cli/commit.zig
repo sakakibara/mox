@@ -1249,12 +1249,15 @@ pub fn commitImpl(
 
 /// Forget each of `paths`, named stale paths of a run that commits: the
 /// live file keeps its edit and mox stops tracking it on this machine.
-fn releaseStale(ctx: *app.Ctx, paths: []const []const u8, home: []const u8) !void {
+fn releaseStale(ctx: *app.Ctx, paths: []const []const u8, home: []const u8, orphans: *const std.StringHashMap([]const u8)) !void {
     const state_dir = ctx.context.?.paths.state_dir;
     for (paths) |lp| {
         try mox.apply.applied.forget(ctx.alloc, ctx.io, state_dir, lp);
         try mox.provenance.map.forget(ctx.alloc, ctx.io, state_dir, lp);
-        try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
+        if (orphans.get(lp)) |m| {
+            try mox.apply.generated.dropLeaf(ctx.alloc, ctx.io, m, lp);
+            try ctx.out.print("  released {f} on this machine: its generator left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
+        } else try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
     }
 }
 
@@ -1351,6 +1354,8 @@ fn commitRun(
     // Named paths whose source left the tree: each keeps its live edit, and
     // this machine forgets it once the run commits.
     var stale_named: []const []const u8 = &.{};
+    // Those of them that a gone generator produced, with their manifests.
+    var orphan_manifests: std.StringHashMap([]const u8) = .init(ctx.alloc);
     var only_stale = false;
     if (paths.len > 0) {
         var direct: std.ArrayList([]const u8) = .empty;
@@ -1358,6 +1363,8 @@ fn commitRun(
         var stale_live: std.ArrayList([]const u8) = .empty;
         const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
         const cands = try mox.apply.stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, m_state.home, tree);
+        var tree_live: std.StringHashMap(void) = .init(ctx.alloc);
+        for (tree.files) |f| try tree_live.put(f.live_path, {});
         for (paths) |p| {
             const live = edit_mod.liveTarget(ctx.alloc, m_state.home, context.cwd, p) catch |e| switch (e) {
                 error.OutOfMemory => return e,
@@ -1367,6 +1374,9 @@ fn commitRun(
                 try direct.append(ctx.alloc, p);
             } else if (mox.apply.stale.at(cands, live) != null) {
                 try stale_live.append(ctx.alloc, live);
+            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, true, &tree_live, live)) |m| {
+                try stale_live.append(ctx.alloc, live);
+                try orphan_manifests.put(live, m);
             } else {
                 try leaf_targets.append(ctx.alloc, live);
             }
@@ -1420,7 +1430,7 @@ fn commitRun(
         try ctx.out.print("  would release {f} on this machine (its source left the tree; the file is kept)\n", .{display.of(lp, m_state.home)});
     if (only_stale) {
         if (report_mode) return 1;
-        try releaseStale(ctx, stale_named, m_state.home);
+        try releaseStale(ctx, stale_named, m_state.home, &orphan_manifests);
         return 0;
     }
     // `--yes` takes every default without reading input.
@@ -2500,7 +2510,7 @@ fn commitRun(
         try ctx.err.print("mox commit: coupling graph not updated: {s}\n", .{@errorName(e)});
     };
 
-    if (!report_mode) try releaseStale(ctx, stale_named, m_state.home);
+    if (!report_mode) try releaseStale(ctx, stale_named, m_state.home, &orphan_manifests);
 
     // The counts are what SURVIVED settling, never what was attempted: an
     // accepted coupled update whose path was restored was not committed.

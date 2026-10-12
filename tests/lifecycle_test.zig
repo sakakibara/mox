@@ -6556,3 +6556,46 @@ test "generated: a case-only rename of a generated file keeps the file on a case
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
     try std.testing.expectEqualStrings("k=a\n", try read(io, a, try h.liveOf(".config/ID-a.inc")));
 }
+
+test "orphans: an edited file of a gone generator is removed by a named --overwrite, or kept by a named commit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    const tmpl = "# mox: for id in \"data/ids.toml\" into \"{s}-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n";
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", try std.fmt.allocPrint(a, tmpl, .{"r"}));
+    try writeRepo(io, &tmp, "state/private/.config/p.inc", try std.fmt.allocPrint(a, tmpl, .{"p"}));
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n\n[[ids]]\nslug = \"b\"\n");
+    try writeRepo(io, &tmp, "state/private/data/ids.toml", "[[ids]]\nslug = \"a\"\n\n[[ids]]\nslug = \"b\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    try Io.Dir.cwd().deleteFile(io, try std.fs.path.join(a, &.{ h.state, "private", ".config", "p.inc" }));
+    for ([_][]const u8{ "r-a", "r-b", "p-a", "p-b" }) |n| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(try std.fmt.allocPrint(a, ".config/{s}.inc", .{n})), .data = "edited\n" });
+    }
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/r-a.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/p-a.inc (its generator left the tree)"));
+
+    for ([_][]const u8{ "r-a", "p-a" }) |n| {
+        const name = try std.fmt.allocPrint(a, "~/.config/{s}.inc", .{n});
+        const r = try h.run(&.{ "mox", "apply", "--overwrite", name });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(!exists(io, try h.liveOf(try std.fmt.allocPrint(a, ".config/{s}.inc", .{n}))));
+    }
+    for ([_][]const u8{ "r-b", "p-b" }) |n| {
+        const name = try std.fmt.allocPrint(a, "~/.config/{s}.inc", .{n});
+        const r = try h.run(&.{ "mox", "commit", "--yes", name });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "its generator left the tree, so mox forgets it") != null);
+        try std.testing.expectEqualStrings("edited\n", try read(io, a, try h.liveOf(try std.fmt.allocPrint(a, ".config/{s}.inc", .{n}))));
+    }
+    const s2 = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, s2.out, "its generator left the tree") == null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try h.liveOf(".config/r-b.inc")));
+}

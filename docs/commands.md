@@ -321,6 +321,8 @@ swept in a run where any file failed to compose or write. A path-scoped run
 sweeps only the stale paths it names: `mox apply --overwrite <path>` is
 how an edited one is removed, since an unscoped `--overwrite` keeps it, and
 `mox commit <path>` keeps its edit by forgetting the path on this machine.
+A file of a generator that left the tree is resolved the same two ways;
+commit also drops it from the generator's manifest.
 
 apply never removes a path through a symlinked directory: when a
 directory between HOME and the path is a symlink, or a path the tree
@@ -378,8 +380,8 @@ without `--yes`, reports only and exits 1 if edits remain;
 `--abort-on-prompt` is strict CI mode, exiting 2 on the first would-be
 prompt. Exit codes are listed at the end of this section.
 
-A named path whose source left the tree (a `STALE` or edited stale file)
-has no source to route into: `mox commit <path>` keeps the live file and
+A named path whose source left the tree (a `STALE` or edited stale file),
+or a file of a generator that left the tree, has no source to route into: `mox commit <path>` keeps the live file and
 forgets the path on this machine (`released ~/x on this machine`) once the
 run commits; a run that only reports (`--dry-run`, or no terminal without
 `--yes`) says it would, and one that aborts releases nothing.

@@ -348,6 +348,63 @@ pub fn sweepOrphans(
     return result;
 }
 
+/// The manifest that lists `leaf` for a generator no longer in the tree
+/// (`tree_live` holds every managed live path): one tagged `repo`, or with
+/// `untagged` one that names no repo. Null when none does.
+pub fn orphanManifestOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, untagged: bool, tree_live: *const std.StringHashMap(void), leaf: []const u8) !?[]const u8 {
+    var tree_names = std.StringHashMap(void).init(arena);
+    var it = tree_live.keyIterator();
+    while (it.next()) |p| try tree_names.put(try arena.dupe(u8, &manifestName(p.*)), {});
+    const gen_dir_path = try std.fs.path.join(arena, &.{ state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return null;
+    for (entries) |entry| {
+        if (entry.kind != .file or tree_names.contains(entry.name)) continue;
+        const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
+        if (try repoOf(arena, bytes)) |r| {
+            if (!std.mem.eql(u8, r, repo)) continue;
+        } else if (!untagged) continue;
+        for (try leavesOf(arena, bytes)) |l| if (std.mem.eql(u8, l, leaf)) return path;
+    }
+    return null;
+}
+
+/// Drop `leaf` from the manifest at `manifest_path`, deleting the manifest
+/// when no file is left in it.
+pub fn dropLeaf(arena: std.mem.Allocator, io: Io, manifest_path: []const u8, leaf: []const u8) !void {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, manifest_path, arena, .limited(max_content_bytes)) catch return;
+    var out: std.ArrayList(u8) = .empty;
+    var leaves: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        defer first = false;
+        if (line.len == 0) continue;
+        const header = (first and std.mem.startsWith(u8, line, "repo ")) or std.mem.startsWith(u8, line, generator_prefix);
+        if (!header) {
+            if (std.mem.eql(u8, line, leaf)) continue;
+            leaves += 1;
+        }
+        try out.appendSlice(arena, line);
+        try out.append(arena, '\n');
+    }
+    if (leaves == 0) {
+        Io.Dir.cwd().deleteFile(io, manifest_path) catch {};
+        return;
+    }
+    try write.writeAtomic(io, manifest_path, out.items, 0o644);
+}
+
+/// Remove one file of an orphaned generator that a scoped run names, as the
+/// orphan sweep would (`opts.force` removes an edited one too), and drop it
+/// from its manifest once it is gone.
+pub fn removeNamedLeaf(arena: std.mem.Allocator, io: Io, opts: Options, manifest_path: []const u8, leaf: []const u8, stdout: *Io.Writer, stderr: *Io.Writer) !Result {
+    var result: Result = .{};
+    try removeLeaf(arena, io, opts, leaf, stdout, stderr, &result);
+    if (!opts.dry_run and result.drift_refused + result.error_refused == 0) try dropLeaf(arena, io, manifest_path, leaf);
+    return result;
+}
+
 /// Remove every prior-set path not in `keep`, snapshot-first. `keep` holds the
 /// paths that must survive: the current produced set plus every other managed
 /// or generated target, so a path handed off to another producer is never

@@ -399,16 +399,24 @@ fn applyPass(
     // A named path whose source left the tree is judged by the stale sweep
     // alone; every other named path must be managed.
     var stale_named: std.StringHashMap(void) = .init(ctx.alloc);
+    // A named file of a generator that left the tree, with its manifest.
+    var orphan_named: std.StringHashMap([]const u8) = .init(ctx.alloc);
     if (scoped) {
         const cands = try mox.apply.stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
+        var tree_live: std.StringHashMap(void) = .init(ctx.alloc);
+        for (tree.files) |f| try tree_live.put(f.live_path, {});
         var managed_paths: std.ArrayList([]const u8) = .empty;
         for (paths) |p| {
             const live = edit.liveTarget(ctx.alloc, home, context.cwd, p) catch {
                 try managed_paths.append(ctx.alloc, p);
                 continue;
             };
-            if (fileops.findByLive(tree, live) == null and mox.apply.stale.at(cands, live) != null) {
+            if (fileops.findByLive(tree, live) != null) {
+                try managed_paths.append(ctx.alloc, p);
+            } else if (mox.apply.stale.at(cands, live) != null) {
                 try stale_named.put(live, {});
+            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, false, &tree_live, live)) |m| {
+                try orphan_named.put(live, m);
             } else try managed_paths.append(ctx.alloc, p);
         }
         var diag: scope.Diag = .{};
@@ -759,6 +767,20 @@ fn applyPass(
     }
     // A full run sweeps every stale path but removes an edited one only when
     // a scoped run names it; a scoped run sweeps only the stale paths it names.
+    if (orphan_named.count() > 0 and counts.fail == 0) {
+        const opts = try orphanOptions(ctx, tree, &ruleset, snap_id, force, dry_run);
+        var oit = orphan_named.iterator();
+        while (oit.next()) |e| {
+            const res = try mox.apply.generated.removeNamedLeaf(ctx.alloc, ctx.io, opts, e.value_ptr.*, e.key_ptr.*, ctx.out, ctx.err);
+            counts.removed += res.removed;
+            if (res.removed > 0 and !dry_run) snapshotted = true;
+            counts.fail += res.error_refused;
+            if (res.drift_refused > 0) {
+                counts.drift += res.drift_refused;
+                try units.append(ctx.alloc, mox.apply.drift.vanished(e.key_ptr.*));
+            }
+        }
+    }
     if (sweep_ok or (stale_named.count() > 0 and counts.fail == 0)) {
         var tree_keep: std.StringHashMap(void) = .init(ctx.alloc);
         for (tree.files) |f| try tree_keep.put(f.live_path, {});
