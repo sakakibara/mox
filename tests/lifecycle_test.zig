@@ -813,8 +813,9 @@ test "remove --purge deletes the live file after snapshotting it" {
     try std.testing.expect(!exists(io, try h.liveOf(".zshrc")));
 
     // A snapshot of the purged live file exists (recoverable via rollback).
-    const snap_gen = try soleChild(io, a, try std.fs.path.join(a, &.{ h.state, "snapshots" }));
-    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ snap_gen, ".zshrc" })));
+    const ids = try testutil.snapshotIds(h);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expect(try testutil.snapshotHolds(h, ids[0], ".zshrc", "content\n"));
 }
 
 test "remove: an unknown attributes.toml key refuses with the friendly schema message, not a raw error name" {
@@ -1428,18 +1429,6 @@ test "add: refuses a path under a dir-only ignored ancestor; --force overrides" 
     try std.testing.expect(exists(io, try h.srcOf(".claude/projects/session.jsonl")));
 }
 
-/// Overwrite every regular file in `dir_abs` with `garbage`.
-fn corruptAll(io: Io, a: std.mem.Allocator, dir_abs: []const u8, garbage: []const u8) !void {
-    var dir = try Io.Dir.cwd().openDir(io, dir_abs, .{ .iterate = true });
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (try it.next(io)) |e| {
-        if (e.kind != .file) continue;
-        const p = try std.fs.path.join(a, &.{ dir_abs, e.name });
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = garbage });
-    }
-}
-
 test "doctor: detects a malformed state file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1449,9 +1438,10 @@ test "doctor: detects a malformed state file" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    // A malformed provenance record mox 0.12.4 left, named for no known path.
+    try testutil.legacyState(a, io, "unresolved-provenance", h.root, h.state);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
-    // Malformed provenance record.
-    try writeRepo(io, &tmp, "state/provenance/deadbeef", "{ not json");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "ok\n" });
 
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
@@ -1663,11 +1653,10 @@ test "doctor --fix rebuilds malformed provenance for tracked files" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    // A state mox 0.12.4 wrote whose provenance record no longer parses.
+    try testutil.legacyState(a, io, "bad-provenance", h.root, h.state);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "a\nb\n");
-    _ = try h.run(&.{ "mox", "apply" });
-
-    // Corrupt the provenance record apply just wrote.
-    try corruptAll(io, a, try std.fs.path.join(a, &.{ h.state, "provenance" }), "{ broken");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "a\nb\n" });
 
     try testutil.gitTracked(io, a, h.repo);
     const fixed = try h.run(&.{ "mox", "doctor", "--fix" });
@@ -1783,8 +1772,7 @@ test "uninstall: removes state, preserves private and trash and the source repo"
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
     // Tracked state removed.
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "applied" })));
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "provenance" })));
+    try std.testing.expectEqual(@as(usize, 0), (try testutil.dumpOf(h)).paths.len);
     // Private and trash preserved (trash needs confirmation; test is non-interactive).
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "private" })));
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "trash" })));
@@ -2777,7 +2765,7 @@ test "add --own --gate: a machine where the gate fails leaves the live file unto
     try std.testing.expect(std.mem.indexOf(u8, apply.out, "skipped") != null);
     try std.testing.expectEqualStrings(live_content, try read(io, a, live));
     // No owned record exists for the gated-off target.
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "applied-owned" })));
+    try std.testing.expect(!(try testutil.anyRecord(h, .owned)));
 
     // status reports the gated partial with its inventory annotation.
     const s = try h.run(&.{ "mox", "status" });
@@ -2895,9 +2883,7 @@ test "remove: --purge is refused on a partial target; plain remove forgets the o
     _ = try h.run(&.{ "mox", "apply" });
 
     const live = try h.liveOf("app.toml");
-    const rec_name = mox.apply.applied.contentHashHex(live);
-    const rec_path = try std.fs.path.join(a, &.{ h.state, "applied-owned", &rec_name });
-    try std.testing.expect(exists(io, rec_path));
+    try std.testing.expect(try testutil.hasRecord(h, live, .owned));
 
     const purge = try h.run(&.{ "mox", "remove", "app.toml", "--purge" });
     try std.testing.expectEqual(@as(u8, 1), purge.rc);
@@ -2912,7 +2898,7 @@ test "remove: --purge is refused on a partial target; plain remove forgets the o
     // record forgotten so a later re-add is first contact again.
     try std.testing.expect(exists(io, live));
     try std.testing.expect(!exists(io, try h.srcOf("app.toml")));
-    try std.testing.expect(!exists(io, rec_path));
+    try std.testing.expect(!try testutil.hasRecord(h, live, .owned));
 }
 
 test "mv: a partial target moves no state, and the next apply leaves the old live file in place" {
@@ -2929,8 +2915,6 @@ test "mv: a partial target moves no state, and the next apply leaves the old liv
 
     const old_live = try h.liveOf("app.toml");
     const new_live = try h.liveOf("app2.toml");
-    const old_rec = try std.fs.path.join(a, &.{ h.state, "applied-owned", &mox.apply.applied.contentHashHex(old_live) });
-    const new_rec = try std.fs.path.join(a, &.{ h.state, "applied-owned", &mox.apply.applied.contentHashHex(new_live) });
 
     const r = try h.run(&.{ "mox", "mv", "app.toml", "app2.toml" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -2939,8 +2923,8 @@ test "mv: a partial target moves no state, and the next apply leaves the old liv
     // The declaration travels inside the renamed source file; no record moves.
     const moved = try read(io, a, try h.srcOf("app2.toml"));
     try std.testing.expect(std.mem.indexOf(u8, moved, "# mox: own tui") != null);
-    try std.testing.expect(exists(io, old_rec));
-    try std.testing.expect(!exists(io, new_rec));
+    try std.testing.expect(try testutil.hasRecord(h, old_live, .owned));
+    try std.testing.expect(!try testutil.hasRecord(h, new_live, .owned));
 
     // A live file at the new path holding the content is first contact,
     // adopted; the old file stays, its record forgotten.
@@ -2950,8 +2934,8 @@ test "mv: a partial target moves no state, and the next apply leaves the old liv
     try std.testing.expect(std.mem.indexOf(u8, apply.out, "adopted") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply.out, "left ~/app.toml in place (no longer managed)") != null);
     try std.testing.expect(exists(io, old_live));
-    try std.testing.expect(!exists(io, old_rec));
-    try std.testing.expect(exists(io, new_rec));
+    try std.testing.expect(!try testutil.hasRecord(h, old_live, .owned));
+    try std.testing.expect(try testutil.hasRecord(h, new_live, .owned));
 }
 
 test "export: a partial target bakes its canonical owned serialization" {
@@ -5372,8 +5356,8 @@ test "stale: a deleted source is STALE and diffed as removed, apply removes it s
     try std.testing.expect(!exists(io, try h.liveOf(".gone")));
     try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
     try std.testing.expectEqualStrings("stays\n", try read(io, a, try h.liveOf(".kept")));
-    const snaps = try mox.apply.snapshot.list(a, io, try std.fs.path.join(a, &.{ h.state, "snapshots" }));
-    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "snapshots", snaps[snaps.len - 1], ".gone" })));
+    const snaps = try testutil.snapshotIds(h);
+    try std.testing.expect((try testutil.snapshotEntry(h, snaps[snaps.len - 1], ".gone")) != null);
 
     // The guidance names the edited path, and only naming it removes it.
     try std.testing.expect(std.mem.indexOf(u8, r.out, "mox apply --overwrite ~/.edited") != null);
@@ -5404,10 +5388,10 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
 
     const bad = try h.run(&.{ "mox", "commit", "~/.edited", "~/.nowhere" });
     try std.testing.expectEqual(@as(u8, 1), bad.rc);
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     const dry = try h.run(&.{ "mox", "commit", "--dry-run", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 1), dry.rc);
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     // Without --yes off a terminal, commit only reports.
     const report = try h.run(&.{ "mox", "commit", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 1), report.rc);
@@ -5415,17 +5399,17 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
     const mixed = try h.run(&.{ "mox", "commit", "~/.edited", "~/.other" });
     try std.testing.expectEqual(@as(u8, 1), mixed.rc);
     try std.testing.expect(std.mem.indexOf(u8, report.out, "would release ~/.edited") != null);
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     // A run that aborts on a prompt releases nothing.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".other"), .data = "o, edited\n" });
     const strict = try h.run(&.{ "mox", "commit", "--abort-on-prompt", "~/.edited", "~/.other" });
     try std.testing.expectEqual(@as(u8, 2), strict.rc);
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
+    try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".other"), .data = "o\n" });
     const c = try h.run(&.{ "mox", "commit", "--yes", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 0), c.rc);
     try std.testing.expect(std.mem.indexOf(u8, c.out, "released ~/.edited on this machine") != null);
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -5476,7 +5460,7 @@ test "stale: a gated-off file, an ignored path, and a run that cannot judge ever
     try std.testing.expect(exists(io, try h.liveOf(".ignored")));
     try std.testing.expect(exists(io, try h.liveOf("gated.toml")));
     try std.testing.expect(std.mem.indexOf(u8, full.out, "gated.toml in place") == null);
-    try std.testing.expect((try mox.apply.applied.readOwned(a, io, h.state, try h.liveOf("gated.toml"))) != null);
+    try std.testing.expect((try testutil.hasRecord(h, try h.liveOf("gated.toml"), .owned)));
 }
 
 test "stale: a failed generator's leaves and a private-walk failure sweep nothing" {
@@ -5520,6 +5504,10 @@ test "stale: another MOX_REPO sweeps nothing of this repo's, tagged generator ma
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    // A record mox 0.12.4 wrote, before records named their repo.
+    try testutil.legacyState(a, io, "untagged-whole", h.root, h.state);
+    const untagged = try h.liveOf(".legacy");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = untagged, .data = "l\n" });
     try writeRepo(io, &tmp, "repo/src/.mine", "a\n");
     try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
@@ -5533,10 +5521,6 @@ test "stale: another MOX_REPO sweeps nothing of this repo's, tagged generator ma
     try std.testing.expect(exists(io, try h.liveOf(".config/id-a.inc")));
 
     // A record written before records named their repo is never swept.
-    const untagged = try h.liveOf(".legacy");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = untagged, .data = "l\n" });
-    const rec = try std.fs.path.join(a, &.{ h.state, "applied", &mox.apply.applied.contentHashHex(untagged) });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rec, .data = try std.fmt.allocPrint(a, "{s} {s}\n", .{ &mox.apply.applied.contentHashHex("l\n"), untagged }) });
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, untagged));
 }
@@ -5560,7 +5544,7 @@ test "stale: the same file as a managed path is forgotten, nothing removed" {
     try Io.Dir.cwd().deleteFile(io, try h.srcOf("b.conf"));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, try h.liveOf("b.conf")));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf("b.conf"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf("b.conf"), .file)));
 
     // A real case-only rename, where the filesystem folds case.
     try writeRepo(io, &tmp, "repo/src/Case.conf", "c\n");
@@ -5590,8 +5574,7 @@ test "stale: an owned file is left in place and forgotten, and a symlink is remo
     try writeRepo(io, &tmp, "repo/src/link", "/nonexistent/target\n");
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"link\"]\nsymlink = true\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    const owned_rec = try std.fs.path.join(a, &.{ h.state, "applied-owned", &mox.apply.applied.contentHashHex(try h.liveOf("app.toml")) });
-    try std.testing.expect(exists(io, owned_rec));
+    try std.testing.expect(try testutil.hasRecord(h, try h.liveOf("app.toml"), .owned));
 
     try Io.Dir.cwd().deleteFile(io, try h.srcOf("app.toml"));
     try Io.Dir.cwd().deleteFile(io, try h.srcOf("link"));
@@ -5605,7 +5588,7 @@ test "stale: an owned file is left in place and forgotten, and a symlink is remo
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "left ~/app.toml in place (no longer managed)") != null);
     try std.testing.expect(exists(io, try h.liveOf("app.toml")));
-    try std.testing.expect(!exists(io, owned_rec));
+    try std.testing.expect(!try testutil.hasRecord(h, try h.liveOf("app.toml"), .owned));
     try std.testing.expect(std.mem.indexOf(u8, r.out, "removed ~/link (no longer managed)") != null);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try h.liveOf("link"), .{ .follow_symlinks = false }));
     // Reported once: nothing is left to say.
@@ -5622,17 +5605,18 @@ test "stale: an unchanged apply tags an untagged owned record in place" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    // The owned record mox 0.12.4 wrote, which names no repo.
+    try testutil.legacyState(a, io, "untagged-owned", h.root, h.state);
     try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 1\n");
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    const live = try h.liveOf("app.toml");
-    var rec = (try mox.apply.applied.readOwned(a, io, h.state, live)).?;
-    rec.repo = null;
-    try mox.apply.applied.recordOwned(a, io, h.state, live, rec);
-    try std.testing.expect((try mox.apply.applied.readOwned(a, io, h.state, live)).?.repo == null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("app.toml"), .data = "[a]\nk = 1\n" });
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "unchanged") != null);
-    try std.testing.expect((try mox.apply.applied.readOwned(a, io, h.state, live)).?.repo != null);
+
+    // Tagged: the record is this repo's, so it goes once its source does.
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf("app.toml"));
+    const gone = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, gone.out, "left ~/app.toml in place (no longer managed)") != null);
 }
 
 test "stale: a live path holding a newline is refused" {
@@ -5690,11 +5674,10 @@ test "mv: another machine's next apply removes the old file, and keeps it where 
     const c = try h.otherMachine("c");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqual(@as(u8, 0), (try b.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    // Machine c recorded before records named their repo.
+    // Machine c applied with mox 0.12.4, before records named their repo.
+    try testutil.legacyState(a, io, "machine-c", h.root, c.state);
     const c_old = try c.homePath(".old");
-    const c_rec = try std.fs.path.join(a, &.{ c.state, "applied", &mox.apply.applied.contentHashHex(c_old) });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = c_rec, .data = try std.fmt.allocPrint(a, "{s} {s}\n", .{ &mox.apply.applied.contentHashHex("same\n"), c_old }) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = c_old, .data = "same\n" });
 
     const mv = try h.run(&.{ "mox", "mv", ".old", ".new" });
     try std.testing.expectEqual(@as(u8, 0), mv.rc);
@@ -5737,7 +5720,7 @@ test "remove: a tombstone keeps every machine's live file; --purge leaves none, 
     try std.testing.expect(std.mem.indexOf(u8, s.out, ".kept") == null);
     try std.testing.expectEqual(@as(u8, 0), (try third.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("k\n", try read(io, a, try third.homePath(".kept")));
-    try std.testing.expect((try mox.apply.applied.read(a, io, third.state, try third.homePath(".kept"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(third, try third.homePath(".kept"), .file)));
     try std.testing.expect(!exists(io, try third.homePath(".purged")));
 
     // doctor does not report the tombstone as an orphaned entry.
@@ -5797,7 +5780,7 @@ test "remove: a private-only file is forgotten here, with no tombstone, and its 
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "private", ".mox", "attributes.toml" })));
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.state, "private", ".mine" })));
     try std.testing.expect(exists(io, try h.liveOf(".mine")));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".mine"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".mine"), .file)));
 }
 
 test "remove: a released generator's leaves stay and are forgotten on every machine" {
@@ -5823,8 +5806,8 @@ test "remove: a released generator's leaves stay and are forgotten on every mach
     try std.testing.expectEqual(@as(u8, 0), (try other.run(&.{ "mox", "apply" })).rc);
     const leaf = try other.homePath(".config/id-a.inc");
     try std.testing.expect(exists(io, leaf));
-    try std.testing.expect((try mox.apply.applied.read(a, io, other.state, leaf)) == null);
-    try std.testing.expectEqual(@as(usize, 0), (try mox.apply.generated.readManifest(a, io, other.state, try other.homePath(".config/gen.inc"))).len);
+    try std.testing.expect(!(try testutil.hasRecord(other, leaf, .file)));
+    if ((try testutil.dumpOf(other)).generator(try other.homePath(".config/gen.inc"))) |g| try std.testing.expectEqual(@as(usize, 0), g.produced.len);
 }
 
 test "mv and remove: a rewrite of a commented attributes file is refused before anything moves" {
@@ -5917,7 +5900,7 @@ test "stale: a broken attributes entry with no source is an ERROR, and nothing i
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(lineWith(r.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
     try std.testing.expectEqualStrings("k\n", try read(io, a, try h.liveOf(".kept")));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".kept"))) != null);
+    try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".kept"), .file)));
     const e = try h.run(&.{ "mox", "export", try std.fs.path.join(a, &.{ h.root, "out" }) });
     try std.testing.expect(e.rc != 0);
     try std.testing.expect(lineWith(e.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
@@ -5965,7 +5948,7 @@ test "stale: a directory the tree now plants as a symlink into the repo loses no
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(lineWith(r.out, "~/.config/nvim/init.lua", "left in place: a parent directory is a symlink"));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".config/nvim/init.lua"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".config/nvim/init.lua"), .file)));
 
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
@@ -6023,7 +6006,7 @@ test "generated: a dropped leaf below a symlinked directory is kept and forgotte
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(lineWith(r.out, "id-a.inc", "left in place: a parent directory is a symlink"));
     try std.testing.expectEqualStrings("key=a\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "id-a.inc" })));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".config/g/id-a.inc"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".config/g/id-a.inc"), .file)));
 }
 
 test "symlinked parent: a file that composes to nothing, an exact dir and a purge keep what the link reaches" {
@@ -6162,7 +6145,7 @@ test "remove: a tombstone whose case differs from the record still keeps the fil
     try std.testing.expect(std.mem.indexOf(u8, s.out, "STALE") == null);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("f\n", try read(io, a, try h.liveOf(".Foo")));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".Foo"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".Foo"), .file)));
 }
 
 test "stale: a run under another HOME sharing the state directory sweeps none of the first run's files" {
@@ -6395,6 +6378,11 @@ test "orphans: a manifest from an aliased HOME, or an untagged one, is left alon
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    // Untagged manifests mox 0.12.4 wrote, for generators never in this tree.
+    try testutil.legacyState(a, io, "untagged-manifests", h.root, h.state);
+    const leaf = try h.liveOf(".config/old.inc");
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
     try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
     try writeRepo(io, &tmp, "repo/src/.other", "o\n");
@@ -6405,21 +6393,15 @@ test "orphans: a manifest from an aliased HOME, or an untagged one, is left alon
     const aliased = try h.otherHome(alias);
     try std.testing.expectEqual(@as(u8, 0), (try aliased.run(&.{ "mox", "apply" })).rc);
 
-    // An untagged manifest in the v0.12.4 form, for a generator never in the tree.
-    const leaf = try h.liveOf(".config/old.inc");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
-    try mox.apply.applied.record(a, io, h.state, leaf, "old\n", "");
-    const untagged = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/old-gen.inc")) });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = untagged, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
-
     try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "a parent directory is a symlink") == null);
-    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try std.fs.path.join(a, &.{ alias, ".config", "g.inc" })) })));
-    try std.testing.expect(exists(io, untagged));
+    const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state });
+    try std.testing.expect(dump.generator(try std.fs.path.join(a, &.{ alias, ".config", "g.inc" })) != null);
+    try std.testing.expect(dump.generator(try h.liveOf(".config/old-gen.inc")) != null);
     try std.testing.expect(exists(io, leaf));
-    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, leaf)) != null);
+    try std.testing.expect(dump.path(leaf).?.file != null);
 }
 
 test "attributes: a repo or private attributes file that is not valid TOML exits 2 in every command" {
@@ -6494,7 +6476,7 @@ test "rollback: a partial target since turned into a managed symlink is never pa
     try writeRepo(io, &tmp, "repo/src/c.yaml", outside);
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"c.yaml\"]\nsymlink = true\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
-    try std.testing.expect((try mox.apply.applied.readOwned(a, io, h.state, try h.liveOf("c.yaml"))) == null);
+    try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf("c.yaml"), .owned)));
 
     _ = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqualStrings("a: 9\n", try read(io, a, outside));
@@ -6628,18 +6610,13 @@ test "orphans: a file of an untagged manifest whose generator is gone is listed,
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    // Two manifests mox 0.12.4 wrote that both name one file: still one row.
+    try testutil.legacyState(a, io, "untagged-manifests", h.root, h.state);
     try writeRepo(io, &tmp, "repo/src/.other", "o\n");
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     const leaf = try h.liveOf(".config/old.inc");
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf).?);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
-    try mox.apply.applied.record(a, io, h.state, leaf, "old\n", "");
-    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.state, "generated" }));
-    const manifest = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/old-gen.inc")) });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
-    // A second old manifest naming the same file: still one row.
-    const manifest2 = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/older-gen.inc")) });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest2, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
     const s = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 0), s.rc);
@@ -6649,7 +6626,9 @@ test "orphans: a file of an untagged manifest whose generator is gone is listed,
     try std.testing.expect(exists(io, leaf));
     const c = try h.run(&.{ "mox", "commit", "--yes", "~/.config/old.inc" });
     try std.testing.expectEqual(@as(u8, 0), c.rc);
-    try std.testing.expect(!exists(io, manifest));
+    const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state });
+    try std.testing.expect(dump.generator(try h.liveOf(".config/old-gen.inc")) == null);
+    try std.testing.expect(dump.generator(try h.liveOf(".config/older-gen.inc")) == null);
     try std.testing.expect(exists(io, leaf));
     const s2 = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, s2.out, "ORPHAN") == null);
@@ -7217,8 +7196,7 @@ test "rollback: re-patching a partial target keeps the live file in rollback's o
     const kept = std.mem.indexOf(u8, rb.out, "is kept in snapshot ") orelse return error.TestExpectedKeptSnapshot;
     const after = rb.out[kept + "is kept in snapshot ".len ..];
     const undo_id = after[0 .. std.mem.indexOfScalar(u8, after, ' ') orelse after.len];
-    const snap_copy = try std.fs.path.join(a, &.{ h.state, "snapshots", undo_id, "app.toml" });
-    try std.testing.expectEqualStrings("a = 2\nb = \"prog\"\n", try read(io, a, snap_copy));
+    try std.testing.expect(try testutil.snapshotHolds(h, undo_id, "app.toml", "a = 2\nb = \"prog\"\n"));
 }
 
 test "rollback: an entry that holds a redacted secret is refused, never written" {

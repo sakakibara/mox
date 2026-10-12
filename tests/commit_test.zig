@@ -1822,7 +1822,7 @@ test "commit: non-TTY report mode exits 1 and writes nothing" {
 
     const src_path = try h.srcOf(".zshrc");
     const src_before = try read(io, a, src_path);
-    const applied_before = (try mox.apply.applied.readContent(a, io, h.state, try h.liveOf(".zshrc"))).?;
+    const applied_before = (try appliedContent(h, ".zshrc")).?;
 
     const live = try h.liveOf(".zshrc");
     try editLive(io, a, live, "export B=2", "export B=22");
@@ -1833,8 +1833,8 @@ test "commit: non-TTY report mode exits 1 and writes nothing" {
 
     // Source bytes unchanged and the applied record was not advanced.
     try std.testing.expectEqualStrings(src_before, try read(io, a, src_path));
-    const applied_after = (try mox.apply.applied.readContent(a, io, h.state, try h.liveOf(".zshrc"))).?;
-    try std.testing.expectEqualStrings(applied_before, applied_after);
+    const applied_after = (try appliedContent(h, ".zshrc")).?;
+    try std.testing.expectEqualStrings(&applied_before, &applied_after);
 }
 
 /// A shared base line (`export EDITOR=vim`, top-level, so it composes into
@@ -5669,8 +5669,10 @@ test "commit: an insertion into a whole-file-gated target lands after the source
 
 const os_blocks = "# mox: when os=darwin\nexport BREW=1\n# mox: end\n# mox: when os=linux\nexport APT=1\n# mox: end\n";
 
-fn appliedContent(h: Harness, name: []const u8) !?[]const u8 {
-    return mox.apply.applied.readContent(h.a, h.io, h.state, try h.liveOf(name));
+/// The hash of the last-applied content cached for `name`, or null.
+fn appliedContent(h: Harness, name: []const u8) !?[64]u8 {
+    const p = (try testutil.dumpOf(h)).path(try h.liveOf(name)) orelse return null;
+    return (p.file orelse return null).cache;
 }
 
 test "commit: a file whose data source is restored for another file's failure is not committed" {
@@ -5707,7 +5709,7 @@ test "commit: a file whose data source is restored for another file's failure is
         try shownLive(a, ".zaliases"),
         try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }),
     })), res.err);
-    try std.testing.expectEqualStrings(abbrs_before, (try appliedContent(h, ".abbrs")).?);
+    try std.testing.expectEqualStrings(&abbrs_before, &(try appliedContent(h, ".abbrs")).?);
 }
 
 test "commit: a file with a held hunk whose routed row lands in a restored data source is not committed" {
@@ -6099,7 +6101,7 @@ test "commit: a restore that fails saves the pre-run bytes, records nothing, and
 
     // Nothing is recorded.
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(myenv_before, (try appliedContent(h, ".myenv")).?);
+    try std.testing.expectEqualStrings(&myenv_before, &(try appliedContent(h, ".myenv")).?);
 
     // The pre-run bytes of the path that could not be restored are saved in a
     // fresh recovery directory, named by root, and the path is named with its
@@ -6193,8 +6195,8 @@ test "commit: a write that fails after earlier writes restores every path, recor
     try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, try h.srcOf(".aenv")));
     try std.testing.expectEqualStrings("note betanote\n", try read(io, a, benv));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(aenv_before, (try appliedContent(h, ".aenv")).?);
-    try std.testing.expectEqualStrings(benv_before, (try appliedContent(h, ".benv")).?);
+    try std.testing.expectEqualStrings(&aenv_before, &(try appliedContent(h, ".aenv")).?);
+    try std.testing.expectEqualStrings(&benv_before, &(try appliedContent(h, ".benv")).?);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
@@ -6226,7 +6228,7 @@ test "commit: a write that fails and a restore that fails save the pre-run bytes
     try std.testing.expectEqualStrings("note gammanote\n", try read(io, a, aenv));
     try std.testing.expectEqualStrings("note betanote\n", try read(io, a, benv));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(aenv_before, (try appliedContent(h, ".aenv")).?);
+    try std.testing.expectEqualStrings(&aenv_before, &(try appliedContent(h, ".aenv")).?);
     const copy = try std.fs.path.join(a, &.{ try recoveryDir(h), "repo", "src", ".aenv" });
     try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, copy));
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
@@ -6309,7 +6311,7 @@ test "commit: a narrowing whose fragment write fails restores the base, removes 
 
     try std.testing.expectEqual(before, try treeDigest(io, a, src_dir));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try h.srcOf(".zshrc.d"), .{}));
-    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    try std.testing.expectEqualStrings(&applied_before, &(try appliedContent(h, ".zshrc")).?);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
@@ -6337,7 +6339,7 @@ test "commit: a first write that fails and changes nothing says only that nothin
     try std.testing.expectEqualStrings("note alphanote\n", try read(io, a, aenv));
     try std.testing.expectEqualStrings("note betanote\n", try read(io, a, try h.srcOf(".benv")));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(aenv_before, (try appliedContent(h, ".aenv")).?);
+    try std.testing.expectEqualStrings(&aenv_before, &(try appliedContent(h, ".aenv")).?);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded\n" ++
         "mox commit: 0 package row(s) already recorded\n", .{aenv}), res.err);
@@ -6373,7 +6375,7 @@ test "commit: a facts write that fails restores the routed source, leaves the fa
     try std.testing.expectEqualStrings(zshrc, try read(io, a, try h.srcOf(".zshrc")));
     try std.testing.expectEqualStrings(facts_before, try read(io, a, facts));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    try std.testing.expectEqualStrings(&applied_before, &(try appliedContent(h, ".zshrc")).?);
     try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: could not write ~/.config/mox/facts.toml (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
@@ -6404,7 +6406,7 @@ test "commit: a path the journal cannot read stops the run before any write" {
 
     try std.testing.expectEqual(before, try treeDigest(io, a, src_dir));
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
-    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    try std.testing.expectEqualStrings(&applied_before, &(try appliedContent(h, ".zshrc")).?);
     const fragment = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(io, src_dir, a), ".zshrc.d", "os", "darwin" });
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not read {s} (NotDir)\n" ++
         "mox commit: 0 package row(s) already recorded\n", .{fragment}), res.err);
@@ -6680,7 +6682,7 @@ test "commit: a coupled update whose simulation cannot be reverted saves the pre
 
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expectEqualStrings("note quokkatoken\n", try read(io, a, try h.srcOf(".myenv")));
-    try std.testing.expectEqualStrings(myenv_before, (try appliedContent(h, ".myenv")).?);
+    try std.testing.expectEqualStrings(&myenv_before, &(try appliedContent(h, ".myenv")).?);
     const copy = try std.fs.path.join(a, &.{ try recoveryDir(h), "repo", "src", ".tsigners" });
     try std.testing.expectEqualStrings("quokkatoken signing\n", try read(io, a, copy));
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not restore {s} (AccessDenied)\n" ++
@@ -7000,7 +7002,7 @@ test "commit: a created directory a restore cannot remove is a restore failure, 
     delete_dir_fail = "";
     try std.testing.expectEqual(@as(u8, 2), res.rc);
 
-    try std.testing.expectEqualStrings(applied_before, (try appliedContent(h, ".zshrc")).?);
+    try std.testing.expectEqualStrings(&applied_before, &(try appliedContent(h, ".zshrc")).?);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
@@ -7526,7 +7528,7 @@ test "commit: a restore that fails saves every path the run still has edited, no
     try std.testing.expectEqual(@as(u8, 2), res.rc);
 
     try std.testing.expect(std.mem.indexOf(u8, res.out, "  committed ") == null);
-    try std.testing.expectEqualStrings(abbrs_before, (try appliedContent(h, ".abbrs")).?);
+    try std.testing.expectEqualStrings(&abbrs_before, &(try appliedContent(h, ".abbrs")).?);
 
     // .abbrs's base still holds this run's edit, so its pre-run bytes are
     // saved beside those of the base that could not be restored; the data

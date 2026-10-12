@@ -397,8 +397,7 @@ test "kind matrix: symlink over a directory -- mox rollback reconstructs the tre
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite", live })).rc);
     try std.testing.expect(isSymlink(io, live));
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const listed = try c.run(&.{ "mox", "snapshot" });
     try std.testing.expectEqual(@as(u8, 0), listed.rc);
@@ -454,8 +453,7 @@ test "kind matrix: symlink over a directory -- an unsnapshottable descendant ref
     try std.testing.expect(exists(io, locked));
     try std.testing.expectEqualStrings("r\n", try read(io, a, readable));
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
 }
 

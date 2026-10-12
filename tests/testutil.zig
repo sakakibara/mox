@@ -130,6 +130,103 @@ pub const Harness = struct {
 
 fn noRefresh(_: ?*anyopaque, _: Io) void {}
 
+/// The state dump of `h`'s state directory, its flags asked of `h`'s repo
+/// and HOME.
+pub fn dumpOf(h: Harness) !mox.state_dump.Dump {
+    return mox.state_dump.load(h.a, h.io, .{ .state_dir = h.state, .parts = &.{.{ .repo = h.repo, .home = h.home }} });
+}
+
+pub const RecordKind = enum { file, owned, link };
+
+/// True when `h`'s state records `live` as `kind`.
+pub fn hasRecord(h: Harness, live: []const u8, kind: RecordKind) !bool {
+    const p = (try dumpOf(h)).path(live) orelse return false;
+    return switch (kind) {
+        .file => p.file != null,
+        .owned => p.owned != null,
+        .link => p.link != null,
+    };
+}
+
+/// True when `h`'s state records any path as `kind`.
+pub fn anyRecord(h: Harness, kind: RecordKind) !bool {
+    for ((try dumpOf(h)).paths) |p| {
+        const there = switch (kind) {
+            .file => p.file != null,
+            .owned => p.owned != null,
+            .link => p.link != null,
+        };
+        if (there) return true;
+    }
+    return false;
+}
+
+/// The entry snapshot `id` holds for the HOME-relative `key`, or null.
+pub fn snapshotEntry(h: Harness, id: []const u8, key: []const u8) !?mox.state_dump.Entry {
+    for ((try dumpOf(h)).generations) |g| {
+        if (std.mem.eql(u8, g.id, id)) return mox.state_dump.entryOf(g, key);
+    }
+    return null;
+}
+
+/// True when snapshot `id` holds `content` for the HOME-relative `key`.
+pub fn snapshotHolds(h: Harness, id: []const u8, key: []const u8, content: []const u8) !bool {
+    const e = (try snapshotEntry(h, id, key)) orelse return false;
+    const hash = e.sha256 orelse return false;
+    return std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(content));
+}
+
+/// The ids of the snapshots `h`'s state holds, oldest first.
+pub fn snapshotIds(h: Harness) ![]const []const u8 {
+    return (try dumpOf(h)).ids(h.a);
+}
+
+const fixture_root = "/FIXTURE";
+
+/// Install the state fixture `name` from `tests/fixtures/v0.12.4/` as the
+/// state directory `state`. mox 0.12.4 made it under a root its files name as
+/// `/FIXTURE`, laid out as `setup` lays out a test's root; every path is
+/// moved onto `root`, and every record named by the hash of a path listed in
+/// the fixture's `paths` file is renamed to match.
+pub fn legacyState(a: std.mem.Allocator, io: Io, name: []const u8, root: []const u8, state: []const u8) !void {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const base = try std.fs.path.join(a, &.{ "tests", "fixtures", "v0.12.4", name });
+    const listed = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ base, "paths" }), a, .limited(1 << 20));
+    var names = std.StringHashMap([]const u8).init(a);
+    var it = std.mem.tokenizeScalar(u8, listed, '\n');
+    while (it.next()) |p| {
+        const moved = try std.mem.replaceOwned(u8, a, p, fixture_root, root);
+        try names.put(try a.dupe(u8, &mox.apply.applied.contentHashHex(p)), try a.dupe(u8, &mox.apply.applied.contentHashHex(moved)));
+    }
+    try copyFixture(a, io, try std.fs.path.join(a, &.{ base, "state" }), state, 0, root, &names);
+}
+
+fn copyFixture(a: std.mem.Allocator, io: Io, src: []const u8, dest: []const u8, depth: usize, root: []const u8, names: *const std.StringHashMap([]const u8)) !void {
+    try Io.Dir.cwd().createDirPath(io, dest);
+    var dir = try Io.Dir.cwd().openDir(io, src, .{ .iterate = true });
+    defer dir.close(io);
+    var walk = dir.iterate();
+    while (try walk.next(io)) |e| {
+        const from = try std.fs.path.join(a, &.{ src, e.name });
+        const out_name = if (depth == 1) names.get(e.name) orelse e.name else e.name;
+        const to = try std.fs.path.join(a, &.{ dest, out_name });
+        switch (e.kind) {
+            .directory => try copyFixture(a, io, from, to, depth + 1, root, names),
+            .sym_link => {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = try Io.Dir.cwd().readLink(io, from, &buf);
+                try Io.Dir.cwd().symLink(io, try std.mem.replaceOwned(u8, a, buf[0..n], fixture_root, root), to, .{});
+            },
+            .file => {
+                const bytes = try Io.Dir.cwd().readFileAlloc(io, from, a, .limited(1 << 24));
+                const st = try Io.Dir.cwd().statFile(io, from, .{});
+                try mox.apply.write.writeAtomic(io, to, try std.mem.replaceOwned(u8, a, bytes, fixture_root, root), @intCast(st.permissions.toMode() & 0o777));
+            },
+            else => {},
+        }
+    }
+}
+
 /// True when any file under `root` contains `needle`, or any symlink under it
 /// has `needle` in its target. Used to assert that nothing of a machine reaches
 /// the shared repo -- git stores a symlink as a blob whose content is the raw

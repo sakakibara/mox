@@ -132,12 +132,11 @@ fn fileExists(io: Io, path: []const u8) bool {
 
 /// True when any snapshot under the state dir holds `rel` with content `want`.
 fn snapshotHas(io: Io, a: std.mem.Allocator, state_dir: []const u8, rel: []const u8, want: []const u8) !bool {
-    const snaps = try std.fs.path.join(a, &.{ state_dir, "snapshots" });
-    const ids = mox.apply.snapshot.list(a, io, snaps) catch return false;
-    for (ids) |id| {
-        const p = try std.fs.path.join(a, &.{ snaps, id, rel });
-        const c = Io.Dir.cwd().readFileAlloc(io, p, a, .limited(1 << 20)) catch continue;
-        if (std.mem.eql(u8, c, want)) return true;
+    const d = try mox.state_dump.load(a, io, .{ .state_dir = state_dir });
+    const hash = mox.apply.applied.contentHashHex(want);
+    for (d.generations) |g| {
+        const e = mox.state_dump.entryOf(g, rel) orelse continue;
+        if (e.sha256) |h| if (std.mem.eql(u8, &h, &hash)) return true;
     }
     return false;
 }

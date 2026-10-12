@@ -522,7 +522,7 @@ test "apply: an external edit between the read and the removal is refused, keepi
     });
 
     Interleaved.real = io;
-    Interleaved.trigger_dir = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    Interleaved.trigger_dir = try mox.state_dump.displacedStore(a, c.state);
     Interleaved.live_path = live;
     Interleaved.edit = "[id]\n\tname = one\nthe user's own line\n";
     Interleaved.fired = false;
@@ -614,7 +614,7 @@ test "apply: an emptied file whose live path is now a special inode is skipped, 
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(exists(io, live));
     try std.testing.expect((try Io.Dir.cwd().statFile(io, live, .{})).kind == .directory);
-    try std.testing.expect((try mox.apply.applied.read(a, io, c.state, live)) != null);
+    try std.testing.expect((try testutil.hasRecord(c, live, .file)));
 }
 
 fn modeOf(io: Io, path: []const u8) !u32 {
@@ -799,12 +799,11 @@ test "apply: a hand-hardened default-mode file is not re-loosened on unchanged a
 }
 
 fn snapshotHas(io: Io, a: std.mem.Allocator, state_dir: []const u8, rel: []const u8, want: []const u8) !bool {
-    const snaps = try std.fs.path.join(a, &.{ state_dir, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
-    for (ids) |id| {
-        const p = try std.fs.path.join(a, &.{ snaps, id, rel });
-        const c = Io.Dir.cwd().readFileAlloc(io, p, a, .limited(1 << 20)) catch continue;
-        if (std.mem.eql(u8, c, want)) return true;
+    const d = try mox.state_dump.load(a, io, .{ .state_dir = state_dir });
+    const hash = mox.apply.applied.contentHashHex(want);
+    for (d.generations) |g| {
+        const e = mox.state_dump.entryOf(g, rel) orelse continue;
+        if (e.sha256) |h| if (std.mem.eql(u8, &h, &hash)) return true;
     }
     return false;
 }
@@ -3497,16 +3496,21 @@ test "apply generator: mox remove --purge does not delete a leaf another generat
     const shared = try c.homePath(".config/shared.inc");
     try std.testing.expectEqualStrings("val=b\n", try read(io, a, shared));
 
-    // A second generator genA is present, and (an inconsistent state) its stale
-    // manifest lists shared.inc. Removing genA must not delete shared.inc, which
-    // genB legitimately owns.
+    // A second generator genA once produced shared.inc too: it is added
+    // failing to compose, so it keeps the produced set its first apply
+    // recorded. Removing genA must not delete shared.inc, which genB owns.
+    try Io.Dir.rename(tmp.dir, "repo/src/.config/genB.inc", tmp.dir, "genB.inc.away", io);
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/genA.inc",
-        .data = "# mox: for id in \"data/da.toml\" into \"a-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n",
+        .data = "# mox: for id in \"data/da.toml\" into \"shared.inc\"\nval=<id.slug>\n# mox: end\n",
     });
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/da.toml", .data = "" });
-    const gen_a_live = try c.homePath(".config/genA.inc");
-    try mox.apply.generated.writeManifest(a, io, c.state, gen_a_live, &.{shared}, c.repo);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/da.toml", .data = "[[da]]\nslug = \"b\"\n" });
+    _ = try c.run(&.{ "mox", "apply", "--overwrite" });
+    try Io.Dir.rename(tmp.dir, "genB.inc.away", tmp.dir, "repo/src/.config/genB.inc", io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/da.toml", .data = "not toml [[[\n" });
+    _ = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqualStrings("val=b\n", try read(io, a, shared));
+    try std.testing.expect((try mox.state_dump.load(a, io, .{ .state_dir = c.state })).generator(try c.homePath(".config/genA.inc")) != null);
 
     const r = try c.run(&.{ "mox", "remove", "--purge", ".config/genA.inc" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -3567,7 +3571,7 @@ test "apply generator: mox remove --purge forgets a leaf that is now a directory
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "now a directory; its record is forgotten") != null);
     try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf_b, .{})).kind == .directory);
-    try std.testing.expect((try mox.apply.applied.read(a, io, c.state, leaf_b)) == null);
+    try std.testing.expect(!(try testutil.hasRecord(c, leaf_b, .file)));
 }
 
 /// True when some line of `out` contains both `needle_a` and `needle_b` -- used
@@ -3677,7 +3681,7 @@ test "export generator: renders every row into the export tree statelessly" {
 
     // Stateless: export recorded no manifest and wrote nothing into HOME.
     const gen_live = try c.homePath(".config/gen.inc");
-    try std.testing.expectEqual(@as(usize, 0), (try mox.apply.generated.readManifest(a, io, c.state, gen_live)).len);
+    try std.testing.expect((try testutil.dumpOf(c)).generator(gen_live) == null);
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
 }
 
@@ -3731,19 +3735,16 @@ test "apply generator: a torn manifest line neither crashes apply nor over-delet
 
     try writeGenFixture(io, &tmp, &.{ "a", "b" });
     const c = try cliSetup(a, io, &tmp);
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-
-    // Corrupt the manifest: keep the two real leaves, then append a blank line
-    // and a torn (leading-space, no-newline, bogus) line. readManifest must skip
-    // the empties and treat the bogus one as an absent leaf -- not crash, not
-    // delete the real ones.
-    const gen_live = try c.homePath(".config/gen.inc");
+    // The manifest mox 0.12.4 wrote, torn: the two real leaves, then a blank
+    // line and a torn (leading-space, no-newline, bogus) line. The empties are
+    // skipped and the bogus one is an absent leaf -- no crash, and the real
+    // ones are not deleted.
+    try testutil.legacyState(a, io, "torn-manifest", c.root, c.state);
     const leaf_a = try c.homePath(".config/id-a.inc");
     const leaf_b = try c.homePath(".config/id-b.inc");
-    const man_hash = mox.apply.applied.contentHashHex(gen_live);
-    const man_path = try std.fs.path.join(a, &.{ c.state, "generated", &man_hash });
-    const torn = try std.fmt.allocPrint(a, "{s}\n{s}\n\n   /tmp/mox-torn-no-such-\x01\x02", .{ leaf_a, leaf_b });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = man_path, .data = torn });
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf_a).?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_a, .data = "key=a\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_b, .data = "key=b\n" });
 
     // Re-apply the same set: nothing to prune, and the bogus prior line is a
     // no-op, so both real leaves survive and apply exits clean.
@@ -4515,7 +4516,7 @@ test "apply partial: a gated-off file is untouched and gains no record" {
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped") != null);
     try std.testing.expectEqualStrings("[program]\nonly = true\n", try read(io, a, live));
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
+    try std.testing.expect(!(try testutil.anyRecord(c, .owned)));
 }
 
 test "apply partial: a directive-only base composes its owned content from overlays" {
@@ -4577,7 +4578,7 @@ test "apply partial: a gated-off directive-only base leaves live and records unt
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "skipped") != null);
     try std.testing.expectEqualStrings("[program]\nonly = true\n", try read(io, a, live));
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
+    try std.testing.expect(!(try testutil.anyRecord(c, .owned)));
 }
 
 test "apply partial: a directive-only disown base takes all content from overlays" {
@@ -4663,7 +4664,7 @@ test "apply partial: a secret owned value is hashed in state and masked in snaps
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
     // The record is a hash: no resolved secret anywhere in state.
-    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ c.state, "applied-owned" })));
+    try std.testing.expect((try testutil.anyRecord(c, .owned)));
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
 
     // A hand edit inside the secret-bearing owned path is drift (hash
@@ -4723,7 +4724,7 @@ test "apply partial: a shrunk own list on a secret record reasserts as outdated,
     // The abandoned b kept its live edit.
     try std.testing.expect(std.mem.indexOf(u8, after, "x = 999") != null);
     // The new record covers exactly the current own list.
-    const rec = (try mox.apply.applied.readOwned(a, io, c.state, live)).?;
+    const rec = (try testutil.dumpOf(c)).path(live).?.owned.?;
     try std.testing.expectEqual(@as(usize, 1), rec.own_paths.len);
     try std.testing.expectEqualStrings("api", rec.own_paths[0]);
 }
@@ -5429,7 +5430,7 @@ test "apply: an external edit between the read and the write is refused, keeping
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "v2\n" });
 
     Interleaved.real = io;
-    Interleaved.trigger_dir = try std.fs.path.join(a, &.{ c.state, "snapshots" });
+    Interleaved.trigger_dir = try mox.state_dump.displacedStore(a, c.state);
     Interleaved.live_path = live;
     Interleaved.edit = "the user's own edit\n";
     Interleaved.fired = false;
@@ -5472,8 +5473,7 @@ test "rollback partial: re-patches the owned subtree and keeps the program's lat
     const grown = try std.mem.concat(a, u8, &.{ try read(io, a, live), "\n[after]\nnew = true\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = grown });
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const r = try c.run(&.{ "mox", "rollback", ids[0] });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -5520,8 +5520,7 @@ test "rollback partial: a live-file stat failure during re-patch propagates inst
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/app.toml", .data = "# mox: own tui\n[tui]\nk = 2\n" });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
 
     const before = try read(io, a, live);
@@ -5565,8 +5564,7 @@ test "rollback: a broken attributes file blocks neither whole-file restores nor 
     // whole-file clobbered.
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/bad.toml", .data = "# mox: own \"unterminated\n[t]\n" });
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const before_app = try read(io, a, live_app);
     const r = try c.run(&.{ "mox", "rollback", ids[0] });
@@ -5599,8 +5597,7 @@ test "rollback partial: a secret-masked snapshot is refused, live untouched" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = edited });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply", "--overwrite" })).rc);
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const before = try read(io, a, live);
     const r = try c.run(&.{ "mox", "rollback", ids[0] });
@@ -5630,8 +5627,7 @@ test "rollback partial: a refused ownership invariant recheck writes nothing and
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     const before = try read(io, a, live);
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
 
     const saved = mox.cli.apply_cmd.test_seam.invariant_refusal;
@@ -5660,9 +5656,7 @@ test "apply: un-declaring ownership drops the owned record and rollback whole-fi
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program_live });
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    const rec_name = mox.apply.applied.contentHashHex(live);
-    const owned_rec = try std.fs.path.join(a, &.{ c.state, "applied-owned", &rec_name });
-    try std.testing.expect(exists(io, owned_rec));
+    try std.testing.expect(try testutil.hasRecord(c, live, .owned));
 
     // Ownership is un-declared: the head lines go, the source captures the
     // whole live file, and the target returns to whole-file management.
@@ -5670,8 +5664,8 @@ test "apply: un-declaring ownership drops the owned record and rollback whole-fi
     const r1 = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r1.rc);
     try std.testing.expect(std.mem.indexOf(u8, r1.out, "unchanged") != null);
-    try std.testing.expect(!exists(io, owned_rec));
-    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ c.state, "applied", &rec_name })));
+    try std.testing.expect(!try testutil.hasRecord(c, live, .owned));
+    try std.testing.expect(try testutil.hasRecord(c, live, .file));
 
     // The source moves on; the write snapshots the pre-write live file.
     const v2 = "# hdr\nmodel = \"gpt\"\n\n[tui]\nk = 2\n";
@@ -5681,8 +5675,7 @@ test "apply: un-declaring ownership drops the owned record and rollback whole-fi
 
     // The stale owned record is gone, so rollback whole-file restores the
     // snapshot instead of withholding it as a partial target.
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const r2 = try c.run(&.{ "mox", "rollback", ids[0] });
     try std.testing.expectEqual(@as(u8, 0), r2.rc);
@@ -5704,14 +5697,9 @@ test "apply partial: declaring ownership over a whole-file target drops its whol
     const live = try c.homePath("app.toml");
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
 
-    const rec_name = mox.apply.applied.contentHashHex(live);
-    const whole_rec = try std.fs.path.join(a, &.{ c.state, "applied", &rec_name });
-    const content_rec = try std.fs.path.join(a, &.{ c.state, "applied-content", &rec_name });
-    const prov_rec = try std.fs.path.join(a, &.{ c.state, "provenance", &rec_name });
-    const owned_rec = try std.fs.path.join(a, &.{ c.state, "applied-owned", &rec_name });
-    try std.testing.expect(exists(io, whole_rec));
-    try std.testing.expect(exists(io, content_rec));
-    try std.testing.expect(exists(io, prov_rec));
+    const before = (try testutil.dumpOf(c)).path(live).?;
+    try std.testing.expect(before.file.?.cache != null);
+    try std.testing.expect(before.provenance != null);
 
     // The program grows the file, then ownership is declared over [tui]:
     // live owned content matches composed, so the partial apply adopts.
@@ -5724,10 +5712,10 @@ test "apply partial: declaring ownership over a whole-file target drops its whol
 
     // The owned record replaces the whole-file state entirely: no whole-file
     // record, content cache, or line provenance survives the transition.
-    try std.testing.expect(exists(io, owned_rec));
-    try std.testing.expect(!exists(io, whole_rec));
-    try std.testing.expect(!exists(io, content_rec));
-    try std.testing.expect(!exists(io, prov_rec));
+    const after = (try testutil.dumpOf(c)).path(live).?;
+    try std.testing.expect(after.owned != null);
+    try std.testing.expect(after.file == null);
+    try std.testing.expect(after.provenance == null);
 }
 
 // Disown mode: the whole file is owned EXCEPT the declared subtrees -- the
@@ -5946,8 +5934,7 @@ test "rollback disown: re-patches the owned complement and keeps the program's l
     const later = try std.mem.replaceOwned(u8, a, try read(io, a, live), "m-old", "m-new");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = later });
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const r = try c.run(&.{ "mox", "rollback", ids[0] });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -6131,8 +6118,7 @@ test "rollback disown: a suffix run of disowned members re-patches through the s
     const later = try std.mem.replaceOwned(u8, a, try read(io, a, live), "m-old", "m-new");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = later });
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const r = try c.run(&.{ "mox", "rollback", ids[0] });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -7077,8 +7063,7 @@ test "format = jsonc: a partial target keeps the program's comments through appl
     try std.testing.expect(std.mem.indexOf(u8, patched, "// the program's note") != null);
     try std.testing.expect(std.mem.indexOf(u8, (try c.run(&.{ "mox", "status" })).out, "ERROR") == null);
 
-    const snaps = try std.fs.path.join(a, &.{ c.state, "snapshots" });
-    const ids = try mox.apply.snapshot.list(a, io, snaps);
+    const ids = try testutil.snapshotIds(c);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     const rb = try c.run(&.{ "mox", "rollback", ids[0] });
     try std.testing.expectEqual(@as(u8, 0), rb.rc);
@@ -8380,7 +8365,7 @@ test "commit: a named .moxignore'd path whose source left the tree is left alone
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "matched by .moxignore, left alone") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "released") == null);
-    try std.testing.expect((try mox.apply.applied.read(a, io, c.state, live)) != null);
+    try std.testing.expect((try testutil.hasRecord(c, live, .file)));
 }
 
 test "status: a partial target whose live file does not parse gives its location" {
@@ -8413,7 +8398,7 @@ test "generator: a JSON template's string row value expands its own captures, a 
     const want = try std.fmt.allocPrint(a, "{{\"dir\": \"{s}/bin\", \"tok\": \"hunter2\", \"bd\": \"{s}/b\", \"bt\": \"hunter3\"}}\n", .{ if (std.mem.eql(u8, os, "macos")) "darwin" else os, if (std.mem.eql(u8, os, "macos")) "darwin" else os });
     try std.testing.expectEqualStrings(want, try read(io, a, try c.homePath("id-a.json")));
     // The secret is kept out of mox's own content cache.
-    try std.testing.expect((try mox.apply.applied.readContent(a, io, c.state, try c.homePath("id-a.json"))) == null);
+    try std.testing.expect((try testutil.dumpOf(c)).path(try c.homePath("id-a.json")).?.file.?.cache == null);
 }
 
 test "generator: a literal duplicate key is passed as written, one a key capture made is refused" {

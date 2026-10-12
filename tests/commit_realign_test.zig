@@ -1115,6 +1115,10 @@ fn runLayout(gpa: Allocator, io: Io, sw: Sweep, st: State, budget: *Budget, seen
         try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "repo/data/d{d}.toml", .{d}), .data = try dataText(a, d, rows) });
     }
     const h = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    // What the sources and state hold before mox first writes the file: a
+    // first-contact commit starts from here.
+    try tmp.dir.createDirPath(io, "state");
+    const unapplied = try snapshot(a, io, h.root);
     const applied = try h.run(&.{ "mox", "apply" });
     const live_path = try h.liveOf(base_rel);
     const want = try linesText(a, lay.a);
@@ -1161,11 +1165,7 @@ fn runLayout(gpa: Allocator, io: Io, sw: Sweep, st: State, budget: *Budget, seen
             var hr = h;
             hr.a = ra;
             try budget.charge();
-            if (mode == .first_contact) {
-                for ([_][]const u8{ "applied", "applied-content" }) |dir| {
-                    try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(ra, &.{ h.state, dir }));
-                }
-            }
+            if (mode == .first_contact) try restore(ra, io, h.root, unapplied);
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live });
             const res = switch (mode) {
                 .yes => try hr.run(&.{ "mox", "commit", "--yes", "--color=never" }),
