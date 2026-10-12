@@ -42,7 +42,9 @@ pub const Result = struct {
     /// The capture recorded `format = "jsonc"` because the file has comments.
     recorded_jsonc: bool = false,
     /// Why the captured strict-JSON file does not parse, or null.
-    not_strict: ?[]const u8 = null,
+    /// Why the captured file does not parse in its own format, located.
+    not_parsed: ?[]const u8 = null,
+    format: ?mox.source.format.Format = null,
 };
 
 /// True when `live_path` names HOME itself (ignoring a trailing separator),
@@ -175,11 +177,13 @@ pub fn addFile(
     if (std.fs.path.dirname(src_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch {};
     try mox.apply.write.writeAtomic(io, src_path, content, mode);
     try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
-    const not_strict = if (resolved.format == .json)
-        try mox.compose.validate.liveFailure(arena, .json, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}))
+    // The captured file is checked in its own format, as apply will check
+    // it; the report is fixed text, since the file is the user's data.
+    const not_parsed = if (resolved.format) |f|
+        try mox.compose.validate.liveFailure(arena, f, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}))
     else
         null;
-    return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc, .not_strict = not_strict };
+    return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc, .not_parsed = not_parsed, .format = resolved.format };
 }
 
 /// The format a captured target takes: its attributes' `format` when it has
@@ -823,7 +827,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// comments recorded as JSONC, or one that is not strict JSON.
 pub fn noteCaptured(ctx: *app.Ctx, shown: []const u8, result: Result) !void {
     if (result.recorded_jsonc) try noteJsonc(ctx, shown);
-    if (result.not_strict) |why| try ctx.err.print("mox add: {s}: warning: not strict JSON ({s}); apply refuses it until it parses\n", .{ shown, why });
+    if (result.not_parsed) |why| {
+        if (result.format == .json) {
+            try ctx.err.print("mox add: {s}: warning: not strict JSON ({s}); apply refuses it until it parses\n", .{ shown, why });
+        } else try ctx.err.print("mox add: {s}: warning: does not parse as {s} ({s}); apply refuses it until it parses\n", .{ shown, @tagName(result.format.?), why });
+    }
 }
 
 fn noteJsonc(ctx: *app.Ctx, shown: []const u8) !void {

@@ -7063,3 +7063,24 @@ test "generated: a file of a generator where mox planted a link replaces the lin
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "rollback" })).rc);
     try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf, .{ .follow_symlinks = false })).kind == .sym_link);
 }
+
+test "add: a captured file that does not parse in its own format warns with its location and fixed text" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.keep", "");
+    const y = try h.liveOf("c.yaml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = y, .data = "a: hunter2\na: 2\n" });
+    const ry = try h.run(&.{ "mox", "add", y });
+    try std.testing.expectEqual(@as(u8, 0), ry.rc);
+    try std.testing.expect(std.mem.indexOf(u8, ry.err, "warning: does not parse as yaml (src/c.yaml:2:1:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ry.err, "hunter2") == null);
+    const t = try h.liveOf("c.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = t, .data = "a = 1\na = 2\n" });
+    const rt = try h.run(&.{ "mox", "add", t });
+    try std.testing.expect(std.mem.indexOf(u8, rt.err, "warning: does not parse as toml (src/c.toml:2:") != null);
+}

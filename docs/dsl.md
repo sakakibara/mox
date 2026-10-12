@@ -889,8 +889,8 @@ resolved into. Since a parser's message can quote any line, such an error
 gives the location and fixed text only: `does not parse as toml`, or for
 INI the parser's error kind, such as `expected assignment`; a duplicate key
 reads `duplicate key <redacted>`, and a hint that would quote the file is
-left out. A layer the user wrote in the repo keeps the parser's full
-reason. A strict-JSON failure carries a hint by its cause: the attributes
+left out. A layer the user wrote, in the repo or the private layer, keeps
+the parser's full reason. A strict-JSON failure carries a hint by its cause: the attributes
 entry that replaces every head directive of the layer, printed under the
 row ready to paste (see Region directives); `format = "jsonc"` for any
 other comment; removing a trailing comma; `{}` for an empty file; quoting a

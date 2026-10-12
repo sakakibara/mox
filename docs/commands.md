@@ -129,6 +129,10 @@ JSON -- is captured as JSONC: add records `format = "jsonc"` for it in
 not: that file is strict JSON its program reads, and the comma is its
 error, so add captures it with a warning naming the line (`warning: not
 strict JSON (src/x.json:3:1: ...)`), and apply refuses it until it parses.
+Any other structured file is checked in its own format the same way -- a
+repeated YAML or TOML key included -- and captured with `warning: does not
+parse as <format> (<location>: <reason>)`, in fixed text that quotes no byte
+of the file.
 
 Partial ownership at onboarding:
 
