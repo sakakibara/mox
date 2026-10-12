@@ -193,6 +193,9 @@ All notable changes to mox are documented here. The format follows
   `ORPHAN`, and `mox commit <file>` forgets one.
 
 ### Fixed
+- Rollback no longer writes `<mox:redacted-secret>` into a live file: an
+  entry whose snapshot holds a redacted secret line is refused, with the
+  advice to run `mox apply` to resolve it again, and exits 1.
 - apply's summary counts a generator's dropped files, an orphaned
   generator's files and an exact directory's removed entries in
   "removed"; it reported "0 removed" for a run that removed only those.

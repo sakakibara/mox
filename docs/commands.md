@@ -1099,7 +1099,9 @@ a snapshot of its own, named in its report and in `mox snapshot`;
 goes when the chain of snapshots it undoes (it may undo another such
 snapshot) ends at one that is pruned; a chain with a missing link keeps it. An entry that cannot be
 restored is that entry's `ERROR`, naming its snapshot copy, and the rest
-are still restored; a link already as the snapshot has it is left alone
+are still restored; one whose snapshot holds a redacted secret line is
+never written ("holds a secret mox does not store; run mox apply to
+resolve it again"); a link already as the snapshot has it is left alone
 and not counted. Notes rollback cannot read (a snapshot's planted links,
 or what a snapshot of its own undoes) are a warning, and treated as
 absent. An `attributes.toml` that is not

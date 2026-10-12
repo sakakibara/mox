@@ -7220,3 +7220,25 @@ test "rollback: re-patching a partial target keeps the live file in rollback's o
     const snap_copy = try std.fs.path.join(a, &.{ h.state, "snapshots", undo_id, "app.toml" });
     try std.testing.expectEqualStrings("a = 2\nb = \"prog\"\n", try read(io, a, snap_copy));
 }
+
+test "rollback: an entry that holds a redacted secret is refused, never written" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.netrc", "user x\n# mox: secret \"cmd:printf hunter2\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.netrc", "user y\n# mox: secret \"cmd:printf hunter2\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf(".netrc");
+    const before = try read(io, a, live);
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(lineWith(rb.err, "~/.netrc", "holds a secret mox does not store; run mox apply to resolve it again"));
+    try std.testing.expectEqualStrings(before, try read(io, a, live));
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "redacted") == null);
+}

@@ -155,6 +155,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         switch (r.why) {
             .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
             .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
+            .redacted => try ctx.err.print("  ERROR   {f} (not restored: it holds a secret mox does not store; run mox apply to resolve it again)\n", .{shown}),
             .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; the snapshot copy is at {s})\n", .{ shown, r.reason, r.snapshot_path }),
             .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
         }

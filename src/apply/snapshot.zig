@@ -393,6 +393,9 @@ pub const Refused = struct {
         dir_over_link,
         /// Restoring it failed; `reason` says how.
         failed,
+        /// The snapshot holds a secret line redacted: writing it would put
+        /// the placeholder in the live file.
+        redacted,
     };
 };
 
@@ -682,6 +685,10 @@ fn restoreFileEntry(
         return;
     }
     const content = try dir.readFileAlloc(io, name, arena, .limited(64 * 1024 * 1024));
+    if (!withheld and std.mem.indexOf(u8, content, prov_map.secret_redaction) != null) {
+        try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, name }), .why = .redacted });
+        return;
+    }
     if (withheld) {
         if (skipped) |out| try out.append(arena, .{ .live_path = target, .content = content });
         return;
