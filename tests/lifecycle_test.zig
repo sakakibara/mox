@@ -6279,3 +6279,42 @@ test "private: an attributes file that is not valid TOML is located and every co
         }
     }
 }
+
+test "rollback: a symlink mox planted is restored over, a user's link is not" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    // A re-pointed managed symlink rolls back to its old target.
+    try writeRepo(io, &tmp, "repo/src/link", "/tmp/t1");
+    try writeRepo(io, &tmp, "repo/src/.rc", "one\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"link\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/link", "/tmp/t2");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const r1 = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), r1.rc);
+    try std.testing.expectEqualStrings("/tmp/t1", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf("link"), &buf)]);
+
+    // A file replaced by a managed symlink rolls back to the file.
+    try writeRepo(io, &tmp, "repo/src/.rc", "/tmp/t3");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"link\"]\nsymlink = true\n\n[\".rc\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const r2 = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expectEqualStrings("one\n", try read(io, a, try h.liveOf(".rc")));
+
+    // A link the user made is still refused.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".rc"));
+    try Io.Dir.cwd().symLink(io, "/etc/hosts", try h.liveOf(".rc"), .{});
+    const r3 = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), r3.rc);
+    try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf(".rc"), &buf)]);
+}

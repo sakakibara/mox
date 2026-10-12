@@ -22,6 +22,7 @@ const std = @import("std");
 
 const Io = std.Io;
 const parent_link = @import("parent_link.zig");
+const applied = @import("applied.zig");
 const write_mod = @import("write.zig");
 const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
@@ -292,6 +293,19 @@ fn refusal(io: Io, home: []const u8, live: []const u8) ?Refused.Why {
     return null;
 }
 
+/// `refusal` for a file or symlink entry: a live symlink mox planted (its
+/// target is the one `state_dir`'s symlink record holds) is replaced, as
+/// rollback replaces any other file mox wrote.
+fn entryRefusal(arena: std.mem.Allocator, io: Io, home: []const u8, live: []const u8, state_dir: ?[]const u8) !?Refused.Why {
+    const why = refusal(io, home, live) orelse return null;
+    if (why != .is_link) return why;
+    const sd = state_dir orelse return why;
+    const recorded = (applied.readSymlink(arena, io, sd, live) catch return why) orelse return why;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = Io.Dir.cwd().readLink(io, live, &buf) catch return why;
+    return if (applied.sameSymlinkTarget(buf[0..n], recorded)) null else why;
+}
+
 /// A snapshot file whose live path the caller asked to withhold from the
 /// whole-file restore, with the snapshot's content for its own handling.
 pub const Withheld = struct {
@@ -309,13 +323,15 @@ pub fn restore(
     id: []const u8,
     home: []const u8,
 ) !Restored {
-    return restoreExcept(arena, io, snapshots_dir, id, home, null, null);
+    return restoreExcept(arena, io, snapshots_dir, id, home, null, null, null);
 }
 
 /// `restore`, withholding every live path in `skip` from the whole-file
 /// write. A withheld file's snapshot content is collected into `skipped`
 /// instead; the caller decides what to do with it (rollback re-patches a
 /// partial target's owned subtree rather than clobbering the remainder).
+/// With `state_dir`, a live symlink mox planted is replaced like any file
+/// mox wrote; any other symlink at a live path is refused.
 pub fn restoreExcept(
     arena: std.mem.Allocator,
     io: Io,
@@ -324,6 +340,7 @@ pub fn restoreExcept(
     home: []const u8,
     skip: ?*const std.StringHashMap(void),
     skipped: ?*std.ArrayList(Withheld),
+    state_dir: ?[]const u8,
 ) !Restored {
     const snap_dir_path = try std.fs.path.join(arena, &.{ snapshots_dir, id });
     var dir = Io.Dir.cwd().openDir(io, snap_dir_path, .{ .iterate = true }) catch |e| switch (e) {
@@ -334,7 +351,7 @@ pub fn restoreExcept(
 
     var result: Restored = .{};
     var refused: std.ArrayList(Refused) = .empty;
-    try restoreDir(arena, io, dir, snap_dir_path, "", home, skip, skipped, &result, &refused);
+    try restoreDir(arena, io, dir, snap_dir_path, "", home, skip, skipped, &result, &refused, state_dir);
     try restoreDirModes(arena, io, snapshots_dir, id, home, &refused);
     result.refused = try refused.toOwnedSlice(arena);
     return result;
@@ -399,6 +416,7 @@ fn restoreDir(
     skipped: ?*std.ArrayList(Withheld),
     result: *Restored,
     refused: *std.ArrayList(Refused),
+    state_dir: ?[]const u8,
 ) !void {
     // Raw iterate() is sound here: a restore replays EVERY entry to disk, so
     // the order it visits them cannot be observed in the result.
@@ -414,11 +432,11 @@ fn restoreDir(
                 var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
                 defer sub.close(io);
                 const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, entry.name });
-                try restoreDir(arena, io, sub, sub_abs, rel, home, skip, skipped, result, refused);
+                try restoreDir(arena, io, sub, sub_abs, rel, home, skip, skipped, result, refused, state_dir);
             },
             .file => {
                 const target = try source_path.joinKeyOnto(arena, home, rel);
-                if (refusal(io, home, target)) |why| {
+                if (try entryRefusal(arena, io, home, target, state_dir)) |why| {
                     try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
                     continue;
                 }
@@ -435,7 +453,7 @@ fn restoreDir(
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
                 const n = try dir.readLink(io, entry.name, &buf);
                 const target = try source_path.joinKeyOnto(arena, home, rel);
-                if (refusal(io, home, target)) |why| {
+                if (try entryRefusal(arena, io, home, target, state_dir)) |why| {
                     try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
                     continue;
                 }

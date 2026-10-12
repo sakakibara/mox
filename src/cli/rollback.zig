@@ -111,7 +111,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     var withheld: std.ArrayList(mox.apply.snapshot.Withheld) = .empty;
-    const restored = mox.apply.snapshot.restoreExcept(ctx.alloc, ctx.io, context.paths.snapshots_dir, id, context.paths.home, &skip, &withheld) catch |e| switch (e) {
+    const restored = mox.apply.snapshot.restoreExcept(ctx.alloc, ctx.io, context.paths.snapshots_dir, id, context.paths.home, &skip, &withheld, context.paths.state_dir) catch |e| switch (e) {
         error.SnapshotNotFound => {
             try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
             return 1;

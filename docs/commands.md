@@ -1034,9 +1034,11 @@ is never whole-file restored: the snapshot's owned subtree is
 re-patched onto the current live file (the program's writes since then
 survive) through the same verification and `check` hook as apply, and
 a snapshot whose owned values were secret-masked is refused --
-re-apply the source instead. An entry whose live path is now a symlink,
-or lies below one, is not restored: rollback names the live path and the
-snapshot copy left in place, and exits 1.
+re-apply the source instead. A symlink mox planted at a live path is
+replaced like any file mox wrote; an entry whose live path is a symlink mox
+did not plant, or lies below a symlinked directory, is not restored:
+rollback names the live path and the snapshot copy left in place, and exits
+1.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10); apply prunes
 the rest. A value that is not an integer warns and the default stands.
