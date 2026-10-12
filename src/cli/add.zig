@@ -174,8 +174,9 @@ pub fn addFile(
     if (std.fs.path.dirname(src_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch {};
     try mox.apply.write.writeAtomic(io, src_path, content, mode);
     try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
+    // A file being captured may hold real secrets: its reason is fixed text.
     const not_strict = if (resolved.format == .json)
-        try mox.compose.validate.liveFailure(arena, .json, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}), false)
+        try mox.compose.validate.liveFailure(arena, .json, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}), true)
     else
         null;
     return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc, .not_strict = not_strict };

@@ -2439,7 +2439,7 @@ fn applyPartialFile(ctx: *app.Ctx, in: PartialInput, counts: *Counts, snapshotte
     const live_doc = partial_mod.OwnedDoc.parse(ctx.alloc, format, live_text) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
-            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse, and mox cannot patch what it cannot preserve)\n", .{ shown, try partial_mod.liveParseError(ctx.alloc, format, live_text, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown}), mox.provenance.map.holdsSecret(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path)) });
+            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse, and mox cannot patch what it cannot preserve)\n", .{ shown, try partial_mod.liveParseError(ctx.alloc, format, live_text, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown}), mox.apply.applied.ownedHoldsSecret(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path)) });
             counts.fail += 1;
             return;
         },

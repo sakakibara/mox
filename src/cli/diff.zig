@@ -530,7 +530,7 @@ fn diffPartial(
         error.OutOfMemory => return error.OutOfMemory,
         error.OwnedUnparseable => {
             const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(live_path, ctx.context.?.paths.home)});
-            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse)\n", .{ shown, try partial_mod.liveParseError(ctx.alloc, format, live, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown}), mox.provenance.map.holdsSecret(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path)) });
+            try ctx.err.print("  ERROR   {s} ({s}; the live file does not parse)\n", .{ shown, try partial_mod.liveParseError(ctx.alloc, format, live, try std.fmt.allocPrint(ctx.alloc, "live {s}", .{shown}), mox.apply.applied.ownedHoldsSecret(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path)) });
             return;
         },
     };

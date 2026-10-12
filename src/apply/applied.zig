@@ -267,6 +267,14 @@ pub fn readOwned(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_p
     return parseOwned(arena, bytes);
 }
 
+/// True when the owned record of the partial target `live_path` says a
+/// secret resolved into its owned content, or the record is missing or
+/// malformed: its live file's parse errors must then quote nothing.
+pub fn ownedHoldsSecret(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) bool {
+    const rec = (readOwned(arena, io, state_dir, live_path) catch return true) orelse return true;
+    return rec.secret;
+}
+
 /// Parse an owned record's bytes, or null when malformed.
 pub fn parseOwned(arena: std.mem.Allocator, bytes: []const u8) !?OwnedRecord {
     const v = json.parse(arena, bytes, .{}) catch return null;

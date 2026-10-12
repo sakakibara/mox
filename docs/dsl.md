@@ -825,16 +825,17 @@ ERROR ~/app.toml (composed output line 2 from src/app.toml and src/app.toml.d/os
 The location is `<layer>:<line>:<col>` for a layer and `composed output line
 <n> from <layers>` for output. A duplicate key is printed as a JSON string.
 When a secret was resolved anywhere in an output, or into a live file mox
-reads, no byte of the parser's message is printed, since a message can
-quote any line: the reason is fixed text (`does not parse as toml`, or for
-INI the parser's error kind, such as `expected assignment`), a duplicate key
-reads `duplicate key <redacted>`, and a hint that would quote the file is
-left out. A strict-JSON failure carries a hint by its cause: the attributes
-entry that replaces every head directive of the layer, printed under the
-row ready to paste (see Region directives); `format = "jsonc"` for any
-other comment; removing a trailing comma; `{}` for an empty file; quoting a
-bare capture; stripping a byte order mark. An empty partial render ("mox
-owns nothing here") is exempt.
+reads (as its record says; a missing or unreadable record counts as a
+secret), and for every file `mox add` captures, no byte of the parser's
+message is printed, since a message can quote any line: the reason is fixed
+text (`does not parse as toml`, or for INI the parser's error kind, such as
+`expected assignment`), a duplicate key reads `duplicate key <redacted>`,
+and a hint that would quote the file is left out. A strict-JSON failure
+carries a hint by its cause: the attributes entry that replaces every head
+directive of the layer, printed under the row ready to paste (see Region
+directives); `format = "jsonc"` for any other comment; removing a trailing
+comma; `{}` for an empty file; quoting a bare capture; stripping a byte
+order mark. An empty partial render ("mox owns nothing here") is exempt.
 
 ## Sources that leave the tree
 

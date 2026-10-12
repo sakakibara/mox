@@ -7126,7 +7126,7 @@ test "strict json: a commented live file of a partial target is refused with the
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json (live ~/s.json:2:3: comments not allowed in strict json; remove it, or set format = \"jsonc\"", "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json (live ~/s.json:2:3: does not parse as json; remove it, or set format = \"jsonc\"", "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
     try std.testing.expectEqualStrings(program, try read(io, a, live));
 }
 
@@ -7766,6 +7766,48 @@ test "json capture: a TOML inf is a compose error naming its key, and a float fo
     try std.testing.expect(lineHasBoth(r.err, "~/bad.json", "NotRepresentableInJson"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "data.n.huge is inf, not representable in JSON") != null);
     try std.testing.expectEqualStrings("{\"b\": 1e+300, \"h\": 0.5}\n", try read(io, a, try c.homePath("ok.json")));
+}
+
+test "validation: a partial target's live file that does not parse never quotes its resolved secret" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.json", "{\"token\": \"<secret:env:MOX_SEK>\"}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"app.json\"]\nown = [\"token\"]\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_SEK", .value = "hunter2zz" }} });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("app.json"), .data = "{\"mine\": 1, \"token\": hunter2zz}\n" });
+    for ([_][]const []const u8{ &.{"apply"}, &.{"diff"}, &.{"status"}, &.{ "commit", "--dry-run" }, &.{"rollback"} }) |args| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(a, "mox");
+        try argv.appendSlice(a, args);
+        const res = try c.run(argv.items);
+        if (std.mem.indexOf(u8, res.out, "hunter2zz") != null or std.mem.indexOf(u8, res.err, "hunter2zz") != null) {
+            std.debug.print("{s} leaked:\n{s}\n{s}\n", .{ args[0], res.out, res.err });
+            return error.SecretLeaked;
+        }
+    }
+}
+
+test "add: the not-strict warning quotes nothing of the captured file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/.keep", "k\n");
+    const c = try cliSetup(a, io, &tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("t.json"), .data = "{\"t\": ghp_SECRETVALUE}\n" });
+    const r = try c.run(&.{ "mox", "add", "~/t.json" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "not strict JSON (src/t.json:1:7: does not parse as json)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ghp_SECRETVALUE") == null);
 }
 
 test "capture: text interpolation renders every data type exactly as before typed JSON captures existed" {
