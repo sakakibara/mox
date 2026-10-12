@@ -266,6 +266,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         refused = true;
     };
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
+    var dropped: std.ArrayList(status_mod.Dropped) = .empty;
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
@@ -308,6 +309,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     };
                     try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.live_path, o.content, o.prov, &total, &changed);
                 }
+                try status_mod.noteDropped(ctx, &dropped, file.live_path, outputs);
                 continue;
             }
         }
@@ -387,6 +389,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             if (c.kind == .symlink) {
                 try diffLinkRemoval(ctx, sty, stat_mode, c.live_path, c.target, &total, &changed);
             } else try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
+        }
+        // A file a live generator no longer produces, which apply would prune.
+        for (try status_mod.judgeDropped(ctx, tree, &ruleset, &scan, dropped.items)) |j| {
+            if (j.verdict != .remove) continue;
+            try diffOne(ctx, context.paths.state_dir, sty, stat_mode, j.drop.leaf, "", &.{}, &total, &changed);
         }
         // A file of a generator that left the tree, which apply would remove.
         for (try status_mod.orphanPlan(ctx, tree, &ruleset, &scan)) |m| {

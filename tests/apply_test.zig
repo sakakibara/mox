@@ -8446,3 +8446,27 @@ test "attributes: a symlink takes no directive key, whatever its key; its direct
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/l.json", "when is a directive key, which a symlink takes as a head directive in its source"));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath("l.json"), .{ .follow_symlinks = false }));
 }
+
+test "status and diff: a file a live generator no longer produces is shown as apply would remove it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"public\"\n[[ids]]\nslug = \"two\"\n[[ids]]\nslug = \"three\"\n");
+    try put(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(".config/Id-three.inc"), .data = "k=three\nmine\n" });
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"public\"\n");
+
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(lineHasBoth(st.out, "STALE", "~/.config/Id-two.inc (its generator no longer produces it)"));
+    try std.testing.expect(lineHasBoth(st.out, "DRIFT", "~/.config/Id-three.inc (its generator no longer produces it)"));
+    const d = try c.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "mine") == null);
+    const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/Id-two.inc") != null);
+}

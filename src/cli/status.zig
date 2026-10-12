@@ -138,6 +138,68 @@ pub fn orphanPlan(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *co
     return mox.apply.generated.planOrphans(ctx.alloc, ctx.io, opts, scan);
 }
 
+/// A file a live generator produced last time and no longer does.
+pub const Dropped = struct { generator: []const u8, leaf: []const u8 };
+
+/// Record in `out` every file `gen_live`'s manifest lists that `outputs`
+/// no longer produces.
+pub fn noteDropped(ctx: *app.Ctx, out: *std.ArrayList(Dropped), gen_live: []const u8, outputs: []const mox.compose.catB.GeneratedFile) !void {
+    const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, gen_live);
+    for (prior) |leaf| {
+        const still = for (outputs) |o| {
+            if (std.mem.eql(u8, o.live_path, leaf)) break true;
+        } else false;
+        if (!still) try out.append(ctx.alloc, .{ .generator = gen_live, .leaf = leaf });
+    }
+}
+
+pub const JudgedDrop = struct { drop: Dropped, verdict: mox.apply.removable.Verdict };
+
+/// How the generator prune would judge each of `dropped`, once `scan`
+/// knows every path still produced or managed.
+pub fn judgeDropped(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan, dropped: []const Dropped) ![]const JudgedDrop {
+    for (tree.files) |f| try scan.kept(f.live_path);
+    var opts = try apply_cmd.orphanOptions(ctx, tree, ruleset, "", false, true);
+    var kept: std.ArrayList([]const u8) = .empty;
+    var kit = scan.keep.keyIterator();
+    while (kit.next()) |k| try kept.append(ctx.alloc, k.*);
+    const inodes = try ctx.alloc.create(mox.apply.stale.Kept);
+    inodes.* = try mox.apply.stale.inodesOf(ctx.alloc, ctx.io, kept.items);
+    opts.keep = &scan.keep;
+    opts.kept_inodes = inodes;
+    var out: std.ArrayList(JudgedDrop) = .empty;
+    for (dropped) |d| try out.append(ctx.alloc, .{ .drop = d, .verdict = try mox.apply.generated.judgeLeaf(ctx.alloc, ctx.io, opts, d.leaf) });
+    return out.toOwnedSlice(ctx.alloc);
+}
+
+fn droppedRows(ctx: *app.Ctx, judged: []const JudgedDrop, rows: *std.Io.Writer, tally: *Tally, units: *std.ArrayList(mox.apply.drift.Unit)) !void {
+    const home = ctx.context.?.paths.home;
+    var drifted = std.StringHashMap(void).init(ctx.alloc);
+    for (judged) |j| {
+        const shown = try display.alloc(ctx.alloc, j.drop.leaf, home);
+        switch (j.verdict) {
+            .kept, .gone, .now_dir, .ignored, .same_file, .leave => {},
+            .remove => {
+                tally.add(.stale);
+                try rows.print("  {s:<8} {s} (its generator no longer produces it)\n", .{ Label.stale.text(), shown });
+            },
+            .linked_parent => {
+                tally.add(.stale);
+                try rows.print("  {s:<8} {s} (its generator no longer produces it; {s})\n", .{ Label.stale.text(), shown, mox.apply.parent_link.reason });
+            },
+            .drift => {
+                tally.add(.drift);
+                if (!(try drifted.getOrPut(j.drop.generator)).found_existing) try units.append(ctx.alloc, mox.apply.drift.generatedSet(j.drop.generator));
+                try rows.print("  {s:<8} {s} (its generator no longer produces it)\n", .{ Label.drift.text(), shown });
+            },
+            .refused => |why| {
+                tally.add(.err);
+                try rows.print("  {s:<8} {s} (its generator no longer produces it; {s})\n", .{ Label.err.text(), shown, why });
+            },
+        }
+    }
+}
+
 /// One row per file of an untagged manifest whose generator is gone: mox
 /// never removes it, and it needs no attention, so it counts toward nothing.
 fn untaggedRows(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, rows: *std.Io.Writer, scan: *const mox.apply.generated.OrphanScan) !void {
@@ -362,6 +424,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
+    var dropped: std.ArrayList(Dropped) = .empty;
     if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home), tree)) |u|
         try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
@@ -435,6 +498,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     try rows.print("  {s:<8} {s}\n", .{ cell.text(), leaf_shown });
                 }
                 if (gen_drifted) try units.append(ctx.alloc, mox.apply.drift.generatedSet(file.live_path));
+                try noteDropped(ctx, &dropped, file.live_path, outputs);
                 continue;
             }
         }
@@ -565,6 +629,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // Files whose source left the tree, as apply's sweeps would judge them.
     if (a.paths.len == 0) {
         try staleRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
+        try droppedRows(ctx, try judgeDropped(ctx, tree, &ruleset, &scan, dropped.items), rows, &tally, &units);
         try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try untaggedRows(ctx, tree, rows, &scan);
     }
