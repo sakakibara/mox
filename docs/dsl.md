@@ -352,7 +352,11 @@ or one nested deeper than a table) is rejected up front.
 In a JSON or JSONC source a capture lives inside a string token, and expands
 per token: the string is decoded (so `"<a | default \"x\">"` is the capture
 `<a | default "x">`), expanded, and written back as a JSON string, with every
-`"`, `\` and control byte in the resolved value escaped. A Windows path, a
+`"`, `\` and control byte in the resolved value escaped. A capture inside a
+string is read as one unit before the string is, so its own quotes need no
+escaping: `"<a | default "x">"` is the same capture. A string holding a
+capture is re-encoded whole, so its other escapes may come out normalized
+(`\/` is written `/`). A Windows path, a
 quote in a secret, or a newline in a fact value cannot break the document,
 and the expansion never adds a line. A string with no capture, and every byte
 outside a capture-bearing string -- structure, whitespace, a JSONC comment --

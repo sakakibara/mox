@@ -38,6 +38,87 @@ pub const Result = struct {
     key_capture: bool = false,
 };
 
+/// `text` with every raw `"` inside a capture that sits in a JSON string
+/// escaped, so `"<a | default "x">"` reads as the one string it means, as
+/// `"<a | default \"x\">"` does. A capture is recognized as a unit before
+/// the string is tokenized; nothing else changes.
+pub fn escapeCaptureQuotes(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '<') == null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    var in_string = false;
+    var changed = false;
+    while (i < text.len) {
+        const c = text[i];
+        if (!in_string) {
+            if (std.mem.startsWith(u8, text[i..], "//")) {
+                const end = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+                try out.appendSlice(arena, text[i..end]);
+                i = end;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[i..], "/*")) {
+                const end = if (std.mem.indexOfPos(u8, text, i + 2, "*/")) |e| e + 2 else text.len;
+                try out.appendSlice(arena, text[i..end]);
+                i = end;
+                continue;
+            }
+            if (c == '"') in_string = true;
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        switch (c) {
+            '\\' => {
+                try out.appendSlice(arena, text[i..@min(i + 2, text.len)]);
+                i += 2;
+            },
+            '"', '\n' => {
+                in_string = false;
+                try out.append(arena, c);
+                i += 1;
+            },
+            '<' => {
+                const rest = text[i + 1 ..];
+                const opens = rest.len > 0 and (std.ascii.isAlphabetic(rest[0]) or rest[0] == '_');
+                const close = if (opens) capture.closeIndex(text, i) else null;
+                const within = if (close) |e| std.mem.indexOfScalar(u8, text[i..e], '\n') == null else false;
+                if (close != null and within) {
+                    var k = i;
+                    while (k <= close.?) : (k += 1) {
+                        if (text[k] == '\\' and k + 1 <= close.?) {
+                            try out.appendSlice(arena, text[k .. k + 2]);
+                            k += 1;
+                        } else if (text[k] == '"') {
+                            try out.appendSlice(arena, "\\\"");
+                            changed = true;
+                        } else try out.append(arena, text[k]);
+                    }
+                    i = close.? + 1;
+                } else {
+                    try out.append(arena, c);
+                    i += 1;
+                }
+            },
+            else => {
+                try out.append(arena, c);
+                i += 1;
+            },
+        }
+    }
+    return if (changed) out.items else text;
+}
+
+test "escapeCaptureQuotes: a raw-quoted default is escaped, an escaped one is left" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("{\"o\": \"<a | default \\\"z\\\">\"}", try escapeCaptureQuotes(arena.allocator(), "{\"o\": \"<a | default \"z\">\"}"));
+    const esc = "{\"o\": \"<a | default \\\"z\\\">\"}";
+    try std.testing.expectEqualStrings(esc, try escapeCaptureQuotes(arena.allocator(), esc));
+    try std.testing.expectEqualStrings("{\"a\": \"x < y\"}", try escapeCaptureQuotes(arena.allocator(), "{\"a\": \"x < y\"}"));
+}
+
 /// Expand every capture-bearing string token of `text`. `ctx.json` is
 /// ignored: a decoded string's own captures expand as plain text.
 pub fn expand(
@@ -50,7 +131,7 @@ pub fn expand(
 ) interp.InterpError!Result {
     var inner_ctx = ctx;
     inner_ctx.json = null;
-    var text = text_in;
+    var text = if (state.in_block_comment) text_in else try escapeCaptureQuotes(arena, text_in);
 
     const line_count = std.mem.count(u8, text, "\n") + 1;
     const line_secret = try arena.alloc(bool, line_count);

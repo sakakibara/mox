@@ -8491,3 +8491,24 @@ test "apply and status: an unreadable source is labelled the same way by both" {
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expect(lineHasBoth(r.err, "~/.secret", "compose failed: AccessDenied"));
 }
+
+test "captures in JSON: a default with raw or escaped quotes is one capture, in .json, .jsonc and a generator" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/raw.json", "{\"o\": \"<machine.nosuch | default \"z\">\"}\n");
+    try put(io, &tmp, "repo/src/esc.json", "{\"o\": \"<machine.nosuch | default \\\"z\\\">\"}\n");
+    try put(io, &tmp, "repo/src/raw.jsonc", "// c\n{\"o\": \"<machine.nosuch | default \"z\">\"}\n");
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try put(io, &tmp, "repo/src/g.json", "// mox: for id in \"data/ids.toml\" into \"g-<id.slug>.json\"\n{\"o\": \"<machine.nosuch | default \"z\">\"}\n// mox: end\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("{\"o\": \"z\"}\n", try read(io, a, try c.homePath("raw.json")));
+    try std.testing.expectEqualStrings("{\"o\": \"z\"}\n", try read(io, a, try c.homePath("esc.json")));
+    try std.testing.expectEqualStrings("// c\n{\"o\": \"z\"}\n", try read(io, a, try c.homePath("raw.jsonc")));
+    try std.testing.expectEqualStrings("{\"o\": \"z\"}\n", try read(io, a, try c.homePath("g-a.json")));
+}

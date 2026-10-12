@@ -180,7 +180,9 @@ fn readBaseHead(
     marker_opt: ?[]const u8,
     bindings: *const dsl.resolver.Resolver,
 ) !Head {
-    const raw = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
+    const read = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
+    // A capture in a JSON string is one unit, its quotes included.
+    const raw = if (file.format != null and file.format.?.isJson()) try json_interp.escapeCaptureQuotes(arena, read) else read;
     if (marker_opt == null or !file.has_base) return .{ .text = raw, .body = raw, .partial = file.ownership != .none };
     const marker = marker_opt.?;
     const head_text = raw[0..@min(raw.len, source.tree.max_head_bytes)];
@@ -284,7 +286,7 @@ fn checkLayers(
         };
         if (!format.isJson() and interp.containsCapture(raw)) continue;
         const display = layerDisplay(arena, file, o.path);
-        try validate.checkLayer(arena, format, raw, display, targetKey(file), &.{}, diag);
+        try validate.checkLayer(arena, format, if (format.isJson()) try json_interp.escapeCaptureQuotes(arena, raw) else raw, display, targetKey(file), &.{}, diag);
         if (format.isJson() and merging and match_mod.matches(match_mod.effectiveOverlayTuple(o, bindings), bindings)) {
             try validate.checkDuplicateKeys(arena, format, raw, display, &.{}, false, diag);
         }
@@ -813,7 +815,7 @@ pub fn targetKey(file: ManagedFile) []const u8 {
 
 fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8, dialect: json.Dialect) !json.Value {
     const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    return json.parse(arena, content, .{ .dialect = dialect });
+    return json.parse(arena, try json_interp.escapeCaptureQuotes(arena, content), .{ .dialect = dialect });
 }
 
 fn parseYamlFile(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const u8, diag: ?*interp.Diag) !yaml.Value {
