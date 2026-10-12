@@ -7925,7 +7925,9 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
     // comptime, passes it. Of the listed sites only live_remove's `remove`
     // deletes a live path; write.zig's atomic write renames onto its own
     // target, snapshot.zig's restore puts a snapshot back, and the rest work on
-    // mox's own state, the repo, a temp file or the mox binary.
+    // mox's own state, the repo, a temp file or the mox binary. Out of scope:
+    // a removal done by a spawned process, and a call reached through
+    // `@field` with a string literal.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -8056,39 +8058,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         const rel = try std.mem.replaceOwned(u8, a, entry.path, "\\", "/");
         const name = try std.fmt.allocPrint(a, "src/{s}", .{rel});
         const text = try entry.dir.readFileAlloc(io, entry.basename, a, .limited(16 * 1024 * 1024));
-        var func: []const u8 = "(top)";
-        var in_test = false;
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "test ") or std.mem.startsWith(u8, line, "test{")) {
-                in_test = true;
-                continue;
-            }
-            if (in_test) {
-                if (std.mem.startsWith(u8, line, "}")) in_test = false;
-                continue;
-            }
-            const t = std.mem.trim(u8, line, " \t\r");
-            if (std.mem.startsWith(u8, t, "\\\\")) continue;
-            if (fnName(t)) |n| func = n;
-            const code = try codeOf(a, t);
-            var i: usize = 0;
-            while (i < code.len) {
-                if (!(std.ascii.isAlphabetic(code[i]) or code[i] == '_')) {
-                    i += 1;
-                    continue;
-                }
-                var k = i;
-                while (k < code.len and (std.ascii.isAlphanumeric(code[k]) or code[k] == '_')) k += 1;
-                if (isOverwritePrimitive(code[i..k])) {
-                    const key = try std.fmt.allocPrint(a, "{s}\t{s}", .{ name, func });
-                    const gop = try found.getOrPut(key);
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* += 1;
-                }
-                i = k;
-            }
-        }
+        try countMentions(a, text, name, &found);
     }
     var bad = false;
     var it = found.iterator();
@@ -8111,16 +8081,79 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
     try std.testing.expect(!bad);
 }
 
+/// Count, into `found` by "file\tfunction", each mention in `text` (the
+/// source file `name`) of a delete, rename or overwrite primitive outside a
+/// test block.
+fn countMentions(a: std.mem.Allocator, text: []const u8, name: []const u8, found: *std.StringHashMap(usize)) !void {
+    var func: []const u8 = "(top)";
+    // A test block ends where its braces balance, so a one-line test
+    // hides nothing after it.
+    var test_depth: ?i64 = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (test_depth == null and (std.mem.startsWith(u8, line, "test ") or std.mem.startsWith(u8, line, "test{"))) test_depth = 0;
+        if (test_depth) |*d| {
+            d.* += braceBalance(try codeOf(a, std.mem.trim(u8, line, " \t\r")));
+            if (d.* <= 0) test_depth = null;
+            continue;
+        }
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "\\\\")) continue;
+        if (fnName(t)) |n| func = n;
+        const code = try codeOf(a, t);
+        var i: usize = 0;
+        while (i < code.len) {
+            if (!(std.ascii.isAlphabetic(code[i]) or code[i] == '_')) {
+                i += 1;
+                continue;
+            }
+            var k = i;
+            while (k < code.len and (std.ascii.isAlphanumeric(code[k]) or code[k] == '_')) k += 1;
+            const qualified_c = i >= 2 and code[i - 1] == '.' and code[i - 2] == 'c' and (i == 2 or !(std.ascii.isAlphanumeric(code[i - 3]) or code[i - 3] == '_'));
+            const writing_open = std.mem.eql(u8, code[i..k], "openFile") and (std.mem.indexOf(u8, code, ".write_only") != null or std.mem.indexOf(u8, code, ".read_write") != null);
+            if (isOverwritePrimitive(code[i..k]) or writing_open or (qualified_c and std.mem.eql(u8, code[i..k], "remove"))) {
+                const key = try std.fmt.allocPrint(a, "{s}\t{s}", .{ name, func });
+                const gop = try found.getOrPut(key);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+            i = k;
+        }
+    }
+}
+
+test "apply: the primitive scanner sees past a one-line test and counts every variant" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var found = std.StringHashMap(usize).init(a);
+    try countMentions(a,
+        \\test "x" {}
+        \\fn after() void {
+        \\    _ = std.c.unlinkat(0, "p", 0);
+        \\    _ = std.c.remove("p");
+        \\    _ = Io.Dir.cwd().openFile(io, p, .{ .mode = .write_only });
+        \\    f.setEndPos(0) catch {};
+        \\    const del = Io.Dir.deleteFile; _ = del;
+        \\}
+    , "src/x.zig", &found);
+    try std.testing.expectEqual(@as(usize, 5), found.get("src/x.zig\tafter").?);
+}
+
 /// True for an identifier naming a primitive that deletes, renames or
 /// overwrites a path, aliases and variants included.
 fn isOverwritePrimitive(ident: []const u8) bool {
     for ([_][]const u8{ "deleteFile", "deleteDir", "deleteTree", "rename", "createFile", "writeFile", "writeAtomic" }) |p| {
         if (std.mem.startsWith(u8, ident, p)) return true;
     }
-    for ([_][]const u8{ "renamePreserve", "copyFile", "createFileAtomic", "replace", "symLinkAtomic", "setLength", "updateFile" }) |x| {
+    for ([_][]const u8{ "renamePreserve", "copyFile", "createFileAtomic", "replace", "symLinkAtomic", "setLength", "updateFile", "unlink", "unlinkat", "ftruncate", "setEndPos" }) |x| {
         if (std.mem.eql(u8, ident, x)) return true;
     }
     return false;
+}
+
+fn braceBalance(code: []const u8) i64 {
+    return @as(i64, @intCast(std.mem.count(u8, code, "{"))) - @as(i64, @intCast(std.mem.count(u8, code, "}")));
 }
 
 /// `t` with its string and character literals emptied and its comment cut.
