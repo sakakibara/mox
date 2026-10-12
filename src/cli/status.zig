@@ -289,6 +289,7 @@ const Spec = struct {
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox status")) return 2;
+    if (try apply_cmd.privateRefusal(ctx, "mox status")) return 2;
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -361,8 +362,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
-    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
-    const priv_down = try apply_cmd.privateDown(ctx, rows, repo_tag);
     if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home), tree)) |u|
         try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
@@ -373,7 +372,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // Every row names the file the way a human reads it; the real path is
         // still what the checks below are run against.
         const shown = try display.alloc(ctx.alloc, file.live_path, home);
-        if (priv_down and try apply_cmd.leftForPrivate(ctx, rows, file.live_path, repo_tag)) continue;
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
         if (file.head_error.len > 0) {
@@ -407,7 +405,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 var gen_drifted = false;
                 for (outputs) |o| {
                     const leaf_shown = try display.alloc(ctx.alloc, o.live_path, home);
-                    if (priv_down and try apply_cmd.leftForPrivate(ctx, rows, o.live_path, repo_tag)) continue;
                     if (o.invalid) |why| {
                         tally.add(.err);
                         try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), leaf_shown, why });
@@ -566,8 +563,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     // Files whose source left the tree, as apply's sweeps would judge them.
-    // An unavailable private layer stops every sweep, so none is previewed.
-    if (a.paths.len == 0 and !priv_down) {
+    if (a.paths.len == 0) {
         try staleRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try untaggedRows(ctx, tree, rows, &scan);

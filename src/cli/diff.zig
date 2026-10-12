@@ -191,6 +191,7 @@ const Spec = struct {
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox diff")) return 2;
+    if (try apply_cmd.privateRefusal(ctx, "mox diff")) return 2;
     const context = ctx.context.?;
     const stat_mode = a.stat;
     const sty = style.Style{ .on = style.enabled(
@@ -265,10 +266,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         refused = true;
     };
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
-    const priv_repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
-    const priv_down = try apply_cmd.privateDown(ctx, ctx.err, priv_repo_tag);
     for (files) |file| {
-        if (priv_down and try apply_cmd.leftForPrivate(ctx, ctx.err, file.live_path, priv_repo_tag)) continue;
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
@@ -300,7 +298,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 continue;
             }) |outputs| {
                 for (outputs) |o| {
-                    if (priv_down and try apply_cmd.leftForPrivate(ctx, ctx.err, o.live_path, priv_repo_tag)) continue;
                     if (o.invalid) |why| {
                         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
                         continue;
@@ -376,7 +373,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // A file whose source left the tree: apply removes it when unedited, so
     // its live content shows on the removed side.
-    if (a.paths.len == 0 and !priv_down) {
+    if (a.paths.len == 0) {
         const stale = mox.apply.stale;
         const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
         const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);

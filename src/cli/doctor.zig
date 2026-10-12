@@ -110,6 +110,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.out.print("  note: {f}: the tracked-source check was skipped (not its own git working tree, or git is unavailable)\n", .{display.of(context.paths.repo_dir, ctx.context.?.paths.home)});
     }
 
+    // A private layer this repo and HOME expect but cannot find: every
+    // composing command refuses until it is back or retired.
+    if (try mox.private.expect.unavailable(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.private_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home))) {
+        advisories += 1;
+        try ctx.out.print("  private-unavailable {f} (the private layer is unavailable but held sources before; restore it, or run `mox private retire` to stop expecting it)\n", .{display.of(context.paths.private_dir, context.paths.home)});
+    }
+
     // The private root's `data/` is data, never source: a file there is not
     // managed, and a user who put one there meaning it to be would get
     // silence otherwise.

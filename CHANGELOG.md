@@ -152,17 +152,24 @@ All notable changes to mox are documented here. The format follows
   files.
 - Nothing is swept -- stale files, or an orphaned generator's leaves -- in a
   run where any file failed to compose or write or carried a head error.
-- Records of a file the private layer contributes to name the private
-  layer. While such records exist and the layer is absent or holds no file,
-  it is unavailable: apply sweeps nothing and leaves every file the layer
-  contributes to as it is, and `status`, `diff` and `apply --dry-run` say
-  so, warning `private layer <path> is unavailable; nothing is swept and
-  files it contributes to are left as they are`. A private layer that is a
-  symlink to a directory is followed instead of failing with `NotDir`.
+- Once an apply has found the private layer holding a source, mox expects
+  it for that repo and HOME: while it is absent, not a directory, or holding
+  no source (junk such as `.DS_Store` and iCloud placeholders does not
+  count), `apply`, `status`, `diff`, `commit`, `export`, `mv` and `remove`
+  exit 2 before writing or removing anything, rollback restores whole files
+  only, and doctor reports it. `mox private retire` stops expecting it. A
+  private layer that is a symlink to a directory is followed instead of
+  failing with `NotDir`.
+- An iCloud placeholder for a file not downloaded (`.name.icloud`) is junk,
+  never a source.
 - A record whose live path is now a directory mox never wrote is forgotten
   once, with a note, instead of failing every run.
 
 ### Upgrading
+- The private layer is first expected by the first apply that finds it
+  holding a source. Before that, a missing private layer behaves as in
+  0.12.4: the files only it provided are removed as sources that left the
+  tree.
 - A machine on an older mox rejects an attributes file carrying the new keys
   (`format`, the directive keys, `released`), and `mox remove` now writes
   one. Upgrade every machine before committing them.

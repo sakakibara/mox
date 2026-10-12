@@ -24,6 +24,7 @@ const Spec = struct {
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox mv")) return 2;
+    if (try apply_cmd.privateRefusal(ctx, "mox mv")) return 2;
     const context = ctx.context.?;
     const old_name = a.old;
     const new_name = a.new;

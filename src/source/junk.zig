@@ -13,6 +13,8 @@ pub fn isJunk(filename: []const u8) bool {
     if (std.mem.endsWith(u8, filename, "~")) return true;
     if (std.mem.startsWith(u8, filename, "#") and std.mem.endsWith(u8, filename, "#")) return true;
     if (std.mem.startsWith(u8, filename, ".#")) return true;
+    // An iCloud placeholder for a file not downloaded: `.name.icloud`.
+    if (filename.len > ".icloud".len + 1 and filename[0] == '.' and std.mem.endsWith(u8, filename, ".icloud")) return true;
     return false;
 }
 

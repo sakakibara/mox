@@ -265,7 +265,7 @@ pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *co
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
         const r = (try repoOf(arena, bytes)) orelse continue;
-        if (applied.layerOf(r, opts.repo) == null) continue;
+        if (!std.mem.eql(u8, r, opts.repo)) continue;
         const leaves = try leavesOf(arena, bytes);
         for (leaves) |leaf| if (!parent_link.underHome(leaf, opts.home)) continue :outer;
         const released = if (try generatorOf(arena, bytes)) |g|
@@ -329,7 +329,7 @@ pub fn orphanManifestOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8,
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
         if (try repoOf(arena, bytes)) |r| {
-            if (applied.layerOf(r, repo) == null) continue;
+            if (!std.mem.eql(u8, r, repo)) continue;
         } else if (!untagged) continue;
         for (try leavesOf(arena, bytes)) |l| if (std.mem.eql(u8, l, leaf)) return path;
     }
@@ -349,7 +349,7 @@ pub fn orphanManifestsOf(arena: std.mem.Allocator, io: Io, state_dir: []const u8
         const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
         if (try repoOf(arena, bytes)) |r| {
-            if (applied.layerOf(r, repo) == null) continue;
+            if (!std.mem.eql(u8, r, repo)) continue;
         } else if (!untagged) continue;
         for (try leavesOf(arena, bytes)) |l| if (std.mem.eql(u8, l, leaf)) {
             try out.append(arena, path);

@@ -111,6 +111,7 @@ fn resolveArg(ctx: *app.Ctx, home: []const u8, cwd: ?[]const u8, name: []const u
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox export")) return 2;
+    if (try apply_cmd.privateRefusal(ctx, "mox export")) return 2;
     const context = ctx.context.?;
     const out_dir = (try resolveArg(ctx, context.paths.home, context.cwd, a.out)) orelse return 2;
     const facts_arg: ?[]const u8 = if (a.facts) |f|

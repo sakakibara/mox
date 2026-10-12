@@ -400,6 +400,7 @@ const publish_cmd = @import("publish.zig");
 const path_cmd = @import("path.zig");
 const git_cmd = @import("git.zig");
 const upgrade_cmd = @import("upgrade.zig");
+const private_cmd = @import("private.zig");
 
 /// Every registered top-level command.
 pub const command_table = [_]Command{
@@ -419,6 +420,7 @@ pub const command_table = [_]Command{
     export_cmd.command,
     mv_cmd.command,
     remove_cmd.command,
+    private_cmd.command,
     doctor_cmd.command,
     uninstall_cmd.command,
     update_cmd.command,

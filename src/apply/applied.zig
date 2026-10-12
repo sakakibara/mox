@@ -60,35 +60,6 @@ pub fn repoTag(arena: std.mem.Allocator, io: Io, repo_dir: []const u8, home: []c
     return std.fmt.allocPrint(arena, "{s}\x00{s}", .{ try realOrGiven(arena, io, repo_dir), try realOrGiven(arena, io, home) });
 }
 
-/// The tag of a record written for a file only the private layer holds:
-/// the repo's tag with the layer named, so a sweep can leave such a file in
-/// place while the private layer is absent.
-pub fn privateTag(arena: std.mem.Allocator, repo_tag: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}\x00private", .{repo_tag});
-}
-
-/// Which layer of `repo_tag` the record tag `rec` names, or null when it
-/// names another repo or HOME, or none.
-pub const Layer = enum { repo, private };
-pub fn layerOf(rec: ?[]const u8, repo_tag: []const u8) ?Layer {
-    const r = rec orelse return null;
-    if (std.mem.eql(u8, r, repo_tag)) return .repo;
-    if (r.len == repo_tag.len + "\x00private".len and std.mem.startsWith(u8, r, repo_tag) and std.mem.eql(u8, r[repo_tag.len..], "\x00private")) return .private;
-    return null;
-}
-
-/// The tag to record `live_path` under for `repo_tag`: the private layer's
-/// when the record there now names it, else the repo's.
-pub fn tagFor(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, repo_tag: []const u8) ![]const u8 {
-    const prior: ?[]const u8 = blk: {
-        if (try readSymlinkRecord(arena, io, state_dir, live_path)) |r| break :blk r.repo;
-        if (try readOwned(arena, io, state_dir, live_path)) |r| break :blk r.repo;
-        const bytes = Io.Dir.cwd().readFileAlloc(io, try recordPath(arena, state_dir, live_path), arena, .limited(max_record_bytes)) catch break :blk null;
-        break :blk if (try parseWhole(arena, bytes)) |w| w.repo else null;
-    };
-    return if (layerOf(prior, repo_tag) == .private) privateTag(arena, repo_tag) else repo_tag;
-}
-
 fn realOrGiven(arena: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
     return Io.Dir.realPathFileAbsoluteAlloc(io, path, arena) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

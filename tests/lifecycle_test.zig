@@ -6806,8 +6806,67 @@ test "stale: a record whose path is now a directory mox never wrote is forgotten
     try std.testing.expectEqualStrings("m\n", try read(io, a, try h.liveOf(".cfg/mine")));
 }
 
-test "private layer: while it is absent its files are left in place with a warning, and a symlinked one is followed" {
-    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+const private_refusal = "is unavailable but held sources before; restore it, or run `mox private retire` to stop expecting it";
+
+/// Every path under `root` with its bytes or link target: what a refused
+/// run must leave exactly as it was.
+fn fsImage(a: std.mem.Allocator, io: Io, root: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return "";
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    var lines: std.ArrayList([]const u8) = .empty;
+    while (try walker.next(io)) |e| {
+        const line = switch (e.kind) {
+            .file => try std.fmt.allocPrint(a, "{s} {s}", .{ e.path, try e.dir.readFileAlloc(io, e.basename, a, .limited(1 << 20)) }),
+            .sym_link => blk: {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const n = try e.dir.readLink(io, e.basename, &buf);
+                break :blk try std.fmt.allocPrint(a, "{s} -> {s}", .{ e.path, buf[0..n] });
+            },
+            else => try std.fmt.allocPrint(a, "{s}/", .{e.path}),
+        };
+        try lines.append(a, line);
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn f(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.f);
+    for (lines.items) |l| {
+        try out.appendSlice(a, l);
+        try out.append(a, '\n');
+    }
+    return out.items;
+}
+
+/// Every composing command refuses with exit 2 and changes nothing.
+fn expectRefused(h: Harness, a: std.mem.Allocator, io: Io) !void {
+    const before_home = try fsImage(a, io, h.home);
+    const before_state = try fsImage(a, io, h.state);
+    for ([_][]const []const u8{
+        &.{ "mox", "apply" },
+        &.{ "mox", "apply", "--dry-run" },
+        &.{ "mox", "status" },
+        &.{ "mox", "diff" },
+        &.{ "mox", "commit", "--yes" },
+        &.{ "mox", "export", try std.fs.path.join(a, &.{ h.root, "out" }) },
+        &.{ "mox", "mv", ".r", ".r2" },
+        &.{ "mox", "remove", ".r" },
+    }) |argv| {
+        const r = try h.run(argv);
+        if (r.rc != 2 or std.mem.indexOf(u8, r.err, private_refusal) == null) {
+            std.debug.print("\n{s} {s}: rc={d}\n{s}\n", .{ argv[1], if (argv.len > 2) argv[2] else "", r.rc, r.err });
+            return error.TestExpectedRefusal;
+        }
+    }
+    try std.testing.expectEqualStrings(before_home, try fsImage(a, io, h.home));
+    try std.testing.expectEqualStrings(before_state, try fsImage(a, io, h.state));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ h.root, "out" }), .{}));
+}
+
+test "private layer: once it held sources, every composing command refuses while it is unavailable" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6815,23 +6874,75 @@ test "private layer: while it is absent its files are left in place with a warni
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
-    try writeRepo(io, &tmp, "repo/src/.keep", "k\n");
-    try writeRepo(io, &tmp, "elsewhere/.netrc", "token\n");
-    const priv = try std.fs.path.join(a, &.{ h.state, "private" });
-    try Io.Dir.cwd().createDirPath(io, h.state);
-    try Io.Dir.cwd().symLink(io, try std.fs.path.join(a, &.{ h.root, "elsewhere" }), priv, .{});
+    try writeRepo(io, &tmp, "repo/src/.r", "r\n");
+    try writeRepo(io, &tmp, "repo/src/.tok", "token=abc\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"public\"\n");
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"Id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "state/private/.pa", "pa\n");
+    try writeRepo(io, &tmp, "state/private/data/ids.toml", "[[ids]]\nslug = \"public\"\n[[ids]]\nslug = \"secrethost\"\n");
+    try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".tok\"]\nmode = \"0600\"\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expectEqualStrings("token\n", try read(io, a, try h.liveOf(".netrc")));
+    const priv = try std.fs.path.join(a, &.{ h.state, "private" });
 
-    // The volume goes away.
-    try Io.Dir.cwd().deleteFile(io, priv);
-    const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, st.out, "is unavailable; nothing is swept and files it contributes to are left as they are") != null);
-    try std.testing.expect(std.mem.indexOf(u8, st.out, "STALE") == null);
+    // Only junk left: a .DS_Store and an evicted iCloud placeholder.
+    try Io.Dir.cwd().rename(priv, Io.Dir.cwd(), try std.fs.path.join(a, &.{ h.root, "away" }), io);
+    try writeRepo(io, &tmp, "state/private/.DS_Store", "x");
+    try writeRepo(io, &tmp, "state/private/..pa.icloud", "x");
+    try expectRefused(h, a, io);
+    // Empty.
+    try Io.Dir.cwd().deleteTree(io, priv);
+    try Io.Dir.cwd().createDirPath(io, priv);
+    try expectRefused(h, a, io);
+    // Absent.
+    try Io.Dir.cwd().deleteTree(io, priv);
+    try expectRefused(h, a, io);
+    try std.testing.expectEqualStrings("k=secrethost\n", try read(io, a, try h.liveOf(".config/Id-secrethost.inc")));
+    try std.testing.expectEqualStrings("pa\n", try read(io, a, try h.liveOf(".pa")));
+
+    // Rollback warns, and doctor reports it.
+    const d = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "is unavailable but held sources before") != null);
+}
+
+test "private retire: after it, a missing private layer reads as absent again" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.r", "r\n");
+    try writeRepo(io, &tmp, "state/private/.pa", "pa\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(a, &.{ h.state, "private" }));
+    try std.testing.expectEqual(@as(u8, 2), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const dry = try h.run(&.{ "mox", "private", "retire", "--dry-run" });
+    try std.testing.expectEqual(@as(u8, 0), dry.rc);
+    try std.testing.expectEqual(@as(u8, 2), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "private", "retire" })).rc);
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "is unavailable; nothing is swept and files it contributes to are left as they are") != null);
-    try std.testing.expectEqualStrings("token\n", try read(io, a, try h.liveOf(".netrc")));
+    // The private-only file's source left the tree: removed, snapshot first.
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try h.liveOf(".pa"), .{}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "rollback" })).rc);
+    try std.testing.expectEqualStrings("pa\n", try read(io, a, try h.liveOf(".pa")));
+}
+
+test "private layer: one that never held a source is not expected" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.r", "r\n");
+    try writeRepo(io, &tmp, "state/private/.DS_Store", "x");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(a, &.{ h.state, "private" }));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 }
 
 test "status, diff and apply --dry-run preview a planted link's replacement as the write apply makes" {

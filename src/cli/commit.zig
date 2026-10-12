@@ -1124,6 +1124,7 @@ fn reconcilePackages(
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox commit")) return 2;
+    if (try apply_cmd.privateRefusal(ctx, "mox commit")) return 2;
     return commitImpl(ctx, a.dry_run, a.yes, a.abort_on_prompt, a.color orelse .auto, a.paths);
 }
 
@@ -2361,7 +2362,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target, try recordTag(ctx, s.live_path));
+        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
         try ctx.out.print("  committed {f}\n", .{display.of(s.live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2370,7 +2371,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live, try recordTag(ctx, gc.leaf_live_path));
+        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
         if (!r.secret) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
         try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.prov);
         try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
@@ -2412,7 +2413,7 @@ fn commitRun(
                     // no line provenance.
                     try advanceOwnedRecord(ctx, file, r.composed, r.prov);
                 } else {
-                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live, try recordTag(ctx, file.live_path));
+                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
                     // Never cache the cleartext of a secret-bearing composition.
                     if (!mox.provenance.map.hasSecret(r.prov)) {
                         try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
@@ -2575,7 +2576,7 @@ fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed
         .secret = any_secret,
         .own_paths = raws,
         .secret_paths = secret_raws.items,
-        .repo = try recordTag(ctx, file.live_path),
+        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
     });
 }
 
@@ -2586,14 +2587,6 @@ fn ignoredStale(ctx: *app.Ctx, resolver: *const mox.dsl.resolver.Resolver, m_sta
     if (!ruleset.isPathIgnored(try mox.source.path.liveKeyRelToHome(ctx.alloc, m_state.home, live), false)) return false;
     try ctx.out.print("  {f}: matched by .moxignore, left alone\n", .{display.of(live, m_state.home)});
     return true;
-}
-
-/// The tag a record commit rewrites names: the layer its record already
-/// names, the private layer's or the repo's.
-fn recordTag(ctx: *app.Ctx, live_path: []const u8) ![]const u8 {
-    const context = ctx.context.?;
-    const repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
-    return mox.apply.applied.tagFor(ctx.alloc, ctx.io, context.paths.state_dir, live_path, repo);
 }
 
 /// How a routed file that passes verification stands: its recompose equals

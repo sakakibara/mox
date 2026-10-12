@@ -996,20 +996,14 @@ so a fact only a private source compares is still asked. `mox remove` of a
 private-only file forgets it here and writes no tombstone, editing the
 private attributes, not the repo's.
 
-The private layer may be a symlink to a directory elsewhere. Every record
-of a file the private layer contributes to -- its own file, or a repo file
-it adds an overlay, a fragment or loop data to -- names the private layer.
-While records name it and the layer is absent or holds no file (an
-unmounted volume, an empty mountpoint, an unsynced folder), it is
-unavailable: apply sweeps nothing of any kind (stale files, a gone
-generator's files, a generator's dropped files, an exact directory's
-entries) and leaves every file the layer contributes to as it is rather
-than rewrite it without its private part, while repo-only files still
-apply. `status`, `diff` and `apply --dry-run` show the same and preview no
-removal, under one warning: `private layer <path> is unavailable; nothing
-is swept and files it contributes to are left as they are`, with a line
-naming each file left. The next run with the layer back converges as
-usual.
+The private layer may be a symlink to a directory elsewhere. Once an apply
+finds it holding a source, mox expects it for that repo and HOME; while it
+is then absent, not a directory, or holding no source -- an unmounted
+volume, an empty mountpoint, an unsynced folder -- every command that
+composes refuses to run, since composing without it would drop its part of
+every file and remove what only it provides. See `mox private` in the
+command reference, and `mox private retire` to stop expecting a layer that
+is gone on purpose.
 
 ## Concurrency and snapshots
 

@@ -38,8 +38,6 @@ pub const Candidate = struct {
     /// A symlink record of a link rollback put back: drift, never removed
     /// without `--overwrite`.
     rolled_back: bool = false,
-    /// Written for a file only the private layer holds.
-    private: bool = false,
 };
 
 /// Every stale record of `repo` under `home`, one per live path, sorted by
@@ -62,7 +60,7 @@ pub fn find(
         if (!tagged(rec.repo, repo) or !parent_link.underHome(rec.live_path, home)) continue;
         if (keep.contains(rec.live_path) or seen.contains(rec.live_path)) continue;
         try seen.put(rec.live_path, {});
-        try out.append(arena, .{ .live_path = rec.live_path, .kind = .owned, .private = isPrivate(rec.repo, repo) });
+        try out.append(arena, .{ .live_path = rec.live_path, .kind = .owned });
     }
     for (try recordBytes(arena, io, state_dir, "applied-symlink", 1024 * 1024)) |bytes| {
         const rec = try applied.parseSymlink(arena, bytes);
@@ -70,7 +68,7 @@ pub fn find(
         if (!tagged(rec.repo, repo) or !parent_link.underHome(live, home)) continue;
         if (keep.contains(live) or seen.contains(live)) continue;
         try seen.put(live, {});
-        try out.append(arena, .{ .live_path = live, .kind = .symlink, .target = rec.target, .rolled_back = rec.rolled_back, .private = isPrivate(rec.repo, repo) });
+        try out.append(arena, .{ .live_path = live, .kind = .symlink, .target = rec.target, .rolled_back = rec.rolled_back });
     }
     for (try recordBytes(arena, io, state_dir, "applied", 1024 * 1024)) |bytes| {
         const rec = (try applied.parseWhole(arena, bytes)) orelse continue;
@@ -81,47 +79,16 @@ pub fn find(
         if (seen.contains(rec.live_path)) {
             for (out.items) |*c| {
                 if (c.kind == .symlink and std.mem.eql(u8, c.live_path, rec.live_path) and !isSymlink(io, c.live_path)) {
-                    c.* = .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash, .private = isPrivate(rec.repo, repo) };
+                    c.* = .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash };
                 }
             }
             continue;
         }
         try seen.put(rec.live_path, {});
-        try out.append(arena, .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash, .private = isPrivate(rec.repo, repo) });
+        try out.append(arena, .{ .live_path = rec.live_path, .kind = .whole, .hash = rec.hash });
     }
     std.mem.sort(Candidate, out.items, {}, lessByPath);
     return out.toOwnedSlice(arena);
-}
-
-/// True when the private layer at `private_dir` cannot be trusted to hold
-/// what it held: it is absent, or holds no file, while records of `repo`
-/// under `home` name it. An empty mountpoint or an unsynced folder reads
-/// the same as a missing one.
-pub fn privateUnavailable(arena: std.mem.Allocator, io: Io, private_dir: []const u8, state_dir: []const u8, repo: []const u8, home: []const u8) !bool {
-    if (try holdsAFile(arena, io, private_dir)) return false;
-    return privateRecords(arena, io, state_dir, repo, home);
-}
-
-fn holdsAFile(arena: std.mem.Allocator, io: Io, dir_path: []const u8) !bool {
-    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return false;
-    defer dir.close(io);
-    var walker = try dir.walk(arena);
-    defer walker.deinit();
-    while (walker.next(io) catch return false) |entry| {
-        if (entry.kind != .directory) return true;
-    }
-    return false;
-}
-
-/// True when any record or generator manifest of `repo` under `home` was
-/// written for a file only the private layer holds.
-pub fn privateRecords(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, home: []const u8) !bool {
-    var none = std.StringHashMap(void).init(arena);
-    for (try find(arena, io, state_dir, repo, home, &none)) |c| if (c.private) return true;
-    for (try recordBytes(arena, io, state_dir, "generated", 64 * 1024 * 1024)) |bytes| {
-        if (applied.layerOf(try generated.repoOf(arena, bytes), repo) == .private) return true;
-    }
-    return false;
 }
 
 /// The stale records of `repo` under `home` against the whole tree `tree`:
@@ -222,11 +189,8 @@ fn isSymlink(io: Io, path: []const u8) bool {
 }
 
 fn tagged(rec_repo: ?[]const u8, repo: []const u8) bool {
-    return applied.layerOf(rec_repo, repo) != null;
-}
-
-fn isPrivate(rec_repo: ?[]const u8, repo: []const u8) bool {
-    return applied.layerOf(rec_repo, repo) == .private;
+    const r = rec_repo orelse return false;
+    return std.mem.eql(u8, r, repo);
 }
 
 fn lessByPath(_: void, a: Candidate, b: Candidate) bool {

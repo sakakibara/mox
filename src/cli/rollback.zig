@@ -164,7 +164,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // none leaves the state directory as it is.
     var mox_bin_dir: ?[]const u8 = null;
     var mox_bin_resolved = false;
+    // A partial target is re-patched from what composes now, which without
+    // an expected private layer would drop its private part: while the
+    // layer is unavailable only whole files are restored.
+    const private_down = try mox.private.expect.unavailable(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.private_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+    if (private_down) try ctx.err.print("mox rollback: warning: private layer {f} is unavailable but held sources before; whole files are restored, partially owned files are not re-patched\n", .{display.of(context.paths.private_dir, context.paths.home)});
     for (withheld.items) |w| {
+        if (private_down) {
+            try ctx.err.print("  ERROR   {f} (not re-patched: the private layer is unavailable)\n", .{display.of(w.live_path, context.paths.home)});
+            failed += 1;
+            continue;
+        }
         const file = partials.get(w.live_path) orelse {
             try ctx.err.print("  ERROR   {f} (partially owned, but its own declaration is unavailable; fix the source tree, then re-run)\n", .{display.of(w.live_path, ctx.context.?.paths.home)});
             failed += 1;

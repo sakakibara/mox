@@ -1011,6 +1011,31 @@ private layer shadows the repo.
 | `--format <format>` | toml or json |
 <!-- /generated -->
 
+## private
+
+The private layer is `<state dir>/private/`. Once an apply finds it holding
+a source -- any file the source walk would not skip as junk, its `data/` and
+`.mox/attributes.toml` included -- mox notes, under the state dir, that this
+repo and HOME expect it. From then on, while it is absent, not a directory,
+or holding no source (an unmounted volume, an empty mountpoint, a folder of
+`.DS_Store` files or iCloud placeholders), every command that composes --
+`apply` (`--dry-run` included), `status`, `diff`, `commit`, `export`, `mv`
+and `remove` -- exits 2 before it writes or removes anything: `private layer
+<path> is unavailable but held sources before; restore it, or run `mox
+private retire` to stop expecting it`. `rollback` warns, restores whole
+files, and re-patches no partially owned file; `doctor` reports it.
+
+`private retire` removes that expectation (`--dry-run` says whether there is
+one). The next apply then treats the private layer as absent: the files only
+it provided have a source that left the tree, and the sweeps remove them,
+snapshot-first, as for any other.
+
+<!-- generated: flags private retire -->
+| Flag | Description |
+| --- | --- |
+| `--dry-run` | say whether there is an expectation to retire, and change nothing |
+<!-- /generated -->
+
 ## doctor
 
 Health report: source files not tracked by git, source modes git cannot carry
