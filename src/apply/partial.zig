@@ -103,8 +103,8 @@ const iniDialect = format_mod.iniDialect;
 
 /// Why a partial target's live file, named `display`, does not parse in
 /// `format`: its location, the parser's reason and a hint by cause.
-pub fn liveParseError(arena: std.mem.Allocator, format: Format, live: []const u8, display: []const u8, has_secret: bool) ![]const u8 {
-    return (try validate.liveFailure(arena, format, live, display, has_secret)) orelse
+pub fn liveParseError(arena: std.mem.Allocator, format: Format, live: []const u8, display: []const u8) ![]const u8 {
+    return (try validate.liveFailure(arena, format, live, display)) orelse
         try std.fmt.allocPrint(arena, "{s}: does not parse as {s}", .{ display, @tagName(format) });
 }
 
@@ -3478,8 +3478,7 @@ test "json: a live file with a comment is refused under the strict dialect" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try testing.expectError(error.OwnedUnparseable, OwnedDoc.parse(arena, .json, "{\n  // note\n  \"a\": 1\n}\n"));
-    try testing.expectEqualStrings("live ~/a.json:2:3: comments not allowed in strict json; remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments", try liveParseError(arena, .json, "{\n  // note\n  \"a\": 1\n}\n", "live ~/a.json", false));
-    try testing.expectEqualStrings("live ~/a.json:2:3: does not parse as json; remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments", try liveParseError(arena, .json, "{\n  // note\n  \"a\": 1\n}\n", "live ~/a.json", true));
+    try testing.expectEqualStrings("live ~/a.json:2:3: does not parse as json; remove it, or set format = \"jsonc\" for this file in .mox/attributes.toml if the program reads comments", try liveParseError(arena, .json, "{\n  // note\n  \"a\": 1\n}\n", "live ~/a.json"));
 }
 
 test "json: a duplicate key on the declared path is refused" {

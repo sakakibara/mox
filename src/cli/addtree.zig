@@ -133,6 +133,7 @@ fn walk(
                     .added => {
                         counts.added += 1;
                         try ctx.out.print("  added {f}\n", .{display.of(child, home)});
+                        try add.noteCaptured(ctx, try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(child, home)}), result);
                         if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(child))) {
                             try ctx.out.print("  note: {f} looks like a secret and will be committed\n", .{display.of(child, home)});
                         }

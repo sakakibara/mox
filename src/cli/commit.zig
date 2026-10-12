@@ -4477,7 +4477,7 @@ fn processStructFile(
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
             const shown = try std.fmt.allocPrint(cc.arena, "{f}", .{display.of(file.live_path, cc.m_state.home)});
-            const why = (try mox.compose.validate.liveFailure(cc.arena, format, live, try std.fmt.allocPrint(cc.arena, "live {s}", .{shown}), mox.provenance.map.holdsSecret(cc.arena, cc.io, cc.paths.state_dir, file.live_path))) orelse @errorName(e);
+            const why = (try mox.compose.validate.liveFailure(cc.arena, format, live, try std.fmt.allocPrint(cc.arena, "live {s}", .{shown}))) orelse @errorName(e);
             try cc.stdout.print("  manual: {s} could not be parsed ({s}); edit its source directly\n", .{ shown, why });
             return .cont;
         },

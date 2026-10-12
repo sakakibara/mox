@@ -7865,3 +7865,55 @@ test "validation: a symlink source or a generator template is never parsed as it
         try std.testing.expect(std.mem.indexOf(u8, s.out, "ERROR") == null and std.mem.indexOf(u8, s.err, "ERROR") == null);
     }
 }
+
+test "validation: a live file's parse error never prints its bytes, owned or not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.json", "{\"theme\": \"dark\"}\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"app.json\"]\nown = [\"theme\"]\n");
+    try put(io, &tmp, "repo/src/w.toml", "a = 1\n");
+    try put(io, &tmp, "repo/src/w.toml.d/os=" ++ host_os ++ ".toml", "b = 2\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("app.json"), .data = "{\"theme\": \"dark\", \"oauth\": ghp_USERTOKEN123}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("w.toml"), .data = "a = 1\nb = ghp_WHOLETOKEN456\n" });
+    for ([_][]const []const u8{ &.{"apply"}, &.{"diff"}, &.{"status"}, &.{ "commit", "--dry-run" }, &.{"rollback"} }) |args| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.append(a, "mox");
+        try argv.appendSlice(a, args);
+        const res = try c.run(argv.items);
+        for ([_][]const u8{ "ghp_USERTOKEN123", "ghp_WHOLETOKEN456" }) |tok| {
+            // diff shows a whole file's live lines by design; only a parse
+            // error is held to fixed text.
+            if (std.mem.eql(u8, args[0], "diff") and std.mem.eql(u8, tok, "ghp_WHOLETOKEN456")) continue;
+            if (std.mem.indexOf(u8, res.out, tok) != null or std.mem.indexOf(u8, res.err, tok) != null) {
+                std.debug.print("{s} leaked {s}:\n{s}\n{s}\n", .{ args[0], tok, res.out, res.err });
+                return error.LiveBytesLeaked;
+            }
+        }
+    }
+}
+
+test "add: a recursive add warns per file that is not strict JSON" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/.keep", "k\n");
+    const c = try cliSetup(a, io, &tmp);
+    try Io.Dir.cwd().createDirPath(io, try c.homePath(".config/x"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(".config/x/t.json"), .data = "{\"t\": 1,}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath(".config/x/ok.json"), .data = "{\"t\": 1}\n" });
+    const r = try c.run(&.{ "mox", "add", "-r", "~/.config/x" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "t.json: warning: not strict JSON (src/.config/x/t.json:1:8: does not parse as json; remove the trailing comma)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "ok.json: warning") == null);
+}

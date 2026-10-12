@@ -11005,7 +11005,7 @@ test "commit: a source layer or live file that does not parse is named with its 
 
     const r = try h.run(&.{ "mox", "commit", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, r.err, try tilde(a, "~/m.json: not committed: src/m.json.d/os=darwin.json:1:8: trailing comma")) != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "could not be parsed (live ~/l.json:3:9: trailing comma")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "could not be parsed (live ~/l.json:3:9: does not parse as json; remove the trailing comma")) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "FormatViolation") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "ParseError") == null);
 }

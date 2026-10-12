@@ -174,9 +174,8 @@ pub fn addFile(
     if (std.fs.path.dirname(src_path)) |parent| Io.Dir.cwd().createDirPath(io, parent) catch {};
     try mox.apply.write.writeAtomic(io, src_path, content, mode);
     try recordAttrs(arena, io, repo_dir, home, live_path, fields, attrs_diag);
-    // A file being captured may hold real secrets: its reason is fixed text.
     const not_strict = if (resolved.format == .json)
-        try mox.compose.validate.liveFailure(arena, .json, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}), true)
+        try mox.compose.validate.liveFailure(arena, .json, content, try std.fmt.allocPrint(arena, "src/{s}", .{trimmed}))
     else
         null;
     return .{ .outcome = .added, .src_path = src_path, .recorded_jsonc = resolved.record_jsonc, .not_strict = not_strict };
@@ -765,8 +764,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     switch (result.outcome) {
         .added => {
             try ctx.out.print("Added {s} -> {f}\n", .{ shown, display.of(result.src_path, home) });
-            if (result.recorded_jsonc) try noteJsonc(ctx, shown);
-            if (result.not_strict) |why| try ctx.err.print("mox add: {s}: warning: not strict JSON ({s}); apply refuses it until it parses\n", .{ shown, why });
+            try noteCaptured(ctx, shown, result);
             if (mox.source.ignore.load.looksLikeSecret(std.fs.path.basename(live_path))) {
                 try ctx.out.print("  note: {s} looks like a secret and will be committed\n", .{shown});
             }
@@ -811,6 +809,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 }
 
 /// Say why a `.json` capture was recorded as jsonc.
+/// What a capture tells about the format it recorded: a `.json` file with
+/// comments recorded as JSONC, or one that is not strict JSON.
+pub fn noteCaptured(ctx: *app.Ctx, shown: []const u8, result: Result) !void {
+    if (result.recorded_jsonc) try noteJsonc(ctx, shown);
+    if (result.not_strict) |why| try ctx.err.print("mox add: {s}: warning: not strict JSON ({s}); apply refuses it until it parses\n", .{ shown, why });
+}
+
 fn noteJsonc(ctx: *app.Ctx, shown: []const u8) !void {
     try ctx.err.print("mox add: {s}: it has comments, so format = \"jsonc\" is recorded for it in .mox/attributes.toml\n", .{shown});
 }

@@ -61,13 +61,13 @@ pub fn checkLayer(
 }
 
 /// Why a live file `display` names does not parse in `format`, as
-/// `<display>:<line>:<col>: <reason>[; <hint>]`, or null when it parses.
-/// `has_secret` says mox resolved a secret into it, so no byte of the
-/// parser's message may be printed.
-pub fn liveFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, has_secret: bool) !?[]const u8 {
+/// `<display>:<line>:<col>: <reason>[; <hint>]`, or null when it parses. A
+/// live file is the user's data and may hold secrets mox never wrote, so the
+/// reason is fixed text: no byte of the file is printed.
+pub fn liveFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8) !?[]const u8 {
     const f = (try firstFailure(arena, format, text, display, "")) orelse return null;
-    const why = try reason(arena, format, f, has_secret);
-    const hint = shownHint(f, has_secret);
+    const why = try reason(arena, format, f, true);
+    const hint = shownHint(f, true);
     if (hint) |h| return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}; {s}", .{ display, f.line, f.col, why, h });
     return try std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}", .{ display, f.line, f.col, why });
 }
