@@ -2270,6 +2270,8 @@ fn commitRun(
         const coupled_count = coupledCount(coupling_edits, &settle.restore_cause);
         if (coupled_count > 0) pending = true;
         if (pkgs.pending()) pending = true;
+        // A release the run would make is work it left undone.
+        if (stale_named.len > 0) pending = true;
         if (routed_count == 0 and manual_count == 0 and coupled_count == 0 and skipped_secret == 0 and !pkgs.pending()) {
             try ctx.out.writeAll("mox commit: nothing to commit\n");
         } else if (skipped_secret > 0) {

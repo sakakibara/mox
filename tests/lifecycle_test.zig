@@ -5411,6 +5411,9 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
     // Without --yes off a terminal, commit only reports.
     const report = try h.run(&.{ "mox", "commit", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 1), report.rc);
+    // Named beside a managed file with nothing to commit, it still exits 1.
+    const mixed = try h.run(&.{ "mox", "commit", "~/.edited", "~/.other" });
+    try std.testing.expectEqual(@as(u8, 1), mixed.rc);
     try std.testing.expect(std.mem.indexOf(u8, report.out, "would release ~/.edited") != null);
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, try h.liveOf(".edited"))) != null);
     // A run that aborts on a prompt releases nothing.

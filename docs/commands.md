@@ -696,12 +696,15 @@ packages entirely.
   edited live copy; a generator that fails to re-expand; a special file at
   a recorded path; a head declaration (`own`, `disown`, `check`) that
   cannot be read on a recorded path whose live content changed; a skipped
-  secret; a package still untracked. The same holds in every mode.
-- **2**: a source could not be read before writing, a write or restore
-  failed (sources restored or copied as above, nothing recorded), a
-  temporary check write for a key placement, a line or a row failed, any
-  temporary check write could not be reverted, or `--abort-on-prompt`
-  reached a prompt. A temporary check write for a coupled rename that
+  secret; a package still untracked; a named stale path or orphaned
+  generator file a reporting run (`--dry-run`, or no terminal without
+  `--yes`) would release. The same holds in every mode.
+- **2**: an attributes file, the repo's or the private layer's, is not
+  valid TOML or cannot be read; a source could not be read before
+  writing, a write or restore failed (sources restored or copied as above,
+  nothing recorded), a temporary check write for a key placement, a line
+  or a row failed, any temporary check write could not be reverted, or
+  `--abort-on-prompt` reached a prompt. A temporary check write for a coupled rename that
   fails undoes that rename (`coupled update to <path> undone: <path> could
   not take it (<error>)`) and is not an exit 2.
 
