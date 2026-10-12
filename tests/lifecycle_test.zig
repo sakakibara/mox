@@ -6219,6 +6219,11 @@ test "remove: a tombstone that matches nothing is a warning until apply has seen
     try std.testing.expect(std.mem.indexOf(u8, again.out, "matches nothing") == null);
     const s2 = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, s2.out, "matches nothing") == null);
+    // Another repo sharing the state directory has not seen its own.
+    try writeRepo(io, &tmp, "repo2/src/.kept", "k\n");
+    try writeRepo(io, &tmp, "repo2/.mox/attributes.toml", "[\".nothing\"]\nreleased = true\n");
+    const s3 = try (try h.otherRepo(try std.fs.path.join(a, &.{ h.root, "repo2" }))).run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s3.out, "WARN", "matches nothing mox manages"));
 }
 
 test "rollback: a live path that is now a symlink keeps the link and names the snapshot copy" {
@@ -6433,4 +6438,20 @@ test "attributes: a repo or private attributes file that is not valid TOML exits
     }
     const fix = try h.run(&.{ "mox", "doctor", "--rebuild-provenance" });
     try std.testing.expect(fix.rc != 2);
+}
+
+test "facts: an unconsumed default from a strict-JSON target's attributes names its attributes entry" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/s.json", "{\"a\": 1}\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"s.json\"]\ndefaults = { lonely = \"x\" }\n");
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "`defaults = { lonely = ... }` in the .mox/attributes.toml entry for") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "# mox: default lonely") == null);
 }

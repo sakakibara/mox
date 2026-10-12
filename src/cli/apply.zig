@@ -453,7 +453,7 @@ fn applyPass(
 
     // A tombstone that matches nothing here is reported before any record
     // changes, so this run's own sweep cannot hide it.
-    if (!scoped) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, tree)) |u|
+    if (!scoped) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree)) |u|
         try printUnmatched(ctx.out, u, home);
 
     // A broken attributes entry no source claims may be a mistyped
@@ -770,7 +770,7 @@ fn applyPass(
             .dry_run = dry_run,
         }, &units, &counts, &snapshotted);
     }
-    if (!scoped and !dry_run) try mox.apply.stale.markTombstones(ctx.alloc, ctx.io, context.paths.state_dir, tree.released);
+    if (!scoped and !dry_run) try mox.apply.stale.markTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree.released);
 
     // Exact-directory sweep: after every managed file is written, remove live
     // entries in `.mox-exact` directories that mox did not produce. The global

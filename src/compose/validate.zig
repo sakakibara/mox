@@ -12,6 +12,7 @@ const toml = @import("toml");
 const yaml = @import("yaml");
 const ini = @import("ini");
 const source = @import("../source/root.zig");
+const dsl = @import("../dsl/root.zig");
 const interp = @import("interp.zig");
 
 const Format = source.format.Format;
@@ -275,6 +276,19 @@ fn yamlDuplicate(arena: std.mem.Allocator, v: yaml.Value, path: []const u8) !?Ya
     return null;
 }
 
+/// The offset of the last comma token before `end`, by the tokenizer, so a
+/// comma inside a string or comment is not one.
+fn lastCommaToken(text: []const u8, dialect: json.Dialect, end: usize) ?usize {
+    var t = json.Tokenizer.init(text, dialect);
+    var last: ?usize = null;
+    while (t.next()) |tok| {
+        const s: usize = @intCast(tok.span.start);
+        if (s >= end) break;
+        if (tok.kind == .comma) last = s;
+    }
+    return last;
+}
+
 /// A key token without its TOML/YAML/INI quotes.
 fn unquoteKey(tok: []const u8) []const u8 {
     const t = std.mem.trimStart(u8, tok, " \t");
@@ -320,7 +334,7 @@ fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, displ
             const trailing = std.mem.indexOf(u8, d.message, "trailing comma") != null;
             // The parser stops at the closing bracket; the comma is the error.
             if (trailing) {
-                if (std.mem.lastIndexOfScalar(u8, text[0..start], ',')) |comma| start = comma;
+                if (lastCommaToken(text, format.jsonDialect(), start)) |comma| start = comma;
             }
             const lc = lineCol(text, start);
             var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message, .err = e };
@@ -351,7 +365,7 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
     var disown: std.ArrayList([]const u8) = .empty;
     var check: ?[]const []const u8 = null;
     var gate: ?[]const u8 = null;
-    var defaults: std.ArrayList([]const u8) = .empty;
+    var defaults: std.ArrayList(source.attributes.Default) = .empty;
     while (t.next()) |tok| {
         if (tok.kind != .comment) {
             seen_value = true;
@@ -373,7 +387,8 @@ fn directiveRefusal(arena: std.mem.Allocator, text: []const u8, display: []const
         } else if (std.mem.eql(u8, verb, "check")) {
             check = source.head.parseQuotedArgv(arena, rest) catch null;
         } else if (std.mem.eql(u8, verb, "default")) {
-            try defaults.append(arena, rest);
+            const d = dsl.parser.parseLineDirective(arena, args, 0) catch continue;
+            if (d.kind == .default) try defaults.append(arena, .{ .name = d.kind.default.name, .value = d.kind.default.value });
         } else if (std.mem.eql(u8, verb, "when") and !seen_value and gate == null) {
             gate = rest;
         }
@@ -428,15 +443,11 @@ fn tomlArray(arena: std.mem.Allocator, items: []const []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "[{s}]", .{try std.mem.join(arena, ", ", parts.items)});
 }
 
-/// The TOML inline table of `default name="value"` arguments.
-fn tomlDefaults(arena: std.mem.Allocator, items: []const []const u8) ![]const u8 {
+/// The TOML inline table of `default` directives, each read by the DSL's
+/// own parser.
+fn tomlDefaults(arena: std.mem.Allocator, items: []const source.attributes.Default) ![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
-    for (items) |item| {
-        const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;
-        const name = std.mem.trim(u8, item[0..eq], " \t");
-        const value = std.mem.trim(u8, std.mem.trim(u8, item[eq + 1 ..], " \t"), "\"");
-        try parts.append(arena, try std.fmt.allocPrint(arena, "{s} = {s}", .{ name, try tomlString(arena, value) }));
-    }
+    for (items) |d| try parts.append(arena, try std.fmt.allocPrint(arena, "{s} = {s}", .{ d.name, try tomlString(arena, d.value) }));
     return std.fmt.allocPrint(arena, "{{ {s} }}", .{try std.mem.join(arena, ", ", parts.items)});
 }
 
@@ -548,6 +559,11 @@ test "strict JSON: each directive kind names its replacement" {
     try expectFailure(.json, "{\n// mox: include \"x.json\"\n}\n", &.{"overlay s.json.d/<axis>.json"});
     try expectFailure(.json, "{\n// mox: secret \"env:X\"\n}\n", &.{"\"<secret:URI>\" capture inside a JSON string"});
     try expectFailure(.json, "// mox: default profile=\"work\"\n{}\n", &.{"\n[\"s.json\"]\ndefaults = { profile = \"work\" }"});
+    try expectFailure(.json, "// mox: default motto=\"a b\"\n{}\n", &.{"defaults = { motto = \"a b\" }"});
+    // A line the DSL cannot read gives no entry, rather than a guessed one.
+    const bad = (try failureText(.json, "// mox: default g=\"x\" junk\n{}\n")).?;
+    defer testing.allocator.free(bad);
+    try testing.expect(std.mem.indexOf(u8, bad, "defaults =") == null);
     try expectFailure(.json, "// mox: keep-empty\n{}\n", &.{"never omitted when empty"});
 }
 

@@ -110,7 +110,7 @@ pub const Unmatched = struct { live_path: []const u8, managed: ?[]const u8 = nul
 /// The tombstones of `tree` that match no record, no generator manifest and
 /// no managed file exactly, less those an apply has already seen. One that
 /// matches a managed file only by case is always listed.
-pub fn unmatchedTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const u8, tree: tree_mod.ManagedTree) ![]Unmatched {
+pub fn unmatchedTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, tree: tree_mod.ManagedTree) ![]Unmatched {
     if (tree.released.len == 0) return &.{};
     var known = std.StringHashMap(void).init(arena);
     for (try recordBytes(arena, io, state_dir, "applied-owned", 64 * 1024 * 1024)) |bytes| {
@@ -136,25 +136,26 @@ pub fn unmatchedTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const 
             }
         }
         if (known.contains(fp)) continue;
-        Io.Dir.cwd().access(io, try markerPath(arena, state_dir, fp), .{}) catch {
+        Io.Dir.cwd().access(io, try markerPath(arena, state_dir, repo, fp), .{}) catch {
             try out.append(arena, .{ .live_path = p });
         };
     }
     return out.toOwnedSlice(arena);
 }
 
-/// Note that an apply has seen every tombstone in `released`, so one that
-/// matches nothing is reported once.
-pub fn markTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const u8, released: []const []const u8) !void {
+/// Note that an apply of `repo` (its repo-and-HOME tag) has seen every
+/// tombstone in `released`, so one that matches nothing is reported once.
+pub fn markTombstones(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo: []const u8, released: []const []const u8) !void {
     for (released) |p| {
-        const path = try markerPath(arena, state_dir, try foldCase(arena, p));
+        const path = try markerPath(arena, state_dir, repo, try foldCase(arena, p));
         if (std.fs.path.dirname(path)) |d| try Io.Dir.cwd().createDirPath(io, d);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "" });
     }
 }
 
-fn markerPath(arena: std.mem.Allocator, state_dir: []const u8, folded: []const u8) ![]const u8 {
-    return std.fs.path.join(arena, &.{ state_dir, "released", &applied.contentHashHex(folded) });
+fn markerPath(arena: std.mem.Allocator, state_dir: []const u8, repo: []const u8, folded: []const u8) ![]const u8 {
+    const name = applied.contentHashHex(try std.fmt.allocPrint(arena, "{s}\x00{s}", .{ repo, folded }));
+    return std.fs.path.join(arena, &.{ state_dir, "released", &name });
 }
 
 /// `paths` as a set matched through `foldCase`.

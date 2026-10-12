@@ -219,6 +219,8 @@ pub const DefaultDiagnostic = union(enum) {
         first_value: []const u8,
         second_source: []const u8,
         second_value: []const u8,
+        first_attrs: bool = false,
+        second_attrs: bool = false,
     },
     /// A `# mox: default` directive names a fact no source in the repo
     /// otherwise compares, captures, or tests for presence -- a default
@@ -229,6 +231,7 @@ pub const DefaultDiagnostic = union(enum) {
     unclaimed: struct {
         name: []const u8,
         source: []const u8,
+        attrs: bool = false,
     },
     /// A `# mox: default` directive names a built-in, open-probe-axis,
     /// reserved-axis, or `data/facts.toml`-derived name -- excluded by
@@ -238,6 +241,7 @@ pub const DefaultDiagnostic = union(enum) {
     reserved: struct {
         name: []const u8,
         source: []const u8,
+        attrs: bool = false,
     },
 };
 
@@ -263,19 +267,32 @@ pub fn writeDiagnostics(
         ),
     };
     for (default_diagnostics) |dd| switch (dd) {
-        .conflict => |c| try out.print(
+        .conflict => |c| if (c.first_attrs or c.second_attrs) try out.print(
+            "{s}conflicting defaults for \"{s}\": {s}=\"{s}\" ({s}) vs {s}=\"{s}\" ({s})\n",
+            .{ prefix, c.name, c.first_source, c.first_value, declaredIn(c.first_attrs), c.second_source, c.second_value, declaredIn(c.second_attrs) },
+        ) else try out.print(
             "{s}conflicting `# mox: default` for \"{s}\": {s}=\"{s}\" vs {s}=\"{s}\"\n",
             .{ prefix, c.name, c.first_source, c.first_value, c.second_source, c.second_value },
         ),
-        .unclaimed => |u| try out.print(
+        .unclaimed => |u| if (u.attrs) try out.print(
+            "{s}`defaults = {{ {s} = ... }}` in the .mox/attributes.toml entry for {s} names a fact nothing else in the repo consumes; ignored\n",
+            .{ prefix, u.name, u.source },
+        ) else try out.print(
             "{s}`# mox: default {s}=...` in {s} names a fact nothing else in the repo consumes; ignored\n",
             .{ prefix, u.name, u.source },
         ),
-        .reserved => |r| try out.print(
+        .reserved => |r| if (r.attrs) try out.print(
+            "{s}`defaults = {{ {s} = ... }}` in the .mox/attributes.toml entry for {s} names a reserved/built-in fact name; ignored\n",
+            .{ prefix, r.name, r.source },
+        ) else try out.print(
             "{s}`# mox: default {s}=...` in {s} names a reserved/built-in fact name; ignored\n",
             .{ prefix, r.name, r.source },
         ),
     };
+}
+
+fn declaredIn(attrs: bool) []const u8 {
+    return if (attrs) "its .mox/attributes.toml defaults" else "a `# mox: default` line";
 }
 
 pub const Discovery = struct {
@@ -381,6 +398,8 @@ const RawDefault = struct {
     name: []const u8,
     value: []const u8,
     source: []const u8,
+    /// Declared by the source's `defaults` attribute, not a head line.
+    attrs: bool = false,
 };
 
 const Discoverer = struct {
@@ -633,16 +652,17 @@ const Discoverer = struct {
             .default => |k| k,
             else => return,
         };
-        try self.recordDefault(def.name, def.value, source_key);
+        try self.recordDefault(def.name, def.value, source_key, false);
     }
 
     /// One declared default, from a `# mox: default` line or a strict-JSON
     /// target's `defaults` attribute.
-    fn recordDefault(self: *Discoverer, name: []const u8, value: []const u8, source_key: []const u8) !void {
+    fn recordDefault(self: *Discoverer, name: []const u8, value: []const u8, source_key: []const u8, attrs: bool) !void {
         if (self.isExcluded(name)) {
             try self.default_diagnostics.append(self.arena, .{ .reserved = .{
                 .name = try self.arena.dupe(u8, name),
                 .source = source_key,
+                .attrs = attrs,
             } });
             return;
         }
@@ -650,6 +670,7 @@ const Discoverer = struct {
             .name = try self.arena.dupe(u8, name),
             .value = try self.arena.dupe(u8, value),
             .source = source_key,
+            .attrs = attrs,
         });
     }
 
@@ -1092,7 +1113,7 @@ const Discoverer = struct {
         // A strict-JSON target's gate and defaults are its attributes': the
         // gate conditions everything the base consumes, exactly as a head
         // gate does.
-        for (file.defaults) |d| try self.recordDefault(d.name, d.value, source_key);
+        for (file.defaults) |d| try self.recordDefault(d.name, d.value, source_key, true);
         var gate_stack: []const *const AxisExpr = &.{};
         if (file.gate) |g| {
             if (dsl.axis.parseString(self.arena, g)) |expr| {
@@ -1352,6 +1373,8 @@ const Discoverer = struct {
                     .first_value = distinct.items[0].value,
                     .second_source = distinct.items[1].source,
                     .second_value = distinct.items[1].value,
+                    .first_attrs = distinct.items[0].attrs,
+                    .second_attrs = distinct.items[1].attrs,
                 } });
                 continue;
             }
@@ -1363,6 +1386,7 @@ const Discoverer = struct {
                 try self.default_diagnostics.append(self.arena, .{ .unclaimed = .{
                     .name = name,
                     .source = occurrences[0].source,
+                    .attrs = occurrences[0].attrs,
                 } });
             }
         }
