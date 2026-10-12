@@ -21,7 +21,8 @@ pub const diff = @import("diff/root.zig");
 pub const provenance = @import("provenance/root.zig");
 pub const packages = @import("packages/root.zig");
 pub const cli = @import("cli/root.zig");
-pub const state_dump = @import("state_dump.zig");
+pub const state = @import("state/root.zig");
+pub const state_dump = state.dump;
 
 /// External: TOML 1.1 parser/encoder. Used by the Cat A composer.
 pub const toml = @import("toml");
@@ -706,6 +707,10 @@ test "coupling module tests are discovered" {
 
 test "packages module tests are discovered" {
     _ = packages;
+}
+
+test "state module tests are discovered" {
+    _ = state;
 }
 
 test "cli paths module is reachable" {

@@ -777,11 +777,8 @@ includes a file whose layers or output do not parse in its format, with
 the layer and line and a hint, and a file whose `.mox/attributes.toml`
 entry breaks the schema. A partially owned file is
 classified on its owned content only, so the program's writes on the
-other side never surface. `ORPHAN` is a file a generator manifest written
-before manifests named their repo lists for a generator that is gone: mox
-never removes it, and `mox commit <file>` forgets it. Exits 1 if any file
-is `OUTDATED`, `DRIFT`, `MISSING`, `STALE`, or `ERROR`; `ORPHAN` counts
-toward nothing.
+other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
+`MISSING`, `STALE`, or `ERROR`.
 
 A repo carrying a `data/packages/` manifest also gets a `packages:`
 section: per backend, each declared package still `MISSING`, each installed
@@ -842,25 +839,23 @@ and `commit` may record it instead). `--json` and
 
 `--json` emits `{"files": [...], "packages": [...]}`. A file is
 `{path, kind, key?, first_contact}`, one per drifted unit (the rows the
-`--drift` report lists): an `ERROR`, `STALE`, `MISSING`, `OUTDATED` or
-`ORPHAN` row is not in the set, and the exit code still signals every one
-but `ORPHAN`; a broken manager is
-`{backend, state: "broken", exit, probe, why?}`, where `exit` is the exit
+`--drift` report lists): an `ERROR`, `STALE`, `MISSING` or `OUTDATED` row is
+not in the set, and the exit code still signals every one; a broken manager
+is `{backend, state: "broken", exit, probe, why?}`, where `exit` is the exit
 code or `null` for a call that never reached one -- killed at its bound,
 ended for want of a terminal, or answered in a shape that is not an answer
 -- and `why` states that reason in words, so a genuine exit of 255 is never
-read as one of them; a manifest that would not load is
-`{state: "refused"}`, alone and leading the package set, since it is the
-whole pass rather than one backend; a package is
-`{backend, state, id, name?, why?, fix?}`, where `state` is `missing`,
-`untracked`, `astray` or `unchecked` and `id` is the identity its backend
-compares by -- a brew cask carries its `cask:` prefix, so it can never be
-read as the formula of the same name. `name` is what the manifest row
-spells, and is present for all but an untracked package; `why` is present
-for an astray or an unchecked one, saying what holds it astray or why it
-could not be judged, and `fix` for an astray one, saying what repairs it. A
-backend that could judge none of its installed packages is
-`{backend, state: "unchecked", why}`.
+read as one of them; a manifest that would not load is `{state: "refused"}`,
+alone and leading the package set, since it is the whole pass rather than
+one backend; a package is `{backend, state, id, name?, why?, fix?}`, where
+`state` is `missing`, `untracked`, `astray` or `unchecked` and `id` is the
+identity its backend compares by -- a brew cask carries its `cask:` prefix,
+so it can never be read as the formula of the same name. `name` is what the
+manifest row spells, and is present for all but an untracked package; `why`
+is present for an astray or an unchecked one, saying what holds it astray or
+why it could not be judged, and `fix` for an astray one, saying what repairs
+it. A backend that could judge none of its installed packages is `{backend,
+state: "unchecked", why}`.
 
 `--porcelain` emits stable tab-separated lines, one record per line, with
 the record kind as the first field. File records are `kind`, `key`,

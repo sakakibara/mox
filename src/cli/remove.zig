@@ -12,6 +12,7 @@ const cli = @import("cli");
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
+const state_cli = @import("state.zig");
 const edit = @import("edit.zig");
 const fileops = @import("fileops.zig");
 const mox = @import("../root.zig");
@@ -35,6 +36,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const lk = (try lock_mod.acquireForCommand(ctx, "remove")) orelse return 1;
     defer lk.release();
+    const st = (try state_cli.open(ctx, .{ .run_kind = .remove, .writes = true, .locked = true })) orelse return 2;
+    // Every exit after the first write commits what the run did.
+    defer state_cli.commit(ctx, st, .{}) catch {};
 
     const live_path = edit.liveTarget(ctx.alloc, context.paths.home, context.cwd, name) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -131,8 +135,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         };
     }
 
-    const id = mox.apply.snapshot.idNow(ctx.io);
-    const trash = try fileops.trashRoot(ctx.alloc, context.paths.state_dir, &id);
+    // The trash and the generation share the run's id.
+    const id = try st.claim();
+    const trash = try fileops.trashRoot(ctx.alloc, context.paths.state_dir, id);
     // A private-only file's walk names it under `src/` like a repo file; it
     // is shown, and trashed, under `private/` instead.
     const src_name = if (private_only)
@@ -168,31 +173,31 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // tracking it, and a stale record would make a later re-add at the same
     // path compare against state from the previous management era instead of
     // going through first contact.
-    try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
-    try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+    try st.forget(live_path);
+    try st.forgetProvenance(live_path);
 
     try ctx.out.print("Removed {s} (trashed to {s})\n", .{ src_name, trash });
 
-    // A GENERATOR owns a produced set, not a single live file. Its manifest is
-    // keyed by the (phantom) live path. Released, its leaves stay where they
-    // are and are forgotten; purged, every produced leaf is removed
-    // (snapshot-first, recoverable) and the manifest dropped.
+    // A GENERATOR owns a produced set, not a single live file, kept by its
+    // (phantom) live path. Released, its leaves stay where they are and are
+    // forgotten; purged, every produced leaf is removed (snapshot-first,
+    // recoverable) and the generator dropped.
     {
-        const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+        const prior = st.produced(live_path);
         if (prior.len > 0 and !purge) {
             // A leaf another producer still writes keeps its records.
             var claimed: std.StringHashMap(void) = .init(ctx.alloc);
             for (merged.files) |f| {
                 if (std.mem.eql(u8, f.live_path, live_path)) continue;
                 try claimed.put(f.live_path, {});
-                for (try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, f.live_path)) |leaf| try claimed.put(leaf, {});
+                for (st.produced(f.live_path)) |leaf| try claimed.put(leaf, {});
             }
             for (prior) |leaf| {
                 if (claimed.contains(leaf)) continue;
-                try mox.apply.applied.forget(ctx.alloc, ctx.io, context.paths.state_dir, leaf);
-                try mox.provenance.map.forget(ctx.alloc, ctx.io, context.paths.state_dir, leaf);
+                try st.forget(leaf);
+                try st.forgetProvenance(leaf);
             }
-            try mox.apply.generated.deleteManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+            try st.forgetGenerator(live_path);
             try ctx.out.print("  {d} generated file(s) left in place, no longer managed\n", .{prior.len});
             return 0;
         }
@@ -201,31 +206,28 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             // OTHER tree target (regular managed files and generator phantoms)
             // AND every OTHER generator's produced leaves. Omitting the latter
             // would let removing this generator delete a leaf another generator
-            // still owns when the two manifests overlap in a stale state.
+            // still owns when the two produced sets overlap in a stale state.
             var keep: std.StringHashMap(void) = .init(ctx.alloc);
             for (merged.files) |f| {
                 if (std.mem.eql(u8, f.live_path, live_path)) continue;
                 try keep.put(f.live_path, {});
-                const other = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, context.paths.state_dir, f.live_path);
-                for (other) |leaf| try keep.put(leaf, {});
+                for (st.produced(f.live_path)) |leaf| try keep.put(leaf, {});
             }
             const links = try mox.apply.stale.managedLinks(ctx.alloc, merged.files);
             const res = try mox.apply.generated.pruneStale(ctx.alloc, ctx.io, .{
-                .state_dir = context.paths.state_dir,
-                .snapshots_dir = context.paths.snapshots_dir,
-                .snap_id = &id,
+                .st = st,
                 .home = context.paths.home,
                 .force = true,
                 .dry_run = false,
                 .links = &links,
             }, prior, &keep, ctx.out, ctx.err);
-            // Drop the manifest only when the whole set was pruned. A refused
+            // Drop the generator only when the whole set was pruned. A refused
             // leaf (undeletable, a directory, an unsnapshottable drift) would
             // otherwise become a permanent un-prunable orphan once the source is
-            // trashed; retain the manifest so it stays tracked and retryable.
+            // trashed; keep the set so it stays tracked and retryable.
             const refused = res.drift_refused + res.error_refused;
             if (refused == 0) {
-                try mox.apply.generated.deleteManifest(ctx.alloc, ctx.io, context.paths.state_dir, live_path);
+                try st.forgetGenerator(live_path);
             }
             try ctx.out.print("  removed {d} generated file(s)\n", .{res.removed});
             return if (refused > 0) 1 else 0;
@@ -263,7 +265,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 break :blk .{ .file = live };
             },
         };
-        switch (mox.apply.live_remove.remove(ctx.alloc, ctx.io, .{ .home = context.paths.home, .snapshots_dir = context.paths.snapshots_dir, .snap_id = &id, .expect = expect, .state_dir = context.paths.state_dir }, live_path, snap)) {
+        switch (mox.apply.live_remove.remove(ctx.alloc, ctx.io, .{ .home = context.paths.home, .st = st, .expect = expect }, live_path, snap)) {
             .removed => {},
             .left => |why| {
                 try ctx.err.print("mox remove: {f}: {s}\n", .{ display.of(live_path, context.paths.home), why });

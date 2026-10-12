@@ -17,6 +17,7 @@ const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
 const parent_link = @import("parent_link.zig");
 const live_remove = @import("live_remove.zig");
+const state = @import("../state/root.zig");
 
 /// Bound on how deep an unmanaged subdirectory is walked when snapshotting its
 /// files before removal. A pathologically deep foreign tree stops here rather
@@ -24,9 +25,7 @@ const live_remove = @import("live_remove.zig");
 const max_depth: usize = 64;
 
 pub const Options = struct {
-    state_dir: []const u8,
-    snapshots_dir: []const u8,
-    snap_id: []const u8,
+    st: *state.Draft,
     home: []const u8,
     force: bool,
     dry_run: bool,
@@ -151,7 +150,7 @@ fn sweepFile(
             return;
         },
     };
-    const rec = try applied.read(arena, io, opts.state_dir, live_path);
+    const rec = opts.st.read(live_path);
     const clean_leftover = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
 
     if (!clean_leftover and !opts.force) {
@@ -168,7 +167,7 @@ fn sweepFile(
 }
 
 fn liveRemove(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8, snap: live_remove.Snap, expect: ?[]const u8) live_remove.Outcome {
-    return live_remove.remove(arena, io, .{ .home = opts.home, .snapshots_dir = opts.snapshots_dir, .snap_id = opts.snap_id, .links = opts.links, .expect = expect, .state_dir = opts.state_dir }, live_path, snap);
+    return live_remove.remove(arena, io, .{ .home = opts.home, .st = opts.st, .links = opts.links, .expect = expect }, live_path, snap);
 }
 
 /// Count and print one exact-dir removal's outcome.
@@ -228,7 +227,7 @@ fn sweepDir(
     // The whole tree -- files, links, and every directory with its mode --
     // is snapshotted before it is removed. If any entry cannot be, refuse the
     // delete: removing it would destroy data with no recoverable copy.
-    snapshot.saveTree(arena, io, opts.snapshots_dir, opts.snap_id, opts.home, live_path) catch |e| switch (e) {
+    snapshot.saveTree(arena, io, opts.st, opts.home, live_path) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             result.error_refused += 1;
@@ -310,9 +309,7 @@ test "enforce: an unreadable file is refused, never deleted with an empty snapsh
     var out_aw: Io.Writer.Allocating = .init(a);
     var err_aw: Io.Writer.Allocating = .init(a);
     const opts: Options = .{
-        .state_dir = try std.fs.path.join(a, &.{ base, "state" }),
-        .snapshots_dir = try std.fs.path.join(a, &.{ base, "snap" }),
-        .snap_id = "test",
+        .st = try state.draft.testDraft(a, io, try std.fs.path.join(a, &.{ base, "state" })),
         .home = base,
         .force = true, // even forced, an unsnapshottable file must not be lost
         .dry_run = false,

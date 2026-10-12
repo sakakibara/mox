@@ -332,44 +332,6 @@ test "apply: tmp file does not linger after success" {
     }
 }
 
-test "applied: record then read roundtrip" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const cwd = try std.process.currentPathAlloc(io, arena.allocator());
-    const state_dir = try std.fs.path.join(arena.allocator(), &.{
-        cwd, ".zig-cache", "tmp", &tmp.sub_path, "state",
-    });
-
-    try mox.apply.applied.record(arena.allocator(), io, state_dir, "/home/me/.zshrc", "export EDITOR=nvim\n", "/repo");
-
-    const got = try mox.apply.applied.read(arena.allocator(), io, state_dir, "/home/me/.zshrc");
-    try std.testing.expect(got != null);
-    const expected = mox.apply.applied.contentHashHex("export EDITOR=nvim\n");
-    try std.testing.expectEqualStrings(&expected, &got.?);
-}
-
-test "applied: read without a record returns null" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const cwd = try std.process.currentPathAlloc(io, arena.allocator());
-    const state_dir = try std.fs.path.join(arena.allocator(), &.{
-        cwd, ".zig-cache", "tmp", &tmp.sub_path, "state",
-    });
-
-    const got = try mox.apply.applied.read(arena.allocator(), io, state_dir, "/home/me/.zshrc");
-    try std.testing.expect(got == null);
-}
-
 fn read(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
     return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
 }
@@ -1128,11 +1090,8 @@ test "apply: refuses while another live process holds the lock" {
 
     // A live process (this test) already holds the lock.
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
-    try Io.Dir.cwd().createDirPath(io, state);
-    const start = mox.cli.lock.processStart(a, io, mox.cli.lock.selfPid());
-    const stamp = if (start.len > 0) start else "-";
-    const lock_line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "mox.lock" }), .data = lock_line });
+    const held = try mox.state.lock.acquire(a, io, state, "apply");
+    defer held.acquired.release();
 
     // apply is the command that installs packages and writes live files, so
     // a second one proceeding is two managers and two writers on one machine.
@@ -1163,11 +1122,8 @@ test "facts interview: persist is guarded by the command lock" {
 
     // A live process (this test) already holds the lock.
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
-    try Io.Dir.cwd().createDirPath(io, state);
-    const start = mox.cli.lock.processStart(a, io, mox.cli.lock.selfPid());
-    const stamp = if (start.len > 0) start else "-";
-    const lock_line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ state, "mox.lock" }), .data = lock_line });
+    const held = try mox.state.lock.acquire(a, io, state, "apply");
+    defer held.acquired.release();
 
     // The interview flow (which would persist the unbound fact) must refuse
     // rather than race the held lock.
@@ -3723,34 +3679,6 @@ test "doctor generator: flags a missing data source and a colliding pair, stays 
     // The healthy generator is never mentioned (and, with no git tree, no
     // untracked advisory names it either).
     try std.testing.expect(std.mem.indexOf(u8, r.out, "gen_ok.inc") == null);
-}
-
-test "apply generator: a torn manifest line neither crashes apply nor over-deletes" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    try writeGenFixture(io, &tmp, &.{ "a", "b" });
-    const c = try cliSetup(a, io, &tmp);
-    // The manifest mox 0.12.4 wrote, torn: the two real leaves, then a blank
-    // line and a torn (leading-space, no-newline, bogus) line. The empties are
-    // skipped and the bogus one is an absent leaf -- no crash, and the real
-    // ones are not deleted.
-    try testutil.legacyState(a, io, "torn-manifest", c.root, c.state);
-    const leaf_a = try c.homePath(".config/id-a.inc");
-    const leaf_b = try c.homePath(".config/id-b.inc");
-    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf_a).?);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_a, .data = "key=a\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf_b, .data = "key=b\n" });
-
-    // Re-apply the same set: nothing to prune, and the bogus prior line is a
-    // no-op, so both real leaves survive and apply exits clean.
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expectEqualStrings("key=a\n", try read(io, a, leaf_a));
-    try std.testing.expectEqualStrings("key=b\n", try read(io, a, leaf_b));
 }
 
 test "apply generator: a loop-level when gate off produces nothing and prunes the prior set" {
@@ -7919,31 +7847,12 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
     const io = std.testing.io;
 
     const allowed = [_]struct { []const u8, []const u8, usize }{
-        .{ "src/apply/applied.zig", "forget", 4 },
-        .{ "src/apply/applied.zig", "forgetOwned", 1 },
-        .{ "src/apply/applied.zig", "forgetSymlink", 1 },
-        .{ "src/apply/applied.zig", "forgetWholeFile", 2 },
-        .{ "src/apply/applied.zig", "record", 3 },
-        .{ "src/apply/applied.zig", "recordContent", 1 },
-        .{ "src/apply/applied.zig", "recordOwned", 2 },
-        .{ "src/apply/applied.zig", "writeSymlinkRecord", 4 },
-        .{ "src/apply/generated.zig", "deleteManifest", 1 },
-        .{ "src/apply/generated.zig", "dropLeaf", 2 },
-        .{ "src/apply/generated.zig", "sweepOrphans", 2 },
-        .{ "src/apply/generated.zig", "writeManifest", 1 },
         .{ "src/apply/live_remove.zig", "remove", 2 },
         .{ "src/apply/run_scripts.zig", "moxBinDir", 4 },
         .{ "src/apply/run_scripts.zig", "runCheck", 1 },
         .{ "src/apply/run_scripts.zig", "sweepCheckDirs", 2 },
-        .{ "src/apply/snapshot.zig", "notePlanted", 1 },
-        .{ "src/apply/snapshot.zig", "prune", 4 },
-        .{ "src/apply/snapshot.zig", "restoreFileEntry", 1 },
-        .{ "src/apply/snapshot.zig", "restoreLinkEntry", 1 },
-        .{ "src/apply/snapshot.zig", "save", 1 },
-        .{ "src/apply/snapshot.zig", "saveSymlink", 1 },
-        .{ "src/apply/snapshot.zig", "saveTree", 1 },
-        .{ "src/apply/snapshot.zig", "take", 1 },
-        .{ "src/apply/stale.zig", "markTombstones", 1 },
+        .{ "src/apply/snapshot.zig", "restoreFile", 1 },
+        .{ "src/apply/snapshot.zig", "restoreLink", 1 },
         .{ "src/apply/write.zig", "writeAtomic", 2 },
         .{ "src/apply/write.zig", "writeAtomicImpl", 4 },
         .{ "src/apply/write.zig", "writeAtomicPartial", 2 },
@@ -7975,8 +7884,6 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/cli/export.zig", "run", 2 },
         .{ "src/cli/fileops.zig", "copyTree", 1 },
         .{ "src/cli/init.zig", "initFresh", 1 },
-        .{ "src/cli/lock.zig", "acquire", 2 },
-        .{ "src/cli/lock.zig", "release", 1 },
         .{ "src/cli/mv.zig", "run", 2 },
         .{ "src/cli/remove.zig", "run", 2 },
         .{ "src/cli/rollback.zig", "repatchPartial", 1 },
@@ -8014,10 +7921,6 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/packages/windows.zig", "installedExplicitImpl", 2 },
         .{ "src/packages/write.zig", "append", 2 },
         .{ "src/packages/write.zig", "seededManifest", 1 },
-        .{ "src/private/expect.zig", "note", 1 },
-        .{ "src/private/expect.zig", "retire", 1 },
-        .{ "src/provenance/map.zig", "forget", 1 },
-        .{ "src/provenance/map.zig", "persist", 1 },
         .{ "src/secret/resolver.zig", "resolveCmdViaScript", 2 },
         .{ "src/source/attributes.zig", "loadText", 1 },
         .{ "src/source/attributes.zig", "write", 2 },
@@ -8026,6 +7929,21 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/source/axes.zig", "recurseDirective", 1 },
         .{ "src/source/axes.zig", "writeFile", 2 },
         .{ "src/source/ignore/load.zig", "stripConditional", 1 },
+        .{ "src/state/blob.zig", "put", 1 },
+        .{ "src/state/durable.zig", "moveAside", 1 },
+        .{ "src/state/durable.zig", "moveWindows", 1 },
+        .{ "src/state/durable.zig", "renameNoReplace", 3 },
+        .{ "src/state/durable.zig", "renameReplace", 2 },
+        .{ "src/state/durable.zig", "writeFile", 5 },
+        .{ "src/state/id.zig", "claimFrom", 1 },
+        .{ "src/state/journal.zig", "begin", 1 },
+        .{ "src/state/lock.zig", "acquire", 2 },
+        .{ "src/state/lock.zig", "release", 1 },
+        .{ "src/state/recovery.zig", "commit", 3 },
+        .{ "src/state/recovery.zig", "recover", 7 },
+        .{ "src/state/recovery.zig", "writeGeneration", 1 },
+        .{ "src/state/retention.zig", "afterCommit", 1 },
+        .{ "src/state/retention.zig", "collect", 1 },
         .{ "src/trigger/state.zig", "save", 2 },
         .{ "src/trigger/state.zig", "settlePending", 2 },
     };

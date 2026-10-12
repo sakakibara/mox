@@ -1,5 +1,7 @@
 const std = @import("std");
 const cli = @import("cli");
+const state_cli = @import("state.zig");
+const State = mox.state.Draft;
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
@@ -132,19 +134,19 @@ fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool)
 
 /// What the orphan sweep would do, judged exactly as apply judges it:
 /// `scan` is what this run learned of the tree's generators.
-pub fn orphanPlan(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan) ![]const mox.apply.generated.OrphanManifest {
+pub fn orphanPlan(ctx: *app.Ctx, st: *State, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan) ![]const mox.apply.generated.OrphanManifest {
     for (tree.files) |f| try scan.kept(f.live_path);
-    const opts = try apply_cmd.orphanOptions(ctx, tree, ruleset, "", false, true);
+    const opts = try apply_cmd.orphanOptions(ctx, st, tree, ruleset, false, true);
     return mox.apply.generated.planOrphans(ctx.alloc, ctx.io, opts, scan);
 }
 
 /// A file a live generator produced last time and no longer does.
 pub const Dropped = struct { generator: []const u8, leaf: []const u8 };
 
-/// Record in `out` every file `gen_live`'s manifest lists that `outputs`
-/// no longer produces.
-pub fn noteDropped(ctx: *app.Ctx, out: *std.ArrayList(Dropped), gen_live: []const u8, outputs: []const mox.compose.catB.GeneratedFile) !void {
-    const prior = try mox.apply.generated.readManifest(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, gen_live);
+/// Record in `out` every file `gen_live`'s produced set lists that
+/// `outputs` no longer produces.
+pub fn noteDropped(ctx: *app.Ctx, st: *const State, out: *std.ArrayList(Dropped), gen_live: []const u8, outputs: []const mox.compose.catB.GeneratedFile) !void {
+    const prior = st.produced(gen_live);
     for (prior) |leaf| {
         const still = for (outputs) |o| {
             if (std.mem.eql(u8, o.live_path, leaf)) break true;
@@ -157,9 +159,9 @@ pub const JudgedDrop = struct { drop: Dropped, verdict: mox.apply.removable.Verd
 
 /// How the generator prune would judge each of `dropped`, once `scan`
 /// knows every path still produced or managed.
-pub fn judgeDropped(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan, dropped: []const Dropped) ![]const JudgedDrop {
+pub fn judgeDropped(ctx: *app.Ctx, st: *State, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan, dropped: []const Dropped) ![]const JudgedDrop {
     for (tree.files) |f| try scan.kept(f.live_path);
-    var opts = try apply_cmd.orphanOptions(ctx, tree, ruleset, "", false, true);
+    var opts = try apply_cmd.orphanOptions(ctx, st, tree, ruleset, false, true);
     var kept: std.ArrayList([]const u8) = .empty;
     var kit = scan.keep.keyIterator();
     while (kit.next()) |k| try kept.append(ctx.alloc, k.*);
@@ -200,22 +202,9 @@ fn droppedRows(ctx: *app.Ctx, judged: []const JudgedDrop, rows: *std.Io.Writer, 
     }
 }
 
-/// One row per file of an untagged manifest whose generator is gone: mox
-/// never removes it, and it needs no attention, so it counts toward nothing.
-fn untaggedRows(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, rows: *std.Io.Writer, scan: *const mox.apply.generated.OrphanScan) !void {
-    const context = ctx.context.?;
-    var tree_live: std.StringHashMap(void) = .init(ctx.alloc);
-    for (tree.files) |f| try tree_live.put(f.live_path, {});
-    var kit = scan.keep.keyIterator();
-    while (kit.next()) |k| try tree_live.put(k.*, {});
-    for (try mox.apply.generated.untaggedOrphanLeaves(ctx.alloc, ctx.io, context.paths.state_dir, &tree_live)) |leaf| {
-        const shown = try display.alloc(ctx.alloc, leaf, context.paths.home);
-        try rows.print("  {s:<8} {s} (generated before this version; its generator is gone: `mox commit {s}` forgets it, or delete it by hand)\n", .{ "ORPHAN", shown, shown });
-    }
-}
-
 fn orphanRows(
     ctx: *app.Ctx,
+    st: *State,
     tree: mox.source.tree.ManagedTree,
     ruleset: *const mox.source.ignore.match.RuleSet,
     scan: *mox.apply.generated.OrphanScan,
@@ -224,7 +213,7 @@ fn orphanRows(
     units: *std.ArrayList(mox.apply.drift.Unit),
 ) !void {
     const home = ctx.context.?.paths.home;
-    for (try orphanPlan(ctx, tree, ruleset, scan)) |m| {
+    for (try orphanPlan(ctx, st, tree, ruleset, scan)) |m| {
         if (m.released) continue;
         for (m.leaves) |leaf| {
             const shown = try display.alloc(ctx.alloc, leaf.path, home);
@@ -256,11 +245,11 @@ fn orphanRows(
 /// remove it or leave it no longer managed, DRIFT where it was edited.
 /// The row of a file where mox planted a link, or rollback put one back,
 /// when a file now belongs there: true once printed.
-fn plantedRow(ctx: *app.Ctx, rows: *std.Io.Writer, tally: *Tally, units: *std.ArrayList(mox.apply.drift.Unit), live_path: []const u8, shown: []const u8, annot: []const u8) !bool {
+fn plantedRow(ctx: *app.Ctx, st: *const State, rows: *std.Io.Writer, tally: *Tally, units: *std.ArrayList(mox.apply.drift.Unit), live_path: []const u8, shown: []const u8, annot: []const u8) !bool {
     const context = ctx.context.?;
     // A planted link rollback put back is drift: only --overwrite replaces
     // it with the file.
-    if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, live_path) != null) {
+    if (try st.rolledBackLink(live_path) != null) {
         tally.add(.drift);
         try units.append(ctx.alloc, .{ .path = live_path, .kind = .whole_file, .first_contact = true });
         try rows.print("  {s:<8} {s}{s}\n", .{ Label.drift.text(), shown, annot });
@@ -268,7 +257,7 @@ fn plantedRow(ctx: *app.Ctx, rows: *std.Io.Writer, tally: *Tally, units: *std.Ar
     }
     // A symlink mox planted where a file now belongs: apply replaces it
     // without --overwrite, so it is an ordinary write.
-    if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.home, live_path)) |v| switch (v) {
+    if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, st, context.paths.home, live_path)) |v| switch (v) {
         .remove => {
             tally.add(.outdated);
             try rows.print("  {s:<8} {s}{s} (replace the symlink mox planted with a file)\n", .{ Label.outdated.text(), shown, annot });
@@ -286,6 +275,7 @@ fn plantedRow(ctx: *app.Ctx, rows: *std.Io.Writer, tally: *Tally, units: *std.Ar
 
 fn staleRows(
     ctx: *app.Ctx,
+    st: *const State,
     tree: mox.source.tree.ManagedTree,
     ruleset: *const mox.source.ignore.match.RuleSet,
     scan: *const mox.apply.generated.OrphanScan,
@@ -296,8 +286,7 @@ fn staleRows(
     const context = ctx.context.?;
     const stale = mox.apply.stale;
     const home = context.paths.home;
-    const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
-    const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
+    const cands = try stale.candidatesOf(ctx.alloc, st, home, tree);
     if (cands.len == 0) return;
     var live_paths: std.ArrayList([]const u8) = .empty;
     for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
@@ -353,6 +342,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox status")) return 2;
     if (try apply_cmd.privateRefusal(ctx, "mox status")) return 2;
     const context = ctx.context.?;
+    const st = (try state_cli.open(ctx, .{ .writes = false, .locked = false })) orelse return 2;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
     var live_ctx: mox.dsl.resolver.Resolver.Live = m_state.liveResolver(&bindings_map);
@@ -425,7 +415,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
     var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
     var dropped: std.ArrayList(Dropped) = .empty;
-    if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home), tree)) |u|
+    if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, st, tree)) |u|
         try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
         tally.add(.err);
@@ -438,7 +428,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
         if (file.head_error.len > 0) {
-            try scan.walked(ctx.alloc, file.live_path);
+            try scan.walked(file.live_path);
             tally.add(.err);
             try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), shown, file.head_error });
             continue;
@@ -447,7 +437,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // directory) is never applied, so status has nothing to report for it.
         var gdiag: mox.compose.interp.Diag = .{};
         const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag);
-        try apply_cmd.scanGenerator(ctx, &scan, &ruleset, file.live_path, gen_out);
+        try apply_cmd.scanGenerator(ctx, st, &scan, &ruleset, file.live_path, gen_out);
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
         if (ruleset.isPathIgnored(rel, false)) continue;
         // A GENERATOR: report each file in its current produced set with its
@@ -473,7 +463,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), leaf_shown, why });
                         continue;
                     }
-                    if (try plantedRow(ctx, rows, &tally, &units, o.live_path, leaf_shown, "")) continue;
+                    if (try plantedRow(ctx, st, rows, &tally, &units, o.live_path, leaf_shown, "")) continue;
                     // Kind guard BEFORE the open: a FIFO here would block the
                     // read and brick the whole report.
                     if (mox.apply.write.guardLiveRead(ctx.io, o.live_path) == .special) {
@@ -490,7 +480,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                             continue;
                         },
                     };
-                    const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, o.live_path);
+                    const recorded = st.read(o.live_path);
                     const disp = mox.apply.applied.classify(recorded, live, o.content);
                     if (disp == .drift) gen_drifted = true;
                     const cell = cellFor(disp);
@@ -498,7 +488,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                     try rows.print("  {s:<8} {s}\n", .{ cell.text(), leaf_shown });
                 }
                 if (gen_drifted) try units.append(ctx.alloc, mox.apply.drift.generatedSet(file.live_path));
-                try noteDropped(ctx, &dropped, file.live_path, outputs);
+                try noteDropped(ctx, st, &dropped, file.live_path, outputs);
                 continue;
             }
         }
@@ -531,7 +521,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             }
             const target = std.mem.trim(u8, composed.?, " \t\r\n");
             const site = mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, file.live_path);
-            const recorded_target = try mox.apply.applied.readSymlink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+            const recorded_target = st.readSymlink(file.live_path);
             const disp = mox.apply.drift.symlinkDisposition(site, recorded_target, target);
             const cell = cellFor(disp);
             tally.add(cell);
@@ -564,7 +554,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             // it: apply keeps it and reports). A path with no whole-file record
             // (a symlink, an owned file, or one mox never wrote) or an absent
             // live file is simply not here -- GATED, no problem.
-            const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+            const recorded = st.read(file.live_path);
             const live_omit: ?[]const u8 = if (recorded == null or mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special)
                 null
             else
@@ -586,13 +576,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             continue;
         }
 
-        if (try plantedRow(ctx, rows, &tally, &units, file.live_path, shown, annot)) continue;
+        if (try plantedRow(ctx, st, rows, &tally, &units, file.live_path, shown, annot)) continue;
 
         // A partial file is classified on its owned subtree only;
         // program activity outside the declared paths can never surface.
         if (file.own_paths.len > 0) {
             var why: ?[]const u8 = null;
-            const cell = try partialCell(ctx, context.paths.state_dir, file, composed.?, &units, &why);
+            const cell = try partialCell(ctx, st, file, composed.?, &units, &why);
             tally.add(cell);
             if (why) |w| {
                 try rows.print("  {s:<8} {s}{s} ({s})\n", .{ cell.text(), shown, annot, w });
@@ -618,7 +608,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                 continue;
             },
         };
-        const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+        const recorded = st.read(file.live_path);
         const disp = mox.apply.applied.classify(recorded, live, composed.?);
         const cell = cellFor(disp);
         tally.add(cell);
@@ -628,10 +618,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Files whose source left the tree, as apply's sweeps would judge them.
     if (a.paths.len == 0) {
-        try staleRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
-        try droppedRows(ctx, try judgeDropped(ctx, tree, &ruleset, &scan, dropped.items), rows, &tally, &units);
-        try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
-        try untaggedRows(ctx, tree, rows, &scan);
+        try staleRows(ctx, st, tree, &ruleset, &scan, rows, &tally, &units);
+        try droppedRows(ctx, try judgeDropped(ctx, st, tree, &ruleset, &scan, dropped.items), rows, &tally, &units);
+        try orphanRows(ctx, st, tree, &ruleset, &scan, rows, &tally, &units);
         try apply_cmd.warnUnmatchedEntries(ctx, rows, tree, &scan.keep);
     }
 
@@ -1243,7 +1232,7 @@ fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![
 /// document (OUTDATED), clean when all equal. A composed document violating
 /// its declaration, or an unparseable composed/live file, is ERROR --
 /// the same shapes apply refuses.
-fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), why: *?[]const u8) !Label {
+fn partialCell(ctx: *app.Ctx, st: *const State, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), why: *?[]const u8) !Label {
     const partial_mod = mox.apply.partial;
     const owned_mod = mox.apply.owned;
     const err_cell: Label = .err;
@@ -1283,7 +1272,7 @@ fn partialCell(ctx: *app.Ctx, state_dir: []const u8, file: mox.source.tree.Manag
         },
     };
 
-    const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, file.live_path);
+    const record = try st.readOwned(file.live_path);
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
     const class = try owned_mod.classifyMode(ctx.alloc, mode, &owned, &live_doc, file.own_paths, record, record_paths);
     if (mox.apply.drift.ownedFile(file.live_path, class, record)) |u| try units.append(ctx.alloc, u);
@@ -1298,7 +1287,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR, ORPHAN. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR; an ORPHAN, a file of a generator gone before manifests named their repo, counts toward nothing. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift): the drift set alone, so an ERROR or STALE row, which the exit code still signals, and an ORPHAN row are not in them. A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift): the drift set alone, so an ERROR or STALE row, which the exit code still signals, is not in them. A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
     .group = .general,
     .needs_context = true,
 }, run);

@@ -185,18 +185,40 @@ All notable changes to mox are documented here. The format follows
 - A record written before records named their repo is never swept: a file
   deleted, drifted or gated off before the upgrade stays as it was, and the
   first apply after upgrading tags every file it still produces.
-- On a downgrade, 0.12.4 sees the snapshots rollback takes of what it
-  replaces as ordinary ones: a bare `mox rollback` may pick one, and its
-  prune leaves their `.undo` notes behind.
-- Downgrading after the upgrade keeps symlinks working: an older binary
-  reads a new symlink record as clean and rewrites it in its own one-line
-  form, which names no repo, so that symlink is never swept until the
-  upgraded binary's next apply tags it again.
 - A generator manifest written before this release names no repo and is
   never swept. The first apply that still produces the generator rewrites
   its manifest tagged. A generator that left the tree before the upgrade
   keeps its files: apply never removes them, `mox status` lists each as
   `ORPHAN`, and `mox commit <file>` forgets one.
+- This release keeps its state in `<state dir>/v2/` and reads nothing of
+  0.12.4's stores (`applied/`, `applied-content/`, `applied-owned/`,
+  `applied-symlink/`, `provenance/`, `generated/`, `snapshots/`, `tmp/`).
+  The first apply after upgrading meets every file for the first time: a
+  live file that already holds what it composes is adopted, and any other
+  is drift, resolved with `mox apply --overwrite <path>` or `mox commit
+  <path>`. Snapshots taken by 0.12.4 cannot be rolled back to, and a file
+  whose source left the tree before the upgrade is not swept; delete it by
+  hand.
+- Delete 0.12.4's stores, while no mox runs on this machine: this release
+  never reads them, and their snapshots can hold a secret in clear. On macOS
+  and Linux, with `S` the state directory (`$MOX_STATE_DIR`, default
+  `$XDG_STATE_HOME/mox`, `~/.local/state/mox` when that is unset):
+
+  ```sh
+  cd "$S" && rm -rf applied applied-content applied-owned applied-symlink provenance generated snapshots tmp mox.lock
+  ```
+
+  On Windows, in PowerShell, with `$S` the state directory
+  (`$env:MOX_STATE_DIR`, default `$env:XDG_STATE_HOME\mox`,
+  `$env:LOCALAPPDATA\mox` when that is unset):
+
+  ```powershell
+  'applied','applied-content','applied-owned','applied-symlink','provenance','generated','snapshots','tmp','mox.lock' | ForEach-Object { Remove-Item -LiteralPath (Join-Path $S $_) -Recurse -Force -ErrorAction SilentlyContinue }
+  ```
+
+- Do not run 0.12.4 beside this release on one state directory: the two
+  share no lock. 0.12.4's `mox uninstall` deletes `v2/`, and with it this
+  release's history.
 
 ### Fixed
 - A secret in a generator's `into` path -- a `<secret:...>` capture, or a row

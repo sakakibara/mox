@@ -14,6 +14,7 @@ const parent_link = @import("parent_link.zig");
 const write = @import("write.zig");
 const source_path = @import("../source/path.zig");
 const ignore_match = @import("../source/ignore/match.zig");
+const state = @import("../state/root.zig");
 
 const max_content_bytes: usize = 64 * 1024 * 1024;
 
@@ -118,8 +119,8 @@ pub fn judge(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, wr
 
 /// How `judge` rules on the symlink mox planted at `live_path`, now that a
 /// file belongs there; null when no record names a link mox planted.
-pub fn plantedLink(arena: std.mem.Allocator, io: Io, state_dir: []const u8, home: []const u8, live_path: []const u8) !?Verdict {
-    const target = (try applied.plantedLink(arena, io, state_dir, live_path)) orelse return null;
+pub fn plantedLink(arena: std.mem.Allocator, io: Io, st: *const state.Draft, home: []const u8, live_path: []const u8) !?Verdict {
+    const target = (try st.plantedLink(live_path)) orelse return null;
     return try judge(arena, io, .{ .home = home }, live_path, .{ .symlink = target });
 }
 

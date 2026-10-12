@@ -12,17 +12,17 @@ const parent_link = @import("parent_link.zig");
 const snapshot = @import("snapshot.zig");
 const write = @import("write.zig");
 const applied = @import("applied.zig");
+const state = @import("../state/root.zig");
 
 pub const Ctx = struct {
     home: []const u8,
-    snapshots_dir: []const u8,
-    snap_id: []const u8,
+    /// The run's draft: it keeps what is removed, and a link mox planted is
+    /// noted as one.
+    st: *state.Draft,
     /// Live paths the tree plants as symlinks: nothing below one is removed.
     links: ?*const std.StringHashMap(void) = null,
     /// Report what would happen, and touch nothing.
     dry_run: bool = false,
-    /// Where the records live: a snapshot of a link mox planted notes it.
-    state_dir: ?[]const u8 = null,
     /// The bytes the caller read and judged: once the snapshot is taken the
     /// file must still hold exactly these, or it is left as `changed`.
     expect: ?[]const u8 = null,
@@ -61,13 +61,13 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
     if (parent_link.through(io, c.home, live_path, c.links)) return .{ .left = parent_link.reason };
     if (c.dry_run) return .removed;
     const saved: anyerror!void = switch (snap) {
-        .file => |bytes| snapshot.save(arena, io, c.snapshots_dir, c.snap_id, c.home, live_path, bytes),
-        .link => |target| snapshot.saveSymlink(arena, io, c.snapshots_dir, c.snap_id, c.home, live_path, target),
-        .tree => snapshot.saveTree(arena, io, c.snapshots_dir, c.snap_id, c.home, live_path),
+        .file => |bytes| c.st.save(c.home, live_path, bytes),
+        .link => |target| c.st.saveSymlink(c.home, live_path, target),
+        .tree => snapshot.saveTree(arena, io, c.st, c.home, live_path),
         .taken_tree, .taken_file, .special => {},
     };
     saved catch |e| return .{ .failed = reasonOf(arena, "snapshot failed, not removing", e) };
-    if (snap == .link) if (c.state_dir) |sd| notePlanted(arena, io, c, sd, live_path, snap.link) catch |e|
+    if (snap == .link) notePlanted(c, live_path, snap.link) catch |e|
         return .{ .failed = reasonOf(arena, "snapshot failed, not removing", e) };
     // The snapshot took time: the directories above may have moved since.
     if (parent_link.through(io, c.home, live_path, c.links)) return .{ .left = parent_link.reason };
@@ -94,9 +94,9 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
     return .removed;
 }
 
-fn notePlanted(arena: std.mem.Allocator, io: Io, c: Ctx, state_dir: []const u8, live_path: []const u8, target: []const u8) !void {
-    const rec = (try applied.readSymlinkRecord(arena, io, state_dir, live_path)) orelse return;
-    if (applied.sameSymlinkTarget(rec.target, target)) try snapshot.notePlanted(arena, io, c.snapshots_dir, c.snap_id, live_path, target, rec.repo orelse "");
+fn notePlanted(c: Ctx, live_path: []const u8, target: []const u8) !void {
+    const rec = c.st.readSymlinkRecord(live_path) orelse return;
+    if (applied.sameSymlinkTarget(rec.target, target)) try c.st.notePlanted(c.home, live_path, target, rec.part);
 }
 
 fn holds(arena: std.mem.Allocator, io: Io, live_path: []const u8, want: []const u8) bool {
@@ -123,13 +123,13 @@ test "remove: a path behind a symlinked directory is left in place, and a failur
 
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     const home = try std.fs.path.join(a, &.{ root, "h" });
-    const snaps = try std.fs.path.join(a, &.{ root, "snaps" });
     try tmp.dir.createDirPath(io, "h/real");
     try tmp.dir.createDirPath(io, "elsewhere");
     try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/f", .data = "x\n" });
     try tmp.dir.symLink(io, "../elsewhere", "h/link", .{});
     try tmp.dir.writeFile(io, .{ .sub_path = "h/real/f", .data = "y\n" });
-    const c: Ctx = .{ .home = home, .snapshots_dir = snaps, .snap_id = "s1" };
+    const st = try state.draft.testDraft(a, io, try std.fs.path.join(a, &.{ root, "state" }));
+    const c: Ctx = .{ .home = home, .st = st };
 
     const through = remove(a, io, c, try std.fs.path.join(a, &.{ home, "link", "f" }), .{ .file = "x\n" });
     try testing.expect(through == .left);

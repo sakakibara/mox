@@ -5,17 +5,18 @@ const lock_mod = @import("lock.zig");
 const apply_cmd = @import("apply.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
-const Env = @import("env").Env;
+const state_cli = @import("state.zig");
+const State = mox.state.Draft;
 
 const Io = std.Io;
 
-/// `mox rollback [<id>]`: restore all live files captured in a snapshot,
+/// `mox rollback [<id>]`: restore every live file a generation displaced,
 /// defaulting to the newest one.
 ///
-/// Last-applied records are deliberately left stale, so the next `mox apply`
-/// sees the restored files as drift and refuses to overwrite them without
-/// --overwrite. Rollback undoes live-file changes; it never touches the source
-/// tree.
+/// Last-applied records of restored files are deliberately left stale, so
+/// the next `mox apply` sees them as drift and refuses to overwrite them
+/// without --overwrite. Rollback undoes live-file changes; it never touches
+/// the source tree. What it replaces is kept in a generation of its own.
 ///
 /// A PARTIALLY owned target is never whole-file restored: that would clobber
 /// the program's remainder as it stood at snapshot time. Its snapshot is
@@ -32,23 +33,20 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const lk = (try lock_mod.acquireForCommand(ctx, "rollback")) orelse return 1;
     defer lk.release();
+    const st = (try state_cli.open(ctx, .{ .run_kind = .rollback, .writes = true, .locked = true })) orelse return 2;
+    // Every exit after the first write commits what the run did.
+    defer state_cli.commit(ctx, st, .{}) catch {};
 
     // Undoing the apply just run is the case that matters, and making the user
     // read an id back out of `mox snapshot` to reach it is pure friction. The
     // chosen id is announced, so an unattended run still records what it took.
     const id = a.id orelse blk: {
-        // A snapshot a rollback took of what it replaced is rolled back only
-        // when named.
+        // What a rollback kept of what it replaced is rolled back only when
+        // named.
         var ids: std.ArrayList([]const u8) = .empty;
-        for (try mox.apply.snapshot.list(ctx.alloc, ctx.io, context.paths.snapshots_dir)) |id| {
-            switch (try mox.apply.snapshot.undoNote(ctx.alloc, ctx.io, context.paths.snapshots_dir, id)) {
-                .of => {},
-                .none => try ids.append(ctx.alloc, id),
-                .corrupt => {
-                    try ctx.err.print("mox rollback: warning: the undo note of snapshot {s} cannot be read; it counts as an ordinary snapshot\n", .{id});
-                    try ids.append(ctx.alloc, id);
-                },
-            }
+        for (try st.listed()) |l| {
+            if (l.gen.kind == .rollback or l.gen.run_kind == .rollback) continue;
+            try ids.append(ctx.alloc, l.id);
         }
         if (ids.items.len == 0) {
             try ctx.err.writeAll("mox rollback: no snapshots to roll back to\n");
@@ -117,47 +115,42 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     }
 
+    const src = (try st.displacedOf(id)) orelse {
+        try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
+        return 1;
+    };
+    st.undoes = id;
+
     // Partial targets are detected by OWNED RECORD existence, not by the
-    // walked tree: the records were written by the same runs that took the
-    // snapshots, and unlike the tree they stay readable when the repo is
+    // walked tree: the records were written by the same runs that displaced
+    // the content, and unlike the tree they stay readable when the repo is
     // broken -- a whole-file restore over a partial target must never
     // happen just because the walk failed.
     var skip: std.StringHashMap(void) = .init(ctx.alloc);
-    for (try snapshotLivePaths(ctx, id)) |lp| {
-        if ((try mox.apply.applied.readOwned(ctx.alloc, ctx.io, context.paths.state_dir, lp)) != null) {
-            try skip.put(lp, {});
-        }
+    for (src.displaced.keys(), src.displaced.values()) |key, d| {
+        if (d.type != .file) continue;
+        const lp = try mox.source.path.joinKeyOnto(ctx.alloc, context.paths.home, key);
+        if ((try st.readOwned(lp)) != null) try skip.put(lp, {});
     }
 
     var withheld: std.ArrayList(mox.apply.snapshot.Withheld) = .empty;
-    var undo: mox.apply.snapshot.Undo = .{ .snapshots_dir = context.paths.snapshots_dir, .of = id };
-    const restored = mox.apply.snapshot.restoreExcept(ctx.alloc, ctx.io, context.paths.snapshots_dir, id, context.paths.home, &skip, &withheld, .{
-        .state_dir = context.paths.state_dir,
-        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
-        .undo = &undo,
-    }) catch |e| {
+    const restored = mox.apply.snapshot.restoreExcept(ctx.alloc, ctx.io, st, src, context.paths.home, &skip, &withheld) catch |e| {
         // Whatever was kept before the failure stays recoverable: say where.
-        if (undo.id) |u| try ctx.out.print("  what it replaced is kept in snapshot {s} ('mox rollback {s}' puts it back)\n", .{ u, u });
-        switch (e) {
-            error.SnapshotNotFound => {
-                try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
-                return 1;
-            },
-            else => return e,
-        }
+        if (st.hasDisplaced()) try ctx.out.print("  what it replaced is kept in snapshot {s} ('mox rollback {s}' puts it back)\n", .{ st.run_id.?, st.run_id.? });
+        return e;
     };
-    for (restored.warnings) |w| try ctx.err.print("mox rollback: warning: {s}\n", .{w});
 
     var repatched: usize = 0;
     var failed: usize = 0;
     for (restored.refused) |r| {
         const shown = display.of(r.live_path, context.paths.home);
         switch (r.why) {
-            .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
-            .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
+            .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ shown, r.copy }),
+            .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; the snapshot copy is at {s})\n", .{ shown, r.copy }),
             .redacted => try ctx.err.print("  ERROR   {f} (not restored: it holds a secret mox does not store; run mox apply to resolve it again)\n", .{shown}),
-            .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; the snapshot copy is at {s})\n", .{ shown, r.reason, r.snapshot_path }),
-            .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
+            .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; the snapshot copy is at {s})\n", .{ shown, r.reason, r.copy }),
+            .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; the snapshot copy is at {s})\n", .{ shown, r.copy }),
+            .missing => try ctx.err.print("  ERROR   {f} (not restored: the snapshot copy at {s} is missing or damaged)\n", .{ shown, r.copy }),
         }
         failed += 1;
     }
@@ -168,7 +161,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // A partial target is re-patched from what composes now, which without
     // an expected private layer would drop its private part: while the
     // layer is unavailable only whole files are restored.
-    const private_down = try mox.private.expect.unavailable(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.private_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+    const private_down = st.expectsPrivate() and !try mox.private.layer.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir);
     if (private_down) try ctx.err.print("mox rollback: warning: private layer {f} is unavailable but held sources before; whole files are restored, partially owned files are not re-patched\n", .{display.of(context.paths.private_dir, context.paths.home)});
     for (withheld.items) |w| {
         if (private_down) {
@@ -187,33 +180,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             mox_bin_dir = try mox.apply.run_scripts.moxBinDir(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, &mox_bin_why);
             if (mox_bin_why) |why| try ctx.err.print("mox rollback: warning: the running mox is not on the check hooks' PATH: {s}\n", .{why});
         }
-        if (try repatchPartial(ctx, file, w.content, check_timeout_ms, &failed, mox_bin_dir, &undo)) repatched += 1;
+        if (try repatchPartial(ctx, st, file, w.content, check_timeout_ms, &failed, mox_bin_dir)) repatched += 1;
     }
 
     try ctx.out.print("Restored {d} file(s) from snapshot {s}\n", .{ restored.count + repatched, id });
-    if (undo.id) |u| try ctx.out.print("  what it replaced is kept in snapshot {s} ('mox rollback {s}' puts it back)\n", .{ u, u });
+    if (st.hasDisplaced()) try ctx.out.print("  what it replaced is kept in snapshot {s} ('mox rollback {s}' puts it back)\n", .{ st.run_id.?, st.run_id.? });
     return if (failed > 0) 1 else 0;
-}
-
-/// Live paths of every regular file captured in snapshot `id` (symlink
-/// snapshots are never partial targets). A missing snapshot yields none;
-/// `restoreExcept` reports it.
-fn snapshotLivePaths(ctx: *app.Ctx, id: []const u8) ![]const []const u8 {
-    const context = ctx.context.?;
-    var out: std.ArrayList([]const u8) = .empty;
-    const snap_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.snapshots_dir, id });
-    var dir = Io.Dir.cwd().openDir(ctx.io, snap_dir, .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound => return out.toOwnedSlice(ctx.alloc),
-        else => return e,
-    };
-    defer dir.close(ctx.io);
-    var walker = try dir.walk(ctx.alloc);
-    defer walker.deinit();
-    while (try walker.next(ctx.io)) |entry| {
-        if (entry.kind != .file) continue;
-        try out.append(ctx.alloc, try mox.source.path.joinKeyOnto(ctx.alloc, context.paths.home, entry.path));
-    }
-    return out.toOwnedSlice(ctx.alloc);
 }
 
 /// Re-patch one partial target's owned subtree from its snapshot onto the
@@ -223,12 +195,12 @@ fn snapshotLivePaths(ctx: *app.Ctx, id: []const u8) ![]const []const u8 {
 /// the live file untouched.
 fn repatchPartial(
     ctx: *app.Ctx,
+    st: *State,
     file: mox.source.tree.ManagedFile,
     snap_content: []const u8,
     check_timeout_ms: i64,
     failed: *usize,
     mox_bin_dir: ?[]const u8,
-    undo: *mox.apply.snapshot.Undo,
 ) !bool {
     const partial = mox.apply.partial;
     const live_path = file.live_path;
@@ -344,16 +316,16 @@ fn repatchPartial(
     // materialized); any other stat failure is a real anomaly and must not
     // silently degrade the mode a rollback writes back.
     const mode = blk: {
-        const st = Io.Dir.cwd().statFile(ctx.io, live_target, .{}) catch |e| switch (e) {
+        const stat = Io.Dir.cwd().statFile(ctx.io, live_target, .{}) catch |e| switch (e) {
             error.FileNotFound => break :blk @as(u32, 0o644),
             else => return e,
         };
-        break :blk mox.apply.write.modeOf(st.permissions);
+        break :blk mox.apply.write.modeOf(stat.permissions);
     };
     // What the re-patch replaces is kept, as a whole-file restore keeps it,
     // its secret-bearing owned values masked as apply's snapshot masks them.
     if (live) |held| if (!std.mem.eql(u8, held, candidate)) keep: {
-        const rec = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path);
+        const rec = try st.readOwned(live_path);
         const secret_paths: []const mox.source.tree.OwnPath = if (rec) |r| try mox.apply.owned.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
         const kept = partial.maskSecretPaths(ctx.alloc, format, held, secret_paths) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -363,7 +335,7 @@ fn repatchPartial(
                 return false;
             },
         };
-        mox.apply.snapshot.keepBytes(ctx.alloc, ctx.io, undo, ctx.context.?.paths.home, live_target, kept) catch |e| switch (e) {
+        mox.apply.snapshot.keepBytes(st, ctx.context.?.paths.home, live_target, kept) catch |e| switch (e) {
             // A partial target linked outside HOME has no place in a snapshot.
             error.LiveFileOutsideHome => break :keep,
             else => {
@@ -396,102 +368,3 @@ pub const command = app.command(Spec, .{
     .group = .general,
     .needs_context = true,
 }, run);
-
-fn testCtx(a: std.mem.Allocator, io: Io, home: []const u8, snapshots_dir: []const u8, out: *Io.Writer, err: *Io.Writer) !app.Ctx {
-    const map_ptr = try a.create(std.process.Environ.Map);
-    map_ptr.* = std.process.Environ.Map.init(a);
-    return .{
-        .alloc = a,
-        .io = io,
-        .context = .{
-            .env = Env{ .map = map_ptr },
-            .paths = .{
-                .home = home,
-                .home_named = true,
-                .repo_dir = "",
-                .state_dir = "",
-                .private_dir = "",
-                .triggers_path = "",
-                .snapshots_dir = snapshots_dir,
-                .facts_path = "",
-            },
-            // rollback takes a snapshot id, never a path argument.
-            .cwd = null,
-        },
-        .out = out,
-        .err = err,
-    };
-}
-
-var read_calls_after_setup: usize = 0;
-var real_dir_read: *const fn (?*anyopaque, *Io.Dir.Reader, []Io.Dir.Entry) Io.Dir.Reader.Error!usize = undefined;
-
-fn failingDirReadAfterOne(userdata: ?*anyopaque, r: *Io.Dir.Reader, buffer: []Io.Dir.Entry) Io.Dir.Reader.Error!usize {
-    read_calls_after_setup += 1;
-    if (read_calls_after_setup > 1) return error.Unexpected;
-    return real_dir_read(userdata, r, buffer);
-}
-
-test "snapshotLivePaths: a mid-walk read failure propagates instead of silently truncating the set" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    const home = try std.fs.path.join(a, &.{ base, "home" });
-    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
-
-    // Two entries: the walk order is unspecified, so a failure after the
-    // first one must be reported rather than mistaken for having reached
-    // the end of a one-entry snapshot.
-    const live_a = try std.fs.path.join(a, &.{ home, "a" });
-    const live_b = try std.fs.path.join(a, &.{ home, "b" });
-    try mox.apply.write.writeAtomic(io, live_a, "a content\n", 0o644);
-    try mox.apply.write.writeAtomic(io, live_b, "b content\n", 0o644);
-    try mox.apply.snapshot.save(a, io, snaps, "id1", home, live_a, "a content\n");
-    try mox.apply.snapshot.save(a, io, snaps, "id1", home, live_b, "b content\n");
-
-    read_calls_after_setup = 0;
-    real_dir_read = io.vtable.dirRead;
-    var vtable = io.vtable.*;
-    vtable.dirRead = failingDirReadAfterOne;
-    const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
-
-    var out_aw: Io.Writer.Allocating = .init(a);
-    var err_aw: Io.Writer.Allocating = .init(a);
-    var ctx = try testCtx(a, faulty, home, snaps, &out_aw.writer, &err_aw.writer);
-
-    try std.testing.expectError(error.Unexpected, snapshotLivePaths(&ctx, "id1"));
-}
-
-test "snapshotLivePaths: a non-missing openDir failure propagates instead of reporting no paths" {
-    if (!Io.File.Permissions.has_executable_bit) return; // no unix perms to lock out with
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    const home = try std.fs.path.join(a, &.{ base, "home" });
-    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
-
-    const live_a = try std.fs.path.join(a, &.{ home, "a" });
-    try mox.apply.write.writeAtomic(io, live_a, "a content\n", 0o644);
-    try mox.apply.snapshot.save(a, io, snaps, "id1", home, live_a, "a content\n");
-    const snap_dir = try std.fs.path.join(a, &.{ snaps, "id1" });
-    try mox.apply.write.setMode(snap_dir, 0o000);
-    defer mox.apply.write.setMode(snap_dir, 0o755) catch {};
-
-    var out_aw: Io.Writer.Allocating = .init(a);
-    var err_aw: Io.Writer.Allocating = .init(a);
-    var ctx = try testCtx(a, io, home, snaps, &out_aw.writer, &err_aw.writer);
-
-    try std.testing.expectError(error.AccessDenied, snapshotLivePaths(&ctx, "id1"));
-}

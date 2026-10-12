@@ -345,6 +345,17 @@ pub fn build(b: *std.Build) void {
     const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_tests_mod });
     test_step.dependOn(&b.addRunArtifact(lifecycle_tests).step);
 
+    // Applied-state integration tests at tests/state_test.zig.
+    const state_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/state_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    state_tests_mod.addImport("mox", lib_mod);
+    const state_tests = b.addTest(.{ .root_module = state_tests_mod });
+    test_step.dependOn(&b.addRunArtifact(state_tests).step);
+
     // Generator-prune property + fuzz test at tests/prune_property_test.zig.
     // The deterministic property test runs on every `zig build test`; its Smith
     // target is also one of the `zig build fuzz` targets.

@@ -13,6 +13,7 @@ const cli = @import("cli");
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
+const state_cli = @import("state.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
 
@@ -21,31 +22,26 @@ const junk = @import("../source/junk.zig");
 
 const max_state_bytes: usize = 64 * 1024 * 1024;
 
-/// Scan `<state>/provenance/` and return the paths of files that fail to
-/// deserialize (malformed / wrong-version state). Arena-owned.
-pub fn findMalformedProvenance(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]const []const u8 {
-    const prov_dir = try std.fs.path.join(arena, &.{ state_dir, "provenance" });
-    var dir = Io.Dir.cwd().openDir(io, prov_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
-        error.FileNotFound => return &.{},
-        else => return e,
-    };
-    defer dir.close(io);
-
+/// The provenance the state keeps that cannot be read: a blob that is
+/// missing, no longer matches its name, or does not parse. Each is named by
+/// its blob path. Arena-owned.
+pub fn findMalformedProvenance(arena: std.mem.Allocator, st: *const mox.state.Draft) ![]const []const u8 {
+    var blobs: std.ArrayList(mox.state.Hex) = .empty;
+    for (st.gen.paths.values()) |e| if (e.kind == .file) if (e.file.?.provenance_blob) |h| try blobs.append(arena, h);
+    for (st.gen.residue.values()) |h| try blobs.append(arena, h);
     var out: std.ArrayList([]const u8) = .empty;
-    // Sorted so the advisory lists the same malformed files in the same order
-    // on every machine.
-    for (try mox.source.dirent.sorted(arena, io, dir)) |entry| {
-        if (entry.kind != .file) continue;
-        // An unreadable record is as much a problem as an unparseable one --
-        // both mean apply cannot trust what it last recorded for this file.
-        const content = dir.readFileAlloc(io, entry.name, arena, .limited(max_state_bytes)) catch {
-            try out.append(arena, try std.fs.path.join(arena, &.{ prov_dir, entry.name }));
-            continue;
-        };
-        if (mox.provenance.map.deserialize(arena, content)) |_| {} else |_| {
-            try out.append(arena, try std.fs.path.join(arena, &.{ prov_dir, entry.name }));
-        }
+    for (blobs.items) |h| {
+        const bytes = try st.readBlob(h);
+        const ok = if (bytes) |b| if (mox.provenance.map.deserialize(arena, b)) |_| true else |_| false else false;
+        if (!ok) try out.append(arena, try st.blobPath(h));
     }
+    // Sorted so the advisory lists the same records in the same order on
+    // every machine.
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
     return out.toOwnedSlice(arena);
 }
 
@@ -67,6 +63,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         lk = (try lock_mod.acquireForCommand(ctx, "doctor")) orelse return 1;
     }
     defer if (lk) |l| l.release();
+    const opened = (try state_cli.openWithReport(ctx, .{ .run_kind = .doctor, .writes = mutating, .locked = mutating, .repair = fix })) orelse return 2;
+    const st = opened.draft;
+    defer state_cli.commit(ctx, st, .{}) catch {};
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
 
@@ -112,7 +111,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // A private layer this repo and HOME expect but cannot find: every
     // composing command refuses until it is back or retired.
-    if (try mox.private.expect.unavailable(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.private_dir, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home))) {
+    if (st.expectsPrivate() and !try mox.private.layer.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir)) {
         advisories += 1;
         try ctx.out.print("  private-unavailable {f} (the private layer is unavailable but held sources before; restore it, or run `mox private retire` to stop expecting it)\n", .{display.of(context.paths.private_dir, context.paths.home)});
     }
@@ -228,18 +227,20 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     // Malformed provenance records (rebuildable).
-    const bad_prov = try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir);
+    const bad_prov = try findMalformedProvenance(ctx.alloc, st);
     var problems = bad_prov.len;
     for (bad_prov) |p| {
         try ctx.out.print("  bad-provenance {s} (fails to read)\n", .{p});
     }
 
+    problems += try stateRows(ctx, st, opened.report, fix);
+
     if (rebuild_prov) {
-        const rebuilt = (try rebuildProvenance(ctx, src_dir)) orelse return 2;
+        const rebuilt = (try rebuildProvenance(ctx, st, src_dir)) orelse return 2;
         try ctx.out.print("  rebuilt provenance for {d} recorded file(s)\n", .{rebuilt});
         // A successful rebuild re-writes every recorded file's provenance, so
         // re-check whether any malformed records remain.
-        problems = (try findMalformedProvenance(ctx.alloc, ctx.io, context.paths.state_dir)).len;
+        problems = (try findMalformedProvenance(ctx.alloc, st)).len;
     }
 
     if (rebuild_coupling) {
@@ -720,6 +721,49 @@ fn allNamesCompared(ax: mox.source.axes.Axes) bool {
     return true;
 }
 
+/// The state's own report: generations recovered from runs that did not
+/// finish, what was moved into quarantine, and generations that do not
+/// parse, which `fix` moves into quarantine. Returns the problems left.
+fn stateRows(ctx: *app.Ctx, st: *mox.state.Draft, report: mox.state.recovery.Report, fix: bool) !usize {
+    var problems: usize = 0;
+    if (report.restarted) {
+        try ctx.out.writeAll("  started over: no generation could be read, so the state is empty from here; the displaced history stays listed\n");
+        try st.forceCommit();
+    }
+    const inv = try mox.state.retention.inventory(ctx.alloc, ctx.io, st.store);
+    for (inv.gens) |l| if (l.gen.kind == .recovered) try ctx.out.print("  recovered {s} (a run that did not finish, folded from its journal)\n", .{l.id});
+    for (inv.unreadable) |gid| {
+        const path = try st.store.genPath(ctx.alloc, gid);
+        if (fix) {
+            var r: mox.state.recovery.Report = .{};
+            try mox.state.recovery.quarantine(ctx.alloc, ctx.io, st.store, path, &r);
+            for (r.quarantined.items) |q| try ctx.out.print("  moved {s} to quarantine: {s}\n", .{ path, q });
+        } else {
+            problems += 1;
+            try ctx.out.print("  bad-generation {s} (does not parse; --fix moves it to quarantine)\n", .{path});
+        }
+    }
+    for (report.quarantined.items) |q| try ctx.out.print("  moved to quarantine: {s}\n", .{q});
+    for (try mox.source.dirent.sortedPath(ctx.alloc, ctx.io, st.store.quarantine, .{ .iterate = true })) |e| {
+        const path = try std.fs.path.join(ctx.alloc, &.{ st.store.quarantine, e.name });
+        try ctx.out.print("  quarantined {s}\n", .{path});
+        if (!std.mem.endsWith(u8, e.name, ".jsonl")) continue;
+        const bytes = Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.alloc, .limited(max_state_bytes)) catch continue;
+        const j = (try mox.state.journal.parse(ctx.alloc, bytes)) orelse continue;
+        for (j.ops) |op| {
+            if (op.map != .displaced) continue;
+            const v = op.value orelse continue;
+            const d = mox.state.generation.parseFlatDisplaced(ctx.alloc, v) catch continue;
+            switch (d.type) {
+                .file => try ctx.out.print("    displaced {s} file {s}\n", .{ op.key, try st.blobPath(d.blob orelse continue) }),
+                .link => try ctx.out.print("    displaced {s} link -> {s}\n", .{ op.key, d.target orelse "" }),
+                .dir => try ctx.out.print("    displaced {s} dir\n", .{op.key}),
+            }
+        }
+    }
+    return problems;
+}
+
 /// Whether `rebuildProvenance` may refresh a file's provenance: only when the
 /// current composition still hashes to what mox last applied. A mismatch means
 /// the live file predates a source change, so rewriting its provenance from the
@@ -732,7 +776,7 @@ fn provenanceInSync(recorded: [mox.apply.applied.hash_hex_len]u8, composed: []co
 /// Recompose every managed file that has a last-applied record and re-persist
 /// its provenance (and applied records). Returns the number rebuilt, or null
 /// after reporting a private layer that cannot be merged.
-fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !?usize {
+fn rebuildProvenance(ctx: *app.Ctx, st: *mox.state.Draft, src_dir: []const u8) !?usize {
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -752,7 +796,7 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !?usize {
         // exclusion is deliberate, not a side effect of its absent record.
         if (file.own_paths.len > 0) continue;
         // Only rebuild for files mox actually tracks (have an applied record).
-        const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+        const recorded = st.read(file.live_path);
         if (recorded == null) continue;
 
         var prov: std.ArrayList(mox.provenance.map.Segment) = .empty;
@@ -764,10 +808,7 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !?usize {
         // provenance from the new source would drop the `.secret` guard.
         if (!provenanceInSync(recorded.?, bytes)) continue;
         // Never cache the cleartext of a secret-bearing composition.
-        if (!mox.provenance.map.hasSecret(prov.items)) {
-            try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, bytes);
-        }
-        try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, prov.items);
+        try st.rebuildFile(file.live_path, bytes, prov.items, mox.provenance.map.hasSecret(prov.items));
         rebuilt += 1;
     }
     return rebuilt;
@@ -904,41 +945,20 @@ test "provenanceInSync: rebuild only when the compose matches the applied hash" 
     try testing.expect(!provenanceInSync(mox.apply.applied.contentHashHex("token = hunter2\n"), "token = PLACEHOLDER\n"));
 }
 
-test "findMalformedProvenance: detects an unparseable record" {
+test "findMalformedProvenance: a blob that does not parse, and one that is missing, are problems" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-
-    try tmp.dir.createDirPath(io, "state/provenance");
-    try tmp.dir.writeFile(io, .{ .sub_path = "state/provenance/deadbeef", .data = "{ not valid json" });
-
-    const state_dir = try tmpAbs(a, io, &tmp, "state");
-    const bad = try findMalformedProvenance(a, io, state_dir);
-    try testing.expectEqual(@as(usize, 1), bad.len);
-}
-
-test "findMalformedProvenance: an unreadable record is a problem, not a silent skip" {
-    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
-
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    try tmp.dir.createDirPath(io, "state/provenance");
-    try tmp.dir.writeFile(io, .{ .sub_path = "state/provenance/deadbeef", .data = "{}" });
-    const rec_path = try tmpAbs(a, io, &tmp, "state/provenance/deadbeef");
-    chmod(rec_path, 0o000);
-    defer chmod(rec_path, 0o644);
-
-    const state_dir = try tmpAbs(a, io, &tmp, "state");
-    const bad = try findMalformedProvenance(a, io, state_dir);
-    try testing.expectEqual(@as(usize, 1), bad.len);
+    const st = try mox.state.draft.testDraft(a, io, try tmpAbs(a, io, &tmp, "state"));
+    try st.record("/h/a", "a\n", null);
+    try st.persistProvenanceBlob("/h/a", try mox.state.blob.put(a, io, st.store.blobs, "{ not valid json"));
+    try st.persistProvenanceBlob("/h/gone", mox.apply.applied.contentHashHex("never stored"));
+    try st.persistProvenance("/h/ok", &.{});
+    const bad = try findMalformedProvenance(a, st);
+    try testing.expectEqual(@as(usize, 2), bad.len);
 }
 
 fn chmod(path: []const u8, mode: u32) void {

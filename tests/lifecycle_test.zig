@@ -1429,6 +1429,14 @@ test "add: refuses a path under a dir-only ignored ancestor; --force overrides" 
     try std.testing.expect(exists(io, try h.srcOf(".claude/projects/session.jsonl")));
 }
 
+/// Point the provenance of `live` at bytes that do not parse.
+fn damageProvenance(h: Harness, live: []const u8) !void {
+    const store = try mox.state.Store.init(h.a, h.state);
+    var g = (try mox.state.recovery.readGeneration(h.a, h.io, store, try testutil.currentId(h), null)).?;
+    g.paths.getPtr(live).?.file.?.provenance_blob = try mox.state.blob.put(h.a, h.io, store.blobs, "not provenance\n");
+    try mox.state.recovery.writeGeneration(h.a, h.io, store, g);
+}
+
 test "doctor: detects a malformed state file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1438,10 +1446,9 @@ test "doctor: detects a malformed state file" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    // A malformed provenance record mox 0.12.4 left, named for no known path.
-    try testutil.legacyState(a, io, "unresolved-provenance", h.root, h.state);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "ok\n");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "ok\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try damageProvenance(h, try h.liveOf(".zshrc"));
 
     const r = try h.run(&.{ "mox", "doctor" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
@@ -1653,10 +1660,9 @@ test "doctor --fix rebuilds malformed provenance for tracked files" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    // A state mox 0.12.4 wrote whose provenance record no longer parses.
-    try testutil.legacyState(a, io, "bad-provenance", h.root, h.state);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "a\nb\n");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "a\nb\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try damageProvenance(h, try h.liveOf(".zshrc"));
 
     try testutil.gitTracked(io, a, h.repo);
     const fixed = try h.run(&.{ "mox", "doctor", "--fix" });
@@ -3180,11 +3186,8 @@ test "add: refuses while another live process holds the lock" {
     try writeRepo(io, &tmp, "home/notes.txt", "n\n");
 
     // A live process (this test) already holds the lock.
-    try Io.Dir.cwd().createDirPath(io, h.state);
-    const start = mox.cli.lock.processStart(a, io, mox.cli.lock.selfPid());
-    const stamp = if (start.len > 0) start else "-";
-    const line = try std.fmt.allocPrint(a, "{d} {s} apply\n", .{ mox.cli.lock.selfPid(), stamp });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "mox.lock" }), .data = line });
+    const held = try mox.state.lock.acquire(a, io, h.state, "apply");
+    defer held.acquired.release();
 
     const r = try h.run(&.{ "mox", "add", "notes.txt" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
@@ -5495,7 +5498,7 @@ test "stale: a failed generator's leaves and a private-walk failure sweep nothin
     try std.testing.expect(exists(io, try h.liveOf(".old")));
 }
 
-test "stale: another MOX_REPO sweeps nothing of this repo's, tagged generator manifests included, and an untagged record is never swept" {
+test "stale: another MOX_REPO sweeps nothing of this repo's, its generators included" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5504,10 +5507,6 @@ test "stale: another MOX_REPO sweeps nothing of this repo's, tagged generator ma
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    // A record mox 0.12.4 wrote, before records named their repo.
-    try testutil.legacyState(a, io, "untagged-whole", h.root, h.state);
-    const untagged = try h.liveOf(".legacy");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = untagged, .data = "l\n" });
     try writeRepo(io, &tmp, "repo/src/.mine", "a\n");
     try writeRepo(io, &tmp, "repo/src/.config/gen.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
@@ -5519,10 +5518,6 @@ test "stale: another MOX_REPO sweeps nothing of this repo's, tagged generator ma
     try std.testing.expectEqual(@as(u8, 0), (try other.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("a\n", try read(io, a, try h.liveOf(".mine")));
     try std.testing.expect(exists(io, try h.liveOf(".config/id-a.inc")));
-
-    // A record written before records named their repo is never swept.
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expect(exists(io, untagged));
 }
 
 test "stale: the same file as a managed path is forgotten, nothing removed" {
@@ -5596,7 +5591,7 @@ test "stale: an owned file is left in place and forgotten, and a symlink is remo
     try std.testing.expect(std.mem.indexOf(u8, again.out, "no longer managed") == null);
 }
 
-test "stale: an unchanged apply tags an untagged owned record in place" {
+test "stale: an unchanged apply gives an owned record another repo wrote this run's part, in place" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5605,15 +5600,17 @@ test "stale: an unchanged apply tags an untagged owned record in place" {
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    // The owned record mox 0.12.4 wrote, which names no repo.
-    try testutil.legacyState(a, io, "untagged-owned", h.root, h.state);
+    // Another repo wrote the owned record, the same state directory.
+    try writeRepo(io, &tmp, "other/src/app.toml", "# mox: own a\n[a]\nk = 1\n");
+    const other = try h.otherRepo(try std.fs.path.join(a, &.{ h.root, "other" }));
+    try std.testing.expectEqual(@as(u8, 0), (try other.run(&.{ "mox", "apply" })).rc);
     try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 1\n");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("app.toml"), .data = "[a]\nk = 1\n" });
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, r.out, "unchanged") != null);
 
-    // Tagged: the record is this repo's, so it goes once its source does.
+    // The record now names this repo and HOME, so it goes once its source
+    // does.
     try Io.Dir.cwd().deleteFile(io, try h.srcOf("app.toml"));
     const gone = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, gone.out, "left ~/app.toml in place (no longer managed)") != null);
@@ -5660,7 +5657,7 @@ test "mv: carries every attribute key, and refuses a move its keys cannot follow
     );
 }
 
-test "mv: another machine's next apply removes the old file, and keeps it where its record predates repo tags" {
+test "mv: another machine's next apply removes the old file" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5671,13 +5668,8 @@ test "mv: another machine's next apply removes the old file, and keeps it where 
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "repo/src/.old", "same\n");
     const b = try h.otherMachine("b");
-    const c = try h.otherMachine("c");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqual(@as(u8, 0), (try b.run(&.{ "mox", "apply" })).rc);
-    // Machine c applied with mox 0.12.4, before records named their repo.
-    try testutil.legacyState(a, io, "machine-c", h.root, c.state);
-    const c_old = try c.homePath(".old");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = c_old, .data = "same\n" });
 
     const mv = try h.run(&.{ "mox", "mv", ".old", ".new" });
     try std.testing.expectEqual(@as(u8, 0), mv.rc);
@@ -5688,8 +5680,6 @@ test "mv: another machine's next apply removes the old file, and keeps it where 
         try std.testing.expect(!exists(io, try m.homePath(".old")));
         try std.testing.expectEqualStrings("same\n", try read(io, a, try m.homePath(".new")));
     }
-    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expect(exists(io, c_old));
 }
 
 test "remove: a tombstone keeps every machine's live file; --purge leaves none, so other machines remove theirs" {
@@ -6368,7 +6358,7 @@ test "orphans: status, diff and apply --dry-run judge an orphaned generator's fi
     try std.testing.expect(exists(io, try h.liveOf(".config/kp-a.inc")));
 }
 
-test "orphans: a manifest from an aliased HOME, or an untagged one, is left alone" {
+test "orphans: a generator recorded under an aliased HOME is left alone" {
     if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -6378,11 +6368,6 @@ test "orphans: a manifest from an aliased HOME, or an untagged one, is left alon
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
-    // Untagged manifests mox 0.12.4 wrote, for generators never in this tree.
-    try testutil.legacyState(a, io, "untagged-manifests", h.root, h.state);
-    const leaf = try h.liveOf(".config/old.inc");
-    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf).?);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
     try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
     try writeRepo(io, &tmp, "repo/src/.other", "o\n");
@@ -6399,9 +6384,6 @@ test "orphans: a manifest from an aliased HOME, or an untagged one, is left alon
     try std.testing.expect(std.mem.indexOf(u8, r.out, "a parent directory is a symlink") == null);
     const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state });
     try std.testing.expect(dump.generator(try std.fs.path.join(a, &.{ alias, ".config", "g.inc" })) != null);
-    try std.testing.expect(dump.generator(try h.liveOf(".config/old-gen.inc")) != null);
-    try std.testing.expect(exists(io, leaf));
-    try std.testing.expect(dump.path(leaf).?.file != null);
 }
 
 test "attributes: a repo or private attributes file that is not valid TOML exits 2 in every command" {
@@ -6599,39 +6581,6 @@ test "orphans: an edited file of a gone generator is removed by a named --overwr
     try std.testing.expect(std.mem.indexOf(u8, s2.out, "its generator left the tree") == null);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, try h.liveOf(".config/r-b.inc")));
-}
-
-test "orphans: a file of an untagged manifest whose generator is gone is listed, never removed, and forgotten by commit" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const h = try setup(a, io, &tmp, null);
-    // Two manifests mox 0.12.4 wrote that both name one file: still one row.
-    try testutil.legacyState(a, io, "untagged-manifests", h.root, h.state);
-    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
-    const leaf = try h.liveOf(".config/old.inc");
-    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(leaf).?);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-
-    const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expectEqual(@as(u8, 0), s.rc);
-    try std.testing.expect(lineWith(s.out, "ORPHAN", "~/.config/old.inc (generated before this version; its generator is gone"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, s.out, "ORPHAN"));
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expect(exists(io, leaf));
-    const c = try h.run(&.{ "mox", "commit", "--yes", "~/.config/old.inc" });
-    try std.testing.expectEqual(@as(u8, 0), c.rc);
-    const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state });
-    try std.testing.expect(dump.generator(try h.liveOf(".config/old-gen.inc")) == null);
-    try std.testing.expect(dump.generator(try h.liveOf(".config/older-gen.inc")) == null);
-    try std.testing.expect(exists(io, leaf));
-    const s2 = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, s2.out, "ORPHAN") == null);
 }
 
 /// A symlink mox planted at ~/.config/c.toml, pointing into the repo, whose
@@ -7236,5 +7185,7 @@ test "snapshot ids: MOX_TEST_CLOCK sets them in a -Dtest-clock build and nowhere
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     const ids = try testutil.snapshotIds(h);
     try std.testing.expectEqual(@as(usize, 1), ids.len);
-    try std.testing.expectEqual(mox.apply.snapshot.takes_test_clock, std.mem.eql(u8, ids[0], "20260710T081500Z"));
+    // The second run's id carries the second the clock gives, with a suffix
+    // when the first run took it.
+    try std.testing.expectEqual(mox.state.id.takes_test_clock, std.mem.startsWith(u8, ids[0], "20260710T081500Z"));
 }

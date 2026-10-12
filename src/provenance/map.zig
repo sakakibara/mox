@@ -8,7 +8,7 @@
 //! the data source. Private-origin and secret hunks never route into `src/`.
 //!
 //! Origin paths are absolute on-disk paths (this map is machine-local state,
-//! stored beside the applied-content snapshot). The privacy invariant is
+//! kept with the last-applied content). The privacy invariant is
 //! enforced by the origin TAG (`.private` never routes to repo src), not by
 //! the path string.
 
@@ -16,7 +16,6 @@ const std = @import("std");
 const json = @import("json");
 
 const Io = std.Io;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Origin = union(enum) {
     /// Verbatim base-file passthrough. `line` is the 1-based base line of the
@@ -315,37 +314,6 @@ fn intOf(v: ?json.Value) ?i128 {
     };
 }
 
-/// Persist provenance for `live_path` under `<state>/provenance/<hash>`.
-pub fn persist(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8, segments: []const Segment) !void {
-    const path = try recordPath(arena, state_dir, live_path);
-    if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
-    const bytes = try serialize(arena, live_path, segments);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
-}
-
-/// Read persisted provenance for `live_path`, or null when none / malformed.
-pub fn read(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !?Map {
-    const path = try recordPath(arena, state_dir, live_path);
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
-        error.FileNotFound => return null,
-        else => return e,
-    };
-    return deserialize(arena, bytes) catch null;
-}
-
-fn recordPath(arena: std.mem.Allocator, state_dir: []const u8, live_path: []const u8) ![]u8 {
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(live_path, &digest, .{});
-    const name = std.fmt.bytesToHex(digest, .lower);
-    return std.fs.path.join(arena, &.{ state_dir, "provenance", &name });
-}
-
-/// Delete the persisted provenance record for `live_path`. Best-effort: an
-/// absent record is not an error. Used when mox stops tracking a path.
-pub fn forget(arena: std.mem.Allocator, io: Io, state_dir: []const u8, live_path: []const u8) !void {
-    Io.Dir.cwd().deleteFile(io, try recordPath(arena, state_dir, live_path)) catch {};
-}
-
 const testing = std.testing;
 
 test "hasSecret: detects a secret segment" {
@@ -460,21 +428,4 @@ test "serialize/deserialize round-trip preserves every origin kind" {
     try testing.expectEqualStrings("abbr <entry.key>", parsed.segments[3].origin.loop.template);
     try testing.expect(parsed.segments[4].origin == .secret);
     try testing.expect(parsed.segments[6].origin == .private);
-}
-
-test "persist/read round-trip through state dir" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const state_dir = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-
-    const segs = [_]Segment{.{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } }};
-    try persist(a, io, state_dir, "/home/me/.zshrc", &segs);
-    const got = (try read(a, io, state_dir, "/home/me/.zshrc")).?;
-    try testing.expectEqual(@as(usize, 1), got.segments.len);
-    try testing.expect(try read(a, io, state_dir, "/other/path") == null);
 }

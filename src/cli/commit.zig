@@ -43,6 +43,8 @@ const cli = @import("cli");
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const paths_mod = @import("paths.zig");
+const state_cli = @import("state.zig");
+const State = mox.state.Draft;
 const lock_mod = @import("lock.zig");
 const tty = @import("tty.zig");
 const prompt = @import("prompt.zig");
@@ -112,6 +114,7 @@ const SymSync = struct {
     live_path: []const u8,
     source_abs: []const u8,
     new_target: []const u8,
+    source_key: []const u8,
 };
 
 /// A generator leaf whose keep wrote at least one field into its data-source
@@ -1154,13 +1157,12 @@ pub fn commitImpl(
 
 /// Forget each of `paths`, named stale paths of a run that commits: the
 /// live file keeps its edit and mox stops tracking it on this machine.
-fn releaseStale(ctx: *app.Ctx, paths: []const []const u8, home: []const u8, orphans: *const std.StringHashMap([]const []const u8)) !void {
-    const state_dir = ctx.context.?.paths.state_dir;
+fn releaseStale(ctx: *app.Ctx, st: *State, paths: []const []const u8, home: []const u8, orphans: *const std.StringHashMap([]const []const u8)) !void {
     for (paths) |lp| {
-        try mox.apply.applied.forget(ctx.alloc, ctx.io, state_dir, lp);
-        try mox.provenance.map.forget(ctx.alloc, ctx.io, state_dir, lp);
+        try st.forget(lp);
+        try st.forgetProvenance(lp);
         if (orphans.get(lp)) |ms| {
-            for (ms) |m| try mox.apply.generated.dropLeaf(ctx.alloc, ctx.io, m, lp);
+            for (ms) |m| try st.dropLeaf(m, lp);
             try ctx.out.print("  released {f} on this machine: its generator left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
         } else try ctx.out.print("  released {f} on this machine: its source left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
     }
@@ -1186,6 +1188,9 @@ fn commitRun(
 
     const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
     defer lk.release();
+    const st = (try state_cli.open(ctx, .{ .run_kind = .commit, .writes = !dry_run, .locked = true })) orelse return 2;
+    // Every exit after the first write commits what the run did.
+    defer state_cli.commit(ctx, st, .{}) catch {};
 
     // Routing a live edit back into a source that is itself mid-merge would
     // write over half-resolved content, so the same refusal apply makes.
@@ -1266,8 +1271,7 @@ fn commitRun(
         var direct: std.ArrayList([]const u8) = .empty;
         var leaf_targets: std.ArrayList([]const u8) = .empty;
         var stale_live: std.ArrayList([]const u8) = .empty;
-        const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
-        const cands = try mox.apply.stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, m_state.home, tree);
+        const cands = try mox.apply.stale.candidatesOf(ctx.alloc, st, m_state.home, tree);
         var tree_live: std.StringHashMap(void) = .init(ctx.alloc);
         for (tree.files) |f| try tree_live.put(f.live_path, {});
         var left_alone: usize = 0;
@@ -1286,13 +1290,13 @@ fn commitRun(
                     continue;
                 }
                 try stale_live.append(ctx.alloc, live);
-            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, true, &tree_live, live) != null) {
+            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, st, &tree_live, live) != null) {
                 if (try ignoredStale(ctx, &axis_resolver, &m_state, live)) {
                     left_alone += 1;
                     continue;
                 }
                 try stale_live.append(ctx.alloc, live);
-                try orphan_manifests.put(live, try mox.apply.generated.orphanManifestsOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, true, &tree_live, live));
+                try orphan_manifests.put(live, try mox.apply.generated.orphanManifestsOf(ctx.alloc, st, &tree_live, live));
             } else {
                 try leaf_targets.append(ctx.alloc, live);
             }
@@ -1347,7 +1351,7 @@ fn commitRun(
         try ctx.out.print("  would release {f} on this machine (its source left the tree; the file is kept)\n", .{display.of(lp, m_state.home)});
     if (only_stale) {
         if (report_mode) return 1;
-        try releaseStale(ctx, stale_named, m_state.home, &orphan_manifests);
+        try releaseStale(ctx, st, stale_named, m_state.home, &orphan_manifests);
         return 0;
     }
     // `--yes` takes every default without reading input.
@@ -1509,7 +1513,7 @@ fn commitRun(
         // can be routed; skip it with the diagnosis and keep committing.
         if (file.head_error.len > 0) {
             try ctx.err.print("mox commit: {f}: skipped ({s})\n", .{ display.of(file.live_path, m_state.home), file.head_error });
-            if (try editedSinceRecord(ctx.alloc, ctx.io, context.paths.state_dir, file)) pending = true;
+            if (try editedSinceRecord(ctx.alloc, ctx.io, st, file)) pending = true;
             continue;
         }
 
@@ -1541,7 +1545,7 @@ fn commitRun(
                     } else try valid.append(ctx.alloc, o);
                 }
                 const outputs = valid.items;
-                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, context.paths.state_dir, &generated)) {
+                switch (try processGeneratorFile(&cc, &ra, file, fidx, outputs, only_leaves, st, &generated)) {
                     .cont => {},
                     .abort => {
                         aborted = true;
@@ -1557,7 +1561,7 @@ fn commitRun(
         }
 
         if (file.is_symlink) {
-            switch (try processSymlinkFile(&cc, &ra, file, fidx, context.paths.state_dir, &sym_syncs)) {
+            switch (try processSymlinkFile(&cc, &ra, file, fidx, st, &sym_syncs)) {
                 .cont => {},
                 .abort => {
                     aborted = true;
@@ -1578,7 +1582,7 @@ fn commitRun(
         // applied-record gates: those records never exist for it, and partial
         // implies per-key routing -- the line route never applies.
         if (file.own_paths.len > 0) {
-            switch (try processPartialFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, context.paths.state_dir, &skipped_secret)) {
+            switch (try processPartialFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, st, &skipped_secret)) {
                 .cont => {},
                 .abort => {
                     aborted = true;
@@ -1592,7 +1596,7 @@ fn commitRun(
             continue;
         }
 
-        const recorded = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+        const recorded = st.read(file.live_path);
         // Kind guard BEFORE the open: a FIFO here would block the read and
         // brick the whole commit.
         if (mox.apply.write.guardLiveRead(ctx.io, file.live_path) == .special) {
@@ -1623,7 +1627,7 @@ fn commitRun(
             continue;
         }
 
-        const cached = try mox.apply.applied.readContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
+        const cached = try st.readContent(file.live_path);
         // A cache that is not what the record hashes is older than it: a
         // secret-bearing composition since replaced it and was never cached.
         const fresh_cache = if (cached) |c| std.mem.eql(u8, &mox.apply.applied.contentHashHex(c), &recorded.?) else false;
@@ -1671,7 +1675,7 @@ fn commitRun(
             }
         }
 
-        var prov = (try mox.provenance.map.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) orelse {
+        var prov = (try st.provenance(file.live_path)) orelse {
             try ctx.out.print("  manual: {f} (no provenance recorded)\n", .{display.of(file.live_path, m_state.home)});
             manual_count += 1;
             manual_hunks[fidx] += 1;
@@ -2366,7 +2370,7 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.recordSymlink(ctx.alloc, ctx.io, context.paths.state_dir, s.live_path, s.new_target, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+        try st.recordSymlink(s.live_path, s.new_target, s.source_key);
         try ctx.out.print("  committed {f}\n", .{display.of(s.live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2375,9 +2379,9 @@ fn commitRun(
             mismatch = true;
             continue;
         }
-        try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
-        if (!r.secret) try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.live);
-        try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, gc.leaf_live_path, r.prov);
+        try st.record(gc.leaf_live_path, r.live, gc.gen_file.source_base_path);
+        if (!r.secret) try st.recordContent(gc.leaf_live_path, r.live);
+        try st.persistProvenance(gc.leaf_live_path, r.prov);
         try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2415,14 +2419,14 @@ fn commitRun(
                     // The OWNED record advances; whole-file records never
                     // exist for a partial target, and partial files persist
                     // no line provenance.
-                    try advanceOwnedRecord(ctx, file, r.composed, r.prov);
+                    try advanceOwnedRecord(ctx, st, file, r.composed, r.prov);
                 } else {
-                    try mox.apply.applied.record(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live, try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home));
+                    try st.record(file.live_path, r.live, file.source_base_path);
                     // Never cache the cleartext of a secret-bearing composition.
                     if (!mox.provenance.map.hasSecret(r.prov)) {
-                        try mox.apply.applied.recordContent(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.live);
+                        try st.recordContent(file.live_path, r.live);
                     }
-                    try mox.provenance.map.persist(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, r.prov);
+                    try st.persistProvenance(file.live_path, r.prov);
                 }
                 try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                 committed_count += 1;
@@ -2435,7 +2439,7 @@ fn commitRun(
     for (tree.files, 0..) |_, fidx| {
         if (declined_hunks[fidx] + unrouted_hunks[fidx] == 0 or v.file_failed[fidx]) continue;
         if (v.file_unit[fidx] and !coupling_only[fidx]) continue;
-        if (try v.stillDiffers(fidx, context.paths.state_dir)) mismatch = true;
+        if (try v.stillDiffers(fidx, st)) mismatch = true;
     }
     if (try printCouplingUndone(ctx.alloc, ctx.err, coupling_dropped, settle.undone)) mismatch = true;
 
@@ -2447,7 +2451,7 @@ fn commitRun(
         try ctx.err.print("mox commit: coupling graph not updated: {s}\n", .{@errorName(e)});
     };
 
-    if (!report_mode) try releaseStale(ctx, stale_named, m_state.home, &orphan_manifests);
+    if (!report_mode) try releaseStale(ctx, st, stale_named, m_state.home, &orphan_manifests);
 
     // The counts are what SURVIVED settling, never what was attempted: an
     // accepted coupled update whose path was restored was not committed.
@@ -2550,8 +2554,7 @@ fn partialExtract(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile, d
 /// Advance a partial file's OWNED record after a verified commit: canonical
 /// serialization (its hash when a secret resolved), the current own path
 /// list, and the secret path set, derived exactly as apply derives them.
-fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed: []const u8, prov_items: []const Segment) !void {
-    const context = ctx.context.?;
+fn advanceOwnedRecord(ctx: *app.Ctx, st: *State, file: mox.source.tree.ManagedFile, composed: []const u8, prov_items: []const Segment) !void {
     const partial_mod = mox.apply.partial;
     const mode: mox.apply.applied.Mode = if (file.ownership == .disown) .disown else .own;
     const format = file.format.?;
@@ -2573,15 +2576,14 @@ fn advanceOwnedRecord(ctx: *app.Ctx, file: mox.source.tree.ManagedFile, composed
     }
     const raws = try ctx.alloc.alloc([]const u8, file.own_paths.len);
     for (file.own_paths, raws) |p, *o| o.* = p.raw;
-    try mox.apply.applied.recordOwned(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path, .{
+    try st.recordOwned(file.live_path, .{
         .mode = mode,
         .canonical = if (any_secret) null else canon,
         .canonical_hash = if (any_secret) mox.apply.applied.contentHashHex(canon) else null,
         .secret = any_secret,
         .own_paths = raws,
         .secret_paths = secret_raws.items,
-        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
-    });
+    }, file.source_base_path);
 }
 
 /// True after saying so when `.moxignore` matches the named path whose
@@ -2792,7 +2794,7 @@ const Verifier = struct {
     /// Whether a file that is no recorded unit still differs from its
     /// recompose by unit equality: for a generator, any leaf edited since its
     /// record that its expansion does not reproduce.
-    fn stillDiffers(v: *Verifier, fidx: usize, state_dir: []const u8) !bool {
+    fn stillDiffers(v: *Verifier, fidx: usize, st: *const State) !bool {
         const file = findByLive(v.tree_now, v.files[fidx].live_path) orelse v.files[fidx];
         var gdiag: mox.compose.interp.Diag = .{};
         const gen = mox.compose.catB.composeGenerator(v.arena, v.io, file, v.resolver, v.m_state, v.secrets, &gdiag) catch return true;
@@ -2801,7 +2803,7 @@ const Verifier = struct {
                 if (mox.apply.write.guardLiveRead(v.io, leaf.live_path) != .readable) continue;
                 const live = Io.Dir.cwd().readFileAlloc(v.io, leaf.live_path, v.arena, .limited(max_file_bytes)) catch continue;
                 if (std.mem.eql(u8, live, leaf.content)) continue;
-                const recorded = try mox.apply.applied.read(v.arena, v.io, state_dir, leaf.live_path);
+                const recorded = st.read(leaf.live_path);
                 if (recorded != null and std.mem.eql(u8, &recorded.?, &mox.apply.applied.contentHashHex(live))) continue;
                 return true;
             }
@@ -3430,7 +3432,7 @@ fn atPreRun(before: ?[]const u8, now: PathNow) bool {
 /// timestamp, with a `-N` suffix when that one is taken.
 fn freshRecoveryDir(arena: std.mem.Allocator, io: Io, root: []const u8) ![]const u8 {
     try Io.Dir.cwd().createDirPath(io, root);
-    const base = mox.apply.snapshot.idNow(io);
+    const base = mox.state.id.idNow(io);
     var n: usize = 1;
     while (true) : (n += 1) {
         const name = if (n == 1) try arena.dupe(u8, &base) else try std.fmt.allocPrint(arena, "{s}-{d}", .{ &base, n });
@@ -4983,11 +4985,11 @@ fn processSymlinkFile(
     ra: *const RunAccum,
     file: mox.source.tree.ManagedFile,
     fidx: usize,
-    state_dir: []const u8,
+    st: *const State,
     sym_syncs: *std.ArrayList(SymSync),
 ) !HunkOutcome {
     const site = mox.apply.applied.inspectSymSite(cc.io, cc.arena, file.live_path);
-    const recorded_target = try mox.apply.applied.readSymlink(cc.arena, cc.io, state_dir, file.live_path);
+    const recorded_target = st.readSymlink(file.live_path);
     // A directory, a plain file, or an absent path where a symlink belongs is
     // not something `keep` can route (no target string to compare against) --
     // `mox apply --overwrite` is the resolution for those, not commit. Where
@@ -5075,6 +5077,7 @@ fn processSymlinkFile(
         .live_path = file.live_path,
         .source_abs = file.source_base_abs,
         .new_target = try cc.arena.dupe(u8, live_target),
+        .source_key = file.source_base_path,
     };
     if (try conflictOf(cc, ra, &.{.{ .path = sync.source_abs, .kind = .{ .sym = sync.new_target } }})) |reason| {
         ra.manual_count.* += 1;
@@ -5151,7 +5154,7 @@ fn processGeneratorFile(
     fidx: usize,
     outputs: []const mox.compose.catB.GeneratedFile,
     only_leaves: ?*const std.StringHashMap(void),
-    state_dir: []const u8,
+    st: *const State,
     gen: *LeafRowEdits,
 ) !HunkOutcome {
     for (outputs) |leaf| {
@@ -5161,7 +5164,7 @@ fn processGeneratorFile(
             // normalize it the same way before the membership test.
             if (!set.contains(try mox.source.path.toKey(cc.arena, leaf.live_path))) continue;
         }
-        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, state_dir, gen)) {
+        switch (try processGeneratorLeaf(cc, ra, gen_file, fidx, leaf, st, gen)) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -5180,12 +5183,12 @@ fn processGeneratorLeaf(
     gen_file: mox.source.tree.ManagedFile,
     fidx: usize,
     leaf: mox.compose.catB.GeneratedFile,
-    state_dir: []const u8,
+    st: *const State,
     gen: *LeafRowEdits,
 ) !HunkOutcome {
     // Kind guard BEFORE the open: a FIFO here would block the read.
     if (mox.apply.write.guardLiveRead(cc.io, leaf.live_path) == .special) {
-        try reportSpecial(cc, ra, leaf.live_path, fidx, (try mox.apply.applied.read(cc.arena, cc.io, state_dir, leaf.live_path)) != null);
+        try reportSpecial(cc, ra, leaf.live_path, fidx, st.read(leaf.live_path) != null);
         return .cont;
     }
     const live = Io.Dir.cwd().readFileAlloc(cc.io, leaf.live_path, cc.arena, .limited(max_file_bytes)) catch |e| switch (e) {
@@ -5193,7 +5196,7 @@ fn processGeneratorLeaf(
         else => return e,
     };
     if (std.mem.eql(u8, live, leaf.content)) return .cont;
-    const recorded = try mox.apply.applied.read(cc.arena, cc.io, state_dir, leaf.live_path);
+    const recorded = st.read(leaf.live_path);
     const first_contact = recorded == null;
     // Live as the last apply wrote it has no drift, whatever the data now
     // renders; edited over a data row that changed since, no hunk is that
@@ -5491,7 +5494,7 @@ fn processPartialFile(
     fidx: usize,
     spaces: []?FileSpace,
     repo_dir: []const u8,
-    state_dir: []const u8,
+    st: *const State,
     skipped_secret: *usize,
 ) !HunkOutcome {
     const arena = cc.arena;
@@ -5563,7 +5566,7 @@ fn processPartialFile(
         },
     };
 
-    const record = try mox.apply.applied.readOwned(arena, cc.io, state_dir, live_path);
+    const record = try st.readOwned(live_path);
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(arena, r.own_paths) else &.{};
 
     // Only owned drift is committable: clean has nothing to route, and
@@ -6254,10 +6257,10 @@ fn finalNewlineManual(cc: *const ClassCtx, ra: *const RunAccum, live_path: []con
 /// Whether the live file at a path mox recorded no longer holds what was
 /// recorded there: a special inode, content whose hash differs, or for an
 /// owned record an owned form that differs or cannot be extracted.
-fn editedSinceRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, file: mox.source.tree.ManagedFile) !bool {
+fn editedSinceRecord(arena: std.mem.Allocator, io: Io, st: *const State, file: mox.source.tree.ManagedFile) !bool {
     const live_path = file.live_path;
-    const recorded = try mox.apply.applied.read(arena, io, state_dir, live_path);
-    const owned = if (recorded == null) (try mox.apply.applied.readOwned(arena, io, state_dir, live_path)) orelse return false else null;
+    const recorded = st.read(live_path);
+    const owned = if (recorded == null) (try st.readOwned(live_path)) orelse return false else null;
     switch (mox.apply.write.guardLiveRead(io, live_path)) {
         .special => return true,
         .absent => return false,
@@ -9252,12 +9255,12 @@ test "freshRecoveryDir: a taken timestamp gets the next free -N suffix" {
     // Retried while the second turns over between taking the names and the
     // call, which would leave nothing taken.
     for (0..5) |_| {
-        const base = mox.apply.snapshot.idNow(io);
+        const base = mox.state.id.idNow(io);
         for ([_][]const u8{ "", "-2" }) |suffix| {
             try Io.Dir.cwd().createDirPath(io, try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ root, std.fs.path.sep_str, &base, suffix }));
         }
         const got = try freshRecoveryDir(a, io, root);
-        if (!std.mem.eql(u8, &mox.apply.snapshot.idNow(io), &base)) continue;
+        if (!std.mem.eql(u8, &mox.state.id.idNow(io), &base)) continue;
         try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}{s}{s}-3", .{ root, std.fs.path.sep_str, &base }), got);
         return;
     }
@@ -9828,7 +9831,7 @@ fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.
         .interactive = false,
         .sty = .{ .on = false },
         .claims = claims,
-        .paths = .{ .home = m_state.home, .home_named = true, .repo_dir = "", .state_dir = "", .private_dir = "", .triggers_path = "", .snapshots_dir = "", .facts_path = "" },
+        .paths = .{ .home = m_state.home, .home_named = true, .repo_dir = "", .state_dir = "", .private_dir = "", .triggers_path = "", .facts_path = "" },
         .files = &.{},
         .ids = try testPathIds(a, io),
         .canon = try testCanon(a),
@@ -9998,7 +10001,6 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
             .state_dir = try std.fs.path.join(a, &.{ root, "state" }),
             .private_dir = "",
             .triggers_path = "",
-            .snapshots_dir = "",
             .facts_path = "",
         },
         .files = &.{},

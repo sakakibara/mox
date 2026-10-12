@@ -1,4 +1,6 @@
 const std = @import("std");
+const junk = @import("../source/junk.zig");
+const Io = std.Io;
 const source = @import("../source/root.zig");
 const partial = @import("../apply/partial.zig");
 
@@ -216,4 +218,43 @@ fn concatPaths(arena: std.mem.Allocator, a: []const []const u8, b: []const []con
     @memcpy(result[0..a.len], a);
     @memcpy(result[a.len..], b);
     return result;
+}
+
+/// True when the private layer at `private_dir` is a directory holding a
+/// file the source walk would not skip as junk, at any depth.
+pub fn holdsSource(arena: std.mem.Allocator, io: Io, private_dir: []const u8) !bool {
+    var dir = Io.Dir.cwd().openDir(io, private_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (walker.next(io) catch return false) |entry| {
+        if (entry.kind == .directory) continue;
+        if (junkPath(entry.path)) continue;
+        return true;
+    }
+    return false;
+}
+
+fn junkPath(path: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, path, "/\\");
+    while (it.next()) |part| if (junk.isJunk(part)) return true;
+    return false;
+}
+
+test "holdsSource: junk and an evicted iCloud placeholder are no source" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "p/.config/x");
+    try tmp.dir.writeFile(io, .{ .sub_path = "p/.DS_Store", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "p/.config/x/..c.icloud", .data = "x" });
+    const p = try tmp.dir.realPathFileAlloc(io, "p", a);
+    try testing.expect(!try holdsSource(a, io, p));
+    try tmp.dir.writeFile(io, .{ .sub_path = "p/.config/x/c", .data = "x" });
+    try testing.expect(try holdsSource(a, io, p));
+    try testing.expect(!try holdsSource(a, io, try std.fs.path.join(a, &.{ p, "missing" })));
 }

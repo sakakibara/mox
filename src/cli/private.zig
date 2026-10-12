@@ -5,6 +5,8 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
+const lock_mod = @import("lock.zig");
+const state_cli = @import("state.zig");
 
 const BareSpec = struct {};
 
@@ -20,9 +22,15 @@ const RetireSpec = struct {
 /// Stop expecting a private layer for this repo and HOME.
 fn retire(ctx: *app.Ctx, a: cli.Args(RetireSpec)) anyerror!u8 {
     const context = ctx.context.?;
-    const tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
     const shown = display.of(context.paths.private_dir, context.paths.home);
-    if (!try mox.private.expect.retire(ctx.alloc, ctx.io, context.paths.state_dir, tag, a.dry_run)) {
+    // A dry run reads without the lock; a real one takes it.
+    var lk: ?lock_mod.Lock = null;
+    if (!a.dry_run) lk = (try lock_mod.acquireForCommand(ctx, "private retire")) orelse return 1;
+    defer if (lk) |l| l.release();
+    const st = (try state_cli.open(ctx, .{ .run_kind = .private, .writes = !a.dry_run, .locked = !a.dry_run })) orelse return 2;
+    defer state_cli.commit(ctx, st, .{}) catch {};
+    const expected = if (a.dry_run) st.expectsPrivate() else try st.retirePrivate();
+    if (!expected) {
         try ctx.out.print("no private layer at {f} is expected here; nothing to retire\n", .{shown});
         return 0;
     }

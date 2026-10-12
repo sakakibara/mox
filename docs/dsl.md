@@ -334,14 +334,13 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   secret never reaches disk or the terminal: its value is kept out of the
   applied-content cache and snapshots, and `mox diff` redacts any hunk touching
   a secret line. (Redaction of a secret you have since removed relies on that
-  file's stored provenance; a file first applied by an older mox that predates
-  provenance tracking would not have it -- reapply once to record it.)
-  A live file that resolves an `op://` or `pass://` secret is applied at mode
-  0600 automatically (dedicated secret managers hold only secrets, so this is
-  never a false positive), unless `.mox/attributes.toml` sets an explicit mode.
-  The ambiguous schemes (`env:`, `file://`, `cmd:` -- the last often a non-secret
-  value like a computed theme name) are left at their composed mode; mark one
-  `mode = "0600"` in `.mox/attributes.toml` when it is sensitive.
+  file's stored provenance.) A live file that resolves an `op://` or
+  `pass://` secret is applied at mode 0600 automatically (dedicated secret
+  managers hold only secrets, so this is never a false positive), unless
+  `.mox/attributes.toml` sets an explicit mode. The ambiguous schemes
+  (`env:`, `file://`, `cmd:` -- the last often a non-secret value like a
+  computed theme name) are left at their composed mode; mark one `mode =
+  "0600"` in `.mox/attributes.toml` when it is sensitive.
 
 Captures must not be adjacent (`<a><b>`) and a name must not repeat within one
 template; both are compose-time errors. A malformed `data.` capture (`<data.x>`
@@ -919,10 +918,9 @@ of this repo and HOME whose path no managed file -- repo or private layer,
 gated-off ones included, since a gate is not removal -- and no generator
 manifest names: a source that was deleted, moved, or released. The sweep of
 an orphaned generator's files takes only manifests of this repo and HOME
-that list no file outside it; an untagged manifest, written before manifests
-named their repo, is never swept. Both sweeps leave a `.moxignore`-matched
-file alone, and `status` and `diff` judge every such file exactly as the
-sweep would.
+that list no file outside it. Both sweeps leave a `.moxignore`-matched file
+alone, and `status` and `diff` judge every such file exactly as the sweep
+would.
 
 - An unedited whole file or symlink is removed, snapshot-first, so `mox
   rollback` recovers it; an edited one is drift, kept until it is named:

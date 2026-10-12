@@ -5,6 +5,8 @@
 
 const std = @import("std");
 const cli = @import("cli");
+const state_cli = @import("state.zig");
+const State = mox.state.Draft;
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
@@ -193,6 +195,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox diff")) return 2;
     if (try apply_cmd.privateRefusal(ctx, "mox diff")) return 2;
     const context = ctx.context.?;
+    const st = (try state_cli.open(ctx, .{ .writes = false, .locked = false })) orelse return 2;
     const stat_mode = a.stat;
     const sty = style.Style{ .on = style.enabled(
         tty.isInteractive(1),
@@ -271,14 +274,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
-            try scan.walked(ctx.alloc, file.live_path);
+            try scan.walked(file.live_path);
             try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
             if (file.head_error_attrs) refused = true;
             continue;
         }
         var gdiag: mox.compose.interp.Diag = .{};
         const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag);
-        try apply_cmd.scanGenerator(ctx, &scan, &ruleset, file.live_path, gen_out);
+        try apply_cmd.scanGenerator(ctx, st, &scan, &ruleset, file.live_path, gen_out);
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so diff has nothing to compare it against.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
@@ -303,13 +306,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
                         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(o.live_path, home), why });
                         continue;
                     }
-                    if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, home, o.live_path)) |v| if (v == .remove) {
+                    if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, st, home, o.live_path)) |v| if (v == .remove) {
                         try diffLinkReplace(ctx, sty, stat_mode, o.live_path, v.remove.link, o.content, o.prov, &total, &changed);
                         continue;
                     };
-                    try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.live_path, o.content, o.prov, &total, &changed);
+                    try diffOne(ctx, st, sty, stat_mode, o.live_path, o.content, o.prov, &total, &changed);
                 }
-                try status_mod.noteDropped(ctx, &dropped, file.live_path, outputs);
+                try status_mod.noteDropped(ctx, st, &dropped, file.live_path, outputs);
                 continue;
             }
         }
@@ -337,21 +340,21 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // mox's to remove -- nothing to diff.
         const composed_bytes = composed orelse {
             if (file.own_paths.len == 0) {
-                const rec = try mox.apply.applied.read(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path);
-                if (rec != null) try diffOne(ctx, context.paths.state_dir, sty, stat_mode, file.live_path, "", &.{}, &total, &changed);
+                const rec = st.read(file.live_path);
+                if (rec != null) try diffOne(ctx, st, sty, stat_mode, file.live_path, "", &.{}, &total, &changed);
             }
             continue;
         };
 
         // A planted link rollback put back: --overwrite replaces it.
-        if (try mox.apply.applied.rolledBackLink(ctx.alloc, ctx.io, context.paths.state_dir, file.live_path)) |target| {
+        if (try st.rolledBackLink(file.live_path)) |target| {
             try diffLinkReplace(ctx, sty, stat_mode, file.live_path, target, composed_bytes, prov.items, &total, &changed);
             continue;
         }
 
         // A symlink mox planted where a file now belongs: apply replaces the
         // link with the composed file.
-        if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, context.paths.state_dir, home, file.live_path)) |v| switch (v) {
+        if (try mox.apply.removable.plantedLink(ctx.alloc, ctx.io, st, home, file.live_path)) |v| switch (v) {
             .remove => |found| {
                 try diffLinkReplace(ctx, sty, stat_mode, file.live_path, found.link, composed_bytes, prov.items, &total, &changed);
                 continue;
@@ -366,19 +369,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A partial file diffs its owned subtree only: canonical composed-owned
         // vs canonical live-owned, as text, labeled with the live path.
         if (file.own_paths.len > 0) {
-            try diffPartial(ctx, context.paths.state_dir, sty, stat_mode, file, composed_bytes, prov.items, &total, &changed);
+            try diffPartial(ctx, st, sty, stat_mode, file, composed_bytes, prov.items, &total, &changed);
             continue;
         }
 
-        try diffOne(ctx, context.paths.state_dir, sty, stat_mode, file.live_path, composed_bytes, prov.items, &total, &changed);
+        try diffOne(ctx, st, sty, stat_mode, file.live_path, composed_bytes, prov.items, &total, &changed);
     }
 
     // A file whose source left the tree: apply removes it when unedited, so
     // its live content shows on the removed side.
     if (a.paths.len == 0) {
         const stale = mox.apply.stale;
-        const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
-        const cands = try stale.candidatesOf(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, home, tree);
+        const cands = try stale.candidatesOf(ctx.alloc, st, home, tree);
         var live_paths: std.ArrayList([]const u8) = .empty;
         for (tree.files) |f| try live_paths.append(ctx.alloc, f.live_path);
         var inodes = try stale.inodesOf(ctx.alloc, ctx.io, live_paths.items);
@@ -388,19 +390,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             if (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c)) != .remove) continue;
             if (c.kind == .symlink) {
                 try diffLinkRemoval(ctx, sty, stat_mode, c.live_path, c.target, &total, &changed);
-            } else try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
+            } else try diffOne(ctx, st, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
         }
         // A file a live generator no longer produces, which apply would prune.
-        for (try status_mod.judgeDropped(ctx, tree, &ruleset, &scan, dropped.items)) |j| {
+        for (try status_mod.judgeDropped(ctx, st, tree, &ruleset, &scan, dropped.items)) |j| {
             if (j.verdict != .remove) continue;
-            try diffOne(ctx, context.paths.state_dir, sty, stat_mode, j.drop.leaf, "", &.{}, &total, &changed);
+            try diffOne(ctx, st, sty, stat_mode, j.drop.leaf, "", &.{}, &total, &changed);
         }
         // A file of a generator that left the tree, which apply would remove.
-        for (try status_mod.orphanPlan(ctx, tree, &ruleset, &scan)) |m| {
+        for (try status_mod.orphanPlan(ctx, st, tree, &ruleset, &scan)) |m| {
             if (m.released) continue;
             for (m.leaves) |leaf| {
                 if (leaf.verdict != .remove) continue;
-                try diffOne(ctx, context.paths.state_dir, sty, stat_mode, leaf.path, "", &.{}, &total, &changed);
+                try diffOne(ctx, st, sty, stat_mode, leaf.path, "", &.{}, &total, &changed);
             }
         }
     }
@@ -468,7 +470,7 @@ fn diffLinkReplace(
 /// and must never reach stdout.
 fn diffOne(
     ctx: *app.Ctx,
-    state_dir: []const u8,
+    st: *const State,
     sty: style.Style,
     stat_mode: bool,
     live_path: []const u8,
@@ -512,7 +514,7 @@ fn diffOne(
         // secrets from the last-applied provenance mox persisted for the path
         // (its resolved values may still sit on disk).
         const b_secret = try secretMask(ctx.alloc, b_lines.len, prov_segments);
-        const prior = try mox.provenance.map.read(ctx.alloc, ctx.io, state_dir, live_path);
+        const prior = try st.provenance(live_path);
         const a_secret = if (prior) |m| try secretMask(ctx.alloc, a_lines.len, m.segments) else &.{};
         const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
         try ctx.out.writeAll(rendered);
@@ -528,7 +530,7 @@ fn diffOne(
 /// its exit contract.
 fn diffPartial(
     ctx: *app.Ctx,
-    state_dir: []const u8,
+    st: *const State,
     sty: style.Style,
     stat_mode: bool,
     file: mox.source.tree.ManagedFile,
@@ -604,7 +606,7 @@ fn diffPartial(
             return;
         },
     };
-    const record = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, state_dir, live_path);
+    const record = try st.readOwned(live_path);
     var secret_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
     if (record) |r| try secret_paths.appendSlice(ctx.alloc, try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths));
     for (secret_scope, flags) |p, flagged| {

@@ -16,7 +16,6 @@ pub const Paths = struct {
     state_dir: []const u8,
     private_dir: []const u8,
     triggers_path: []const u8,
-    snapshots_dir: []const u8,
     facts_path: []const u8,
 };
 
@@ -83,7 +82,6 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
 
     const private_dir = try std.fs.path.join(arena, &.{ state_dir, "private" });
     const triggers_path = try std.fs.path.join(arena, &.{ state_dir, trigger_state.state_basename });
-    const snapshots_dir = try std.fs.path.join(arena, &.{ state_dir, "snapshots" });
 
     const config_base = try dirs.baseDirIn(arena, env, os_tag, .config, home);
     const facts_path = try std.fs.path.join(arena, &.{ config_base, "mox", "facts.toml" });
@@ -95,7 +93,6 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
         .state_dir = state_dir,
         .private_dir = private_dir,
         .triggers_path = triggers_path,
-        .snapshots_dir = snapshots_dir,
         .facts_path = facts_path,
     };
 }

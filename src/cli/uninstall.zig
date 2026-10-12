@@ -1,34 +1,37 @@
-//! `mox uninstall`: remove mox's machine-local state (applied records,
-//! provenance, ...). The private layer is PRESERVED unless `--purge-private`.
-//! Snapshots (the pre-mox original content of every file mox overwrote) and
-//! trash are PRESERVED unless confirmed: `--purge-snapshots` / `--purge-trash`
-//! delete non-interactively, otherwise a TTY is prompted -- so uninstalling
-//! never silently destroys the only backup of the user's originals. The user's
-//! source repo (their git repo) is NEVER touched. Under the lock.
+//! `mox uninstall`: remove mox's machine-local state. Records, provenance and
+//! flags are forgotten; the displaced history in `v2/` -- the pre-mox
+//! original content of every file mox replaced -- is kept, so `mox rollback`
+//! still works, unless `--purge-snapshots` or a confirmation at a terminal
+//! deletes `v2/`. The private layer is PRESERVED unless `--purge-private`;
+//! trash is preserved unless `--purge-trash` or confirmed. The user's source
+//! repo is NEVER touched, and nothing outside the state directory is deleted.
+//! Under the lock.
 
 const std = @import("std");
 const cli = @import("cli");
 const display = @import("display.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
+const state_cli = @import("state.zig");
+const mox = @import("../root.zig");
 const dirent = @import("../source/dirent.zig");
 const tty = @import("tty.zig");
 
 const Io = std.Io;
 
-const lock_name = "mox.lock";
+const lock_name = mox.state.lock.lock_name;
 const max_prompt_attempts = 100;
 
 pub const Action = enum { remove, preserve, prompt };
 
 /// Decide what to do with a top-level entry of the state dir. The private
-/// layer is preserved unless `--purge-private`; snapshots and trash are prompted
-/// (they hold the user's recoverable originals); the lock file is left to the
-/// lock's own release; everything else is removed.
+/// layer is preserved unless `--purge-private`; the history in `v2/` and
+/// trash are prompted (they hold the user's recoverable originals); the lock file is left to the lock's own
+/// release; everything else is removed.
 pub fn actionFor(name: []const u8, purge_private: bool) Action {
     if (std.mem.eql(u8, name, lock_name)) return .preserve;
     if (std.mem.eql(u8, name, "trash")) return .prompt;
-    if (std.mem.eql(u8, name, "snapshots")) return .prompt;
+    if (std.mem.eql(u8, name, mox.state.draft.store_dir_name)) return .prompt;
     if (std.mem.eql(u8, name, "private")) return if (purge_private) .remove else .preserve;
     return .remove;
 }
@@ -53,8 +56,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         },
         else => return e,
     };
+    dir.close(ctx.io);
+    const st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = true, .locked = true })) orelse return 2;
 
     // Sorted so kept/removed lines print in the same order on every machine.
+    dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true, .follow_symlinks = false });
     const entries = try dirent.sorted(ctx.alloc, ctx.io, dir);
     dir.close(ctx.io);
     var names: std.ArrayList([]const u8) = .empty;
@@ -72,22 +78,44 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     }
 
-    // Recoverable entries (snapshots, trash): delete only if the matching
+    // Recoverable entries (the history, trash): delete only if the matching
     // --purge flag is set or an interactive user confirms; otherwise keep.
+    var history_kept = false;
+    var history_asked = false;
+    var purge_history = false;
     for (prompt_names.items) |name| {
         const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, name });
-        const forced = (std.mem.eql(u8, name, "trash") and a.purge_trash) or
-            (std.mem.eql(u8, name, "snapshots") and a.purge_snapshots);
-        const do_delete = forced or (tty.isInteractive(0) and try confirm(ctx, name, path));
+        const is_trash = std.mem.eql(u8, name, "trash");
+        const do_delete = if (is_trash)
+            a.purge_trash or (tty.isInteractive(0) and try confirm(ctx, name, path))
+        else blk: {
+            if (!history_asked) {
+                history_asked = true;
+                purge_history = a.purge_snapshots or (tty.isInteractive(0) and try confirm(ctx, "snapshots", st.store.v2));
+            }
+            break :blk purge_history;
+        };
         if (do_delete) {
             try removeEntry(ctx, path, &removed);
         } else {
-            try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-{s})\n", .{ display.of(path, ctx.context.?.paths.home), name });
+            if (!is_trash) history_kept = true;
+            try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-{s})\n", .{ display.of(path, ctx.context.?.paths.home), if (is_trash) "trash" else "snapshots" });
         }
     }
 
+    if (history_kept) try forgetRecords(ctx, st);
+
     try ctx.out.print("mox uninstall: removed {d} state entr(ies); source repo untouched\n", .{removed});
     return 0;
+}
+
+/// Commit a generation that forgets every record and flag, and strip every
+/// retained generation down to its displaced history so the records' blobs
+/// go.
+fn forgetRecords(ctx: *app.Ctx, st: *mox.state.Draft) !void {
+    try st.forgetEverything();
+    try state_cli.commit(ctx, st, .{ .skip_gc = true });
+    try mox.state.retention.stripRecords(ctx.alloc, ctx.io, st.store);
 }
 
 /// Remove one state entry, reporting the outcome. A delete FAILURE is reported
@@ -136,21 +164,19 @@ pub const command = app.command(Spec, .{
     .name = "uninstall",
     .usage = "mox uninstall [--flags]",
     .summary = "Remove mox state",
-    .details = "Private preserved unless --purge-private; snapshots and trash preserved unless --purge-snapshots/--purge-trash or confirmed. The source repo is never touched.",
+    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. The source repo is never touched.",
     .group = .general,
     .needs_context = true,
 }, run);
 
 const testing = std.testing;
 
-test "actionFor: private preserved by default, removed on purge; trash prompts" {
+test "actionFor: private preserved by default, removed on purge; trash and the history prompt" {
     try testing.expectEqual(Action.preserve, actionFor("private", false));
     try testing.expectEqual(Action.remove, actionFor("private", true));
     try testing.expectEqual(Action.prompt, actionFor("trash", false));
-    try testing.expectEqual(Action.preserve, actionFor("mox.lock", false));
-    try testing.expectEqual(Action.remove, actionFor("applied", false));
-    try testing.expectEqual(Action.remove, actionFor("provenance", false));
-    // Snapshots hold the pre-mox originals: prompt, never silently removed.
-    try testing.expectEqual(Action.prompt, actionFor("snapshots", false));
-    try testing.expectEqual(Action.prompt, actionFor("snapshots", true));
+    try testing.expectEqual(Action.preserve, actionFor(lock_name, false));
+    try testing.expectEqual(Action.remove, actionFor("coupling", false));
+    // The history holds the pre-mox originals: prompt, never silently removed.
+    try testing.expectEqual(Action.prompt, actionFor(mox.state.draft.store_dir_name, false));
 }
