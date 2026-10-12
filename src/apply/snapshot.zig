@@ -284,6 +284,8 @@ pub const Refused = struct {
         parent_link,
         /// The live path itself is a symlink a restore would destroy.
         is_link,
+        /// A symlink sits where the snapshot has a directory.
+        dir_over_link,
     };
 };
 
@@ -386,7 +388,7 @@ fn restoreDirModes(
         const mode = std.fmt.parseInt(u32, line[0..sp], 8) catch return error.CorruptDirmodes;
         const live = try source_path.joinKeyOnto(arena, home, line[sp + 1 ..]);
         if (refusal(io, home, live)) |why| {
-            try refused.append(arena, .{ .live_path = live, .snapshot_path = try std.fs.path.join(arena, &.{ snapshots_dir, id, line[sp + 1 ..] }), .why = why });
+            try refused.append(arena, .{ .live_path = live, .snapshot_path = try std.fs.path.join(arena, &.{ snapshots_dir, id, line[sp + 1 ..] }), .why = if (why == .is_link) .dir_over_link else why });
             continue;
         }
         try entries.append(arena, .{ .live = live, .mode = mode });

@@ -5966,6 +5966,7 @@ test "stale: a directory the tree now plants as a symlink into the repo loses no
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
     try std.testing.expect(lineWith(rb.err, "~/.config/nvim/init.lua", "not restored: a parent directory is a symlink; the snapshot copy is at"));
+    try std.testing.expect(lineWith(rb.err, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory", "remove the symlink and re-run mox rollback"));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
 }
 
@@ -6247,7 +6248,7 @@ test "rollback: a live path that is now a symlink keeps the link and names the s
     try Io.Dir.cwd().symLink(io, "/etc/hosts", try h.liveOf(".rc"), .{});
     const r = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(lineWith(r.err, "~/.rc", "not restored: ~/.rc is a symlink; the snapshot copy is at"));
+    try std.testing.expect(lineWith(r.err, "~/.rc", "not restored: it is a symlink mox did not plant; the snapshot copy is at"));
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf(".rc"), &buf)]);
 }

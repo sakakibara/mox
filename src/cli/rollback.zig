@@ -132,7 +132,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const shown = display.of(r.live_path, context.paths.home);
         switch (r.why) {
             .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
-            .is_link => try ctx.err.print("  ERROR   {f} (not restored: {f} is a symlink; the snapshot copy is at {s})\n", .{ shown, shown, r.snapshot_path }),
+            .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
+            .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; remove the symlink and re-run mox rollback)\n", .{shown}),
         }
         failed += 1;
     }
