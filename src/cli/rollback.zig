@@ -186,7 +186,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             mox_bin_dir = try mox.apply.run_scripts.moxBinDir(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, &mox_bin_why);
             if (mox_bin_why) |why| try ctx.err.print("mox rollback: warning: the running mox is not on the check hooks' PATH: {s}\n", .{why});
         }
-        if (try repatchPartial(ctx, file, w.content, check_timeout_ms, &failed, mox_bin_dir)) repatched += 1;
+        if (try repatchPartial(ctx, file, w.content, check_timeout_ms, &failed, mox_bin_dir, &undo)) repatched += 1;
     }
 
     try ctx.out.print("Restored {d} file(s) from snapshot {s}\n", .{ restored.count + repatched, id });
@@ -227,6 +227,7 @@ fn repatchPartial(
     check_timeout_ms: i64,
     failed: *usize,
     mox_bin_dir: ?[]const u8,
+    undo: *mox.apply.snapshot.Undo,
 ) !bool {
     const partial = mox.apply.partial;
     const live_path = file.live_path;
@@ -347,6 +348,29 @@ fn repatchPartial(
             else => return e,
         };
         break :blk mox.apply.write.modeOf(st.permissions);
+    };
+    // What the re-patch replaces is kept, as a whole-file restore keeps it,
+    // its secret-bearing owned values masked as apply's snapshot masks them.
+    if (live) |held| if (!std.mem.eql(u8, held, candidate)) keep: {
+        const rec = try mox.apply.applied.readOwned(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, live_path);
+        const secret_paths: []const mox.source.tree.OwnPath = if (rec) |r| try mox.apply.owned.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
+        const kept = partial.maskSecretPaths(ctx.alloc, format, held, secret_paths) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MaskFailed => {
+                try ctx.err.print("  ERROR   {f} (not re-patched: what it holds could not be kept with its secrets masked)\n", .{display.of(live_path, ctx.context.?.paths.home)});
+                failed.* += 1;
+                return false;
+            },
+        };
+        mox.apply.snapshot.keepBytes(ctx.alloc, ctx.io, undo, ctx.context.?.paths.home, live_target, kept) catch |e| switch (e) {
+            // A partial target linked outside HOME has no place in a snapshot.
+            error.LiveFileOutsideHome => break :keep,
+            else => {
+                try ctx.err.print("  ERROR   {f} (not re-patched: what it holds could not be kept first: {s})\n", .{ display.of(live_path, ctx.context.?.paths.home), @errorName(e) });
+                failed.* += 1;
+                return false;
+            },
+        };
     };
     mox.apply.write.writeAtomicPartial(ctx.io, live_target, candidate, mode, live_stat) catch |e| switch (e) {
         error.LiveChangedDuringWrite => {

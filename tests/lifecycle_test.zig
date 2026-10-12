@@ -7195,3 +7195,28 @@ test "add: a captured file that does not parse in its own format warns with its 
     const rt = try h.run(&.{ "mox", "add", t });
     try std.testing.expect(std.mem.indexOf(u8, rt.err, "warning: does not parse as toml (src/c.toml:2:") != null);
 }
+
+test "rollback: re-patching a partial target keeps the live file in rollback's own snapshot first" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    const live = try h.liveOf("app.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a = 0\nb = \"prog\"\n" });
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\na = 1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\na = 2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("a = 2\nb = \"prog\"\n", try read(io, a, live));
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    try std.testing.expectEqualStrings("a = 1\nb = \"prog\"\n", try read(io, a, live));
+    const kept = std.mem.indexOf(u8, rb.out, "is kept in snapshot ") orelse return error.TestExpectedKeptSnapshot;
+    const after = rb.out[kept + "is kept in snapshot ".len ..];
+    const undo_id = after[0 .. std.mem.indexOfScalar(u8, after, ' ') orelse after.len];
+    const snap_copy = try std.fs.path.join(a, &.{ h.state, "snapshots", undo_id, "app.toml" });
+    try std.testing.expectEqualStrings("a = 2\nb = \"prog\"\n", try read(io, a, snap_copy));
+}

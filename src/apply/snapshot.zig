@@ -437,7 +437,7 @@ pub const Undo = struct {
     of: []const u8,
     id: ?[]const u8 = null,
 
-    fn take(u: *Undo, arena: std.mem.Allocator, io: Io) ![]const u8 {
+    pub fn take(u: *Undo, arena: std.mem.Allocator, io: Io) ![]const u8 {
         if (u.id) |id| return id;
         const id = try freshId(arena, io, u.snapshots_dir);
         try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ u.snapshots_dir, id }));
@@ -466,6 +466,12 @@ pub fn undoNote(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id:
     if (of.len < id_len or of.len > id_len + 8) return .corrupt;
     for (of) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-')) return .corrupt;
     return .{ .of = of };
+}
+
+/// Keep `bytes`, what a partial re-patch is about to replace at `live`, in
+/// rollback's own snapshot `u`; the caller has masked its secret values.
+pub fn keepBytes(arena: std.mem.Allocator, io: Io, u: *Undo, home: []const u8, live: []const u8, bytes: []const u8) !void {
+    try save(arena, io, u.snapshots_dir, try u.take(arena, io), home, live, bytes);
 }
 
 /// Keep what is at `live` in the rollback's own snapshot before the restore
