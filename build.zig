@@ -367,6 +367,17 @@ pub fn build(b: *std.Build) void {
     const fuzz_tests = b.addTest(.{ .root_module = fuzz_tests_mod });
     test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 
+    // The normalized state dump, for the differential gate: built on request,
+    // never installed by default.
+    const dump_mod = b.createModule(.{
+        .root_source_file = b.path("tests/state_dump_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dump_mod.addImport("mox", lib_mod);
+    const dump_exe = b.addExecutable(.{ .name = "mox-state-dump", .root_module = dump_mod });
+    b.step("state-dump", "Build the normalized state dump tool").dependOn(&b.addInstallArtifact(dump_exe, .{}).step);
+
     const fuzz_step = b.step("fuzz", "Run the fuzz targets once as bounded smoke checks");
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
     fuzz_step.dependOn(&b.addRunArtifact(prune_prop_tests).step);

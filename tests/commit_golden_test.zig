@@ -8,7 +8,7 @@ const testutil = @import("testutil.zig");
 const Harness = testutil.Harness;
 
 const repo_exclusions = [_][]const u8{".git"};
-const state_exclusions = [_][]const u8{"bin"};
+const state_exclusions = [_][]const u8{"bin"} ++ mox.state_dump.store_entries;
 
 // A transcript holds what a capture renders and digests of state that
 // records it, so the hostname is pinned like os and arch. Dotted, so the
@@ -76,7 +76,7 @@ const Normalizer = struct {
         return t;
     }
 
-    fn apply(n: Normalizer, a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    pub fn apply(n: Normalizer, a: std.mem.Allocator, text: []const u8) ![]const u8 {
         // A record names its repo percent-encoded.
         var t = try std.mem.replaceOwned(u8, a, text, try mox.apply.applied.pctEncode(a, n.root), "<ROOT>");
         t = try std.mem.replaceOwned(u8, a, t, n.root, "<ROOT>");
@@ -187,7 +187,33 @@ fn transcript(a: std.mem.Allocator, io: Io, h: Harness, res: testutil.RunResult,
     }
     try out.appendSlice(a, "--- state\n");
     try appendTree(&out, a, io, n, h.state, &state_exclusions, true);
+    const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state, .parts = &.{.{ .repo = h.repo, .home = h.home }} });
+    try out.appendSlice(a, try sortedBlocks(a, try n.recordName(a, try mox.state_dump.render(a, dump, n))));
     return out.items;
+}
+
+/// `text`'s blocks -- a line that does not start with a space, and the
+/// indented lines under it -- in sorted order: the dump orders paths by the
+/// hash of a live path, which moves with the test's temporary root.
+fn sortedBlocks(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var blocks: std.ArrayList([]const u8) = .empty;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const end = (std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len - 1) + 1;
+        if (i > start and text[i] != ' ') {
+            try blocks.append(a, text[start..i]);
+            start = i;
+        }
+        i = end;
+    }
+    if (start < text.len) try blocks.append(a, text[start..]);
+    std.mem.sort([]const u8, blocks.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return std.mem.concat(a, u8, blocks.items);
 }
 
 fn expectGolden(a: std.mem.Allocator, io: Io, h: Harness, res: testutil.RunResult, home_files: []const []const u8, want: []const u8) !void {
@@ -243,14 +269,12 @@ test "commit golden: a text line routed to its base" {
         \\export B=22
         \\export C=3
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.zshrc} 70e088a1db4236d1
-        \\applied/{~/.zshrc} 42cd2a2f9cadf341
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.zshrc} 4d155492e3015560
+        \\part 0 expects-private no
+        \\path {~/.zshrc}
+        \\  file 70e088a1db4236d1ffe25a5b4781d2389068362128e418ba87b1b9a449163eb3 cache 70e088a1db4236d1ffe25a5b4781d2389068362128e418ba87b1b9a449163eb3
+        \\  provenance 4d155492e30155600eed52231443a264d91226880ca3c2d8f7ad200341032c46
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -295,14 +319,12 @@ test "commit golden: a loop row string field routed to its data source" {
         \\abbr <entry.key>="<entry.expansion>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} 5eabd410fa3bbe11
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance 5eabd410fa3bbe111172fa70e837bb735f3790a8f79b3d74711dfa2e6044cf6e
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -364,14 +386,12 @@ test "commit golden: a shared base line narrowed to this os synthesizes a region
         \\== src/.zshrc.d/os/darwin
         \\export EDITOR=nvim
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.zshrc} 064a800582e89c33
-        \\applied/{~/.zshrc} 34a22cc73ed97fa6
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.zshrc} 1de5d3c3e80d7a65
+        \\part 0 expects-private no
+        \\path {~/.zshrc}
+        \\  file 064a800582e89c331d23282aa130ff910a2fdaa2d64838f8cbd8a2ad2b85b15f cache 064a800582e89c331d23282aa130ff910a2fdaa2d64838f8cbd8a2ad2b85b15f
+        \\  provenance 1de5d3c3e80d7a65f50e4613603e11405305affc63e7f5480d231c9947e55ee9
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -409,14 +429,12 @@ test "commit golden: a structured key routed to the os overlay that wins it" {
         \\== src/config.toml.d/os=darwin.toml
         \\theme = "solarized"
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/config.toml} b97e05e77de1da85
-        \\applied/{~/config.toml} 4bf1376757beed07
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/config.toml} 3a329ab3cd8f3b28
+        \\part 0 expects-private no
+        \\path {~/config.toml}
+        \\  file b97e05e77de1da850e955a278e66d4deb21b57216f2fc4a0fd88ca18764998c2 cache b97e05e77de1da850e955a278e66d4deb21b57216f2fc4a0fd88ca18764998c2
+        \\  provenance 3a329ab3cd8f3b2854fb65c3ee92c7912a9d44130895b0ec9d629032e442b2ac
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -454,10 +472,11 @@ test "commit golden: an owned key of a partial file routed to its base" {
         \\[tui.keymap.global]
         \\submit = "ctrl-enter"
         \\--- state
-        \\applied-owned/
-        \\applied-owned/{~/app.toml} df8d7236025b9877
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
+        \\part 0 expects-private no
+        \\path {~/app.toml}
+        \\  owned own tui.keymap.global secret
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -498,14 +517,12 @@ test "commit golden: a capture-derived line routed to the machine fact" {
         \\--- home .config/mox/facts.toml
         \\email = "new@work.com"
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.zshrc} 1a57e47d5d6e8b1f
-        \\applied/{~/.zshrc} dc7273ea5fde9187
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.zshrc} c3ef5a550ec34bce
+        \\part 0 expects-private no
+        \\path {~/.zshrc}
+        \\  file 1a57e47d5d6e8b1f94150e7d3441aa020219170be74dcdc1339b887724e2c50e cache 1a57e47d5d6e8b1f94150e7d3441aa020219170be74dcdc1339b887724e2c50e
+        \\  provenance c3ef5a550ec34bce5f161694a9a102174a9067314eac51460e5556f77d031644
         \\
     ;
     try expectGolden(a, io, h, res, &.{".config/mox/facts.toml"}, want);
@@ -543,10 +560,11 @@ test "commit golden: a symlink target synced to its source" {
         \\== src/mylink
         \\/tmp/mox-new-target
         \\--- state
-        \\applied-symlink/
-        \\applied-symlink/{~/mylink} 2c653ee27eafb291
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
+        \\part 0 expects-private no
+        \\path {~/mylink}
+        \\  link /tmp/mox-new-target
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -592,19 +610,18 @@ test "commit golden: a generator leaf row routed to its data source" {
         \\key=<entry.value>
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.config/id-a.inc} c9232dba09b77625
-        \\applied-content/{~/.config/id-b.inc} c54aaff57e4c9a3a
-        \\applied/{~/.config/id-a.inc} 39062391789fb78d
-        \\applied/{~/.config/id-b.inc} 842bd0fb23659d60
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\generated/
-        \\generated/{~/.config/gen.inc} 4aa9bf20407edeb2
-        \\provenance/
-        \\provenance/{~/.config/id-a.inc} 6eeb23a77115120c
-        \\provenance/{~/.config/id-b.inc} 9abba5483ccaa232
+        \\generator {~/.config/gen.inc}
+        \\  produced %3CROOT%3E/home/.config/id-a.inc
+        \\  produced %3CROOT%3E/home/.config/id-b.inc
+        \\part 0 expects-private no
+        \\path {~/.config/id-a.inc}
+        \\  file c9232dba09b77625192b29437de8c466a066dde1247d566216f469e783bd6a3d cache c9232dba09b77625192b29437de8c466a066dde1247d566216f469e783bd6a3d
+        \\  provenance 6eeb23a77115120c0b8a9580945f2203efac2f01285e3545e8be2cf12691166c
+        \\path {~/.config/id-b.inc}
+        \\  file c54aaff57e4c9a3aaebe367b797714af71a09cd1e34cd70624f3706d4e492813 cache c54aaff57e4c9a3aaebe367b797714af71a09cd1e34cd70624f3706d4e492813
+        \\  provenance 9abba5483ccaa232cd8a09542174eaf96f128d0b936e8a8fd960a3f5e1a226db
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -643,17 +660,15 @@ test "commit golden: a token rename updates its coupled consumer" {
         \\== src/.mysigners
         \\new@example.com signing
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.myenv} 96306e5aea28e071
-        \\applied-content/{~/.mysigners} 901706149d79baf5
-        \\applied/{~/.myenv} 0b5e5d6e92744ecb
-        \\applied/{~/.mysigners} 74f093319c6bd297
         \\coupling/
         \\coupling/graph.json 9e9341024fa9f107
-        \\provenance/
-        \\provenance/{~/.myenv} 19605d5259d226c4
-        \\provenance/{~/.mysigners} b5dcd9333215086a
+        \\part 0 expects-private no
+        \\path {~/.myenv}
+        \\  file 96306e5aea28e071fad1f4427eeb6c57530c9c275b78aafc9c4c96184dae8b10 cache 96306e5aea28e071fad1f4427eeb6c57530c9c275b78aafc9c4c96184dae8b10
+        \\  provenance 19605d5259d226c4469afd29e3401c22a09193ba712b169d1bc15859af66c7a9
+        \\path {~/.mysigners}
+        \\  file 901706149d79baf51ee593771a9133a45d0e662f107c1d65f312a2c2e3808e5d cache 901706149d79baf51ee593771a9133a45d0e662f107c1d65f312a2c2e3808e5d
+        \\  provenance b5dcd9333215086a11b4f3a625f2c321514f5a0a4d083837f47cec5d686e60ea
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -689,14 +704,12 @@ test "commit golden: a first-contact file confirmed at the prompt" {
         \\export PROFILE=<machine.profile | default "work">
         \\export C=3
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.bashrc} c41026694098dd79
-        \\applied/{~/.bashrc} 3e27c644f944a619
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.bashrc} c2c96e0e4392555c
+        \\part 0 expects-private no
+        \\path {~/.bashrc}
+        \\  file c41026694098dd7919cf2ae9228fe7c57dd2ca33249ae9d0a18510d32d59c7e3 cache c41026694098dd7919cf2ae9228fe7c57dd2ca33249ae9d0a18510d32d59c7e3
+        \\  provenance c2c96e0e4392555c65584aa68571923d694331b9c8ec96ea607e1afbbd72c5cf
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -735,14 +748,12 @@ test "commit golden: a routed hunk beside a manual hunk in one file" {
         \\export MIDDLE=1
         \\export HOST=<machine.hostname>
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.zshrc} b7c91210a67218b5
-        \\applied/{~/.zshrc} cfc581c93da0b603
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.zshrc} 7308ebd4ad4d26f9
+        \\part 0 expects-private no
+        \\path {~/.zshrc}
+        \\  file 887eaf5c1a01ca60566ad05565bf987fbcf7838714621d3d0a55f581c4c6ef11 cache 887eaf5c1a01ca60566ad05565bf987fbcf7838714621d3d0a55f581c4c6ef11
+        \\  provenance 7308ebd4ad4d26f9a0b3c04dba73b2c6a09be8d628160f20d7d2c5a3d53b4cfd
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -798,17 +809,15 @@ test "commit golden: one data row edited through two loop files, routed in one a
         \\alias <entry.key>='<entry.expansion>'
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs2} fb428ae02a4f2e1e
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs2} 7e6479d8487d29f6
-        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json dd5d468c769ac4f0
-        \\provenance/
-        \\provenance/{~/.abbrs2} ac985625d9bb9bd2
-        \\provenance/{~/.abbrs} 5eabd410fa3bbe11
+        \\part 0 expects-private no
+        \\path {~/.abbrs2}
+        \\  file fb428ae02a4f2e1e4532618915488b30797598bb58b25beb15a3f148be11931a cache fb428ae02a4f2e1e4532618915488b30797598bb58b25beb15a3f148be11931a
+        \\  provenance ac985625d9bb9bd2918fd7e695b1c3b89c5cb9e55985597abbab049b062f2fd8
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance 5eabd410fa3bbe111172fa70e837bb735f3790a8f79b3d74711dfa2e6044cf6e
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -856,20 +865,18 @@ test "commit golden: one rename made in two files with a third sharing the token
         \\== src/.mysigners
         \\new@example.com signing
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.mycontacts} b74ec336d15e1515
-        \\applied-content/{~/.myenv} 96306e5aea28e071
-        \\applied-content/{~/.mysigners} 2ce71af7eb434a42
-        \\applied/{~/.mycontacts} 21e4130916b01b07
-        \\applied/{~/.myenv} 0b5e5d6e92744ecb
-        \\applied/{~/.mysigners} 66be2907da5f7189
         \\coupling/
         \\coupling/graph.json f5ece01951fbd549
-        \\provenance/
-        \\provenance/{~/.mycontacts} 2d69e2d15e8c0df4
-        \\provenance/{~/.myenv} 19605d5259d226c4
-        \\provenance/{~/.mysigners} b5dcd9333215086a
+        \\part 0 expects-private no
+        \\path {~/.mycontacts}
+        \\  file b74ec336d15e151525c86d37f0485e4c55017ec9dea1fe2d911a92ddd1930c30 cache b74ec336d15e151525c86d37f0485e4c55017ec9dea1fe2d911a92ddd1930c30
+        \\  provenance 2d69e2d15e8c0df4e2c1cde0c4f1b2e4511b70355a87e1f4c9bf8dae1c931ba2
+        \\path {~/.myenv}
+        \\  file 96306e5aea28e071fad1f4427eeb6c57530c9c275b78aafc9c4c96184dae8b10 cache 96306e5aea28e071fad1f4427eeb6c57530c9c275b78aafc9c4c96184dae8b10
+        \\  provenance 19605d5259d226c4469afd29e3401c22a09193ba712b169d1bc15859af66c7a9
+        \\path {~/.mysigners}
+        \\  file 2ce71af7eb434a428effb3ea691a717c78878e8f4a82b771466d55c6f84a5d0e cache 2ce71af7eb434a428effb3ea691a717c78878e8f4a82b771466d55c6f84a5d0e
+        \\  provenance b5dcd9333215086a11b4f3a625f2c321514f5a0a4d083837f47cec5d686e60ea
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -933,24 +940,23 @@ test "commit golden: a symlink, a generator leaf and a text file committed in on
         \\== src/mylink
         \\/tmp/mox-new-target
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.config/id-a.inc} 40ac730b26f0a164
-        \\applied-content/{~/.config/id-b.inc} e6077e23d07bf6e5
-        \\applied-content/{~/.zshrc} 3082dc99cc937277
-        \\applied-symlink/
-        \\applied-symlink/{~/mylink} 2c653ee27eafb291
-        \\applied/{~/.config/id-a.inc} acbd8c4e7eee44ca
-        \\applied/{~/.config/id-b.inc} 927578fab23ce82b
-        \\applied/{~/.zshrc} c106085c5981665b
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\generated/
-        \\generated/{~/.config/gen.inc} 4aa9bf20407edeb2
-        \\provenance/
-        \\provenance/{~/.config/id-a.inc} 6eeb23a77115120c
-        \\provenance/{~/.config/id-b.inc} 9abba5483ccaa232
-        \\provenance/{~/.zshrc} c6c6603f72035924
+        \\generator {~/.config/gen.inc}
+        \\  produced %3CROOT%3E/home/.config/id-a.inc
+        \\  produced %3CROOT%3E/home/.config/id-b.inc
+        \\part 0 expects-private no
+        \\path {~/.config/id-a.inc}
+        \\  file 40ac730b26f0a164a78eff3478a4e8ef0f1e48470e84535d7987fe3483588ce5 cache 40ac730b26f0a164a78eff3478a4e8ef0f1e48470e84535d7987fe3483588ce5
+        \\  provenance 6eeb23a77115120c0b8a9580945f2203efac2f01285e3545e8be2cf12691166c
+        \\path {~/.config/id-b.inc}
+        \\  file e6077e23d07bf6e5b11d8eb3d54e61a80532b10c0c87d3c7735caac83c08f0cf cache e6077e23d07bf6e5b11d8eb3d54e61a80532b10c0c87d3c7735caac83c08f0cf
+        \\  provenance 9abba5483ccaa232cd8a09542174eaf96f128d0b936e8a8fd960a3f5e1a226db
+        \\path {~/.zshrc}
+        \\  file 3082dc99cc937277c19a139865ea640ff58cea0e750c5b28f73ce920d77e0eca cache 3082dc99cc937277c19a139865ea640ff58cea0e750c5b28f73ce920d77e0eca
+        \\  provenance c6c6603f72035924e7b6257a64fe82372caa93f7366bbccdc3f3c62bb8451344
+        \\path {~/mylink}
+        \\  link /tmp/mox-new-target
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1003,17 +1009,15 @@ test "commit golden: two loop files edit different fields of one data row" {
         \\key: <entry.key>
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbr-expansions} 61e048bd9cc31695
-        \\applied-content/{~/.abbr-keys} e1abcf61834df7ea
-        \\applied/{~/.abbr-expansions} 5ab72ae5ec7ad95e
-        \\applied/{~/.abbr-keys} fb91bc97cd79d360
         \\coupling/
         \\coupling/graph.json 143cfab9a5a5b964
-        \\provenance/
-        \\provenance/{~/.abbr-expansions} c24477fb6fb8a9f4
-        \\provenance/{~/.abbr-keys} 88ce5a0792efbd57
+        \\part 0 expects-private no
+        \\path {~/.abbr-expansions}
+        \\  file 61e048bd9cc31695a3029a8606abc8423aba2981290df6881315b3e157aa3e97 cache 61e048bd9cc31695a3029a8606abc8423aba2981290df6881315b3e157aa3e97
+        \\  provenance c24477fb6fb8a9f42bd597fdffa5a1f009d13d17e2da31998ce9436f8698457a
+        \\path {~/.abbr-keys}
+        \\  file e1abcf61834df7eae9f6d6289ade7ac4be24f140953420bd3a7ec39d392ed0eb cache e1abcf61834df7eae9f6d6289ade7ac4be24f140953420bd3a7ec39d392ed0eb
+        \\  provenance 88ce5a0792efbd57ea9a9c37aa7a65b045f295ebd52120e96443700bde916b1c
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1060,17 +1064,15 @@ test "commit golden: a managed data file row edited through its loop and directl
         \\key = "gs"
         \\expansion = "git status -sb"
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied-content/{~/abbrs.toml} 23e0d3c836d135f7
-        \\applied/{~/.abbrs} 41b5a01af29747af
-        \\applied/{~/abbrs.toml} f8b912e7156b863f
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} aebc15626befc541
-        \\provenance/{~/abbrs.toml} 11c8f2ada989ca95
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance aebc15626befc541b68c955798a436bb62017e7837d45eedb72d289dbd65c345
+        \\path {~/abbrs.toml}
+        \\  file 23e0d3c836d135f789847f4dc5a60aea389a81c9b48e345f45c401a83b0ee83c cache 23e0d3c836d135f789847f4dc5a60aea389a81c9b48e345f45c401a83b0ee83c
+        \\  provenance 11c8f2ada989ca956846cffeebf41f2ccf2890ee0f840f8c7baba874dc06ac61
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1119,12 +1121,13 @@ test "commit golden: a partial file and a symlink committed in one run" {
         \\== src/mylink
         \\/tmp/mox-new-target
         \\--- state
-        \\applied-owned/
-        \\applied-owned/{~/app.toml} df8d7236025b9877
-        \\applied-symlink/
-        \\applied-symlink/{~/mylink} 2c653ee27eafb291
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
+        \\part 0 expects-private no
+        \\path {~/app.toml}
+        \\  owned own tui.keymap.global secret
+        \\path {~/mylink}
+        \\  link /tmp/mox-new-target
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1172,14 +1175,12 @@ test "commit golden: a loop row field edited beside a multi-line string holding 
         \\tool <entry.name>="<entry.cmd>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.tools} 599c3cd5917ae432
-        \\applied/{~/.tools} a8f3d5330273d2ce
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.tools} 50f0c6bdcb6b589f
+        \\part 0 expects-private no
+        \\path {~/.tools}
+        \\  file 599c3cd5917ae432374bd465262015cd245482207ce06e56f52019e05b4d1241 cache 599c3cd5917ae432374bd465262015cd245482207ce06e56f52019e05b4d1241
+        \\  provenance 50f0c6bdcb6b589f84e88ac27832394d4a3046d29ecaaceaaccbe76297235a9f
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1227,14 +1228,12 @@ test "commit golden: one file with two loops over one data source, one loop line
         \\alias <entry.expansion>
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.hosts} da58489fa57654f3
-        \\applied/{~/.hosts} d166a23c86b8608d
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.hosts} 0cb34f6197657b9c
+        \\part 0 expects-private no
+        \\path {~/.hosts}
+        \\  file da58489fa57654f3b78de31ab82ebf364d8b8d74df702e828d6875114ce49a07 cache da58489fa57654f3b78de31ab82ebf364d8b8d74df702e828d6875114ce49a07
+        \\  provenance 0cb34f6197657b9c37b2486d32e153cba7c0b03fa9a238dcaa2de019a3da327c
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1279,14 +1278,12 @@ test "commit golden: a bare field capture under a loop variable not named entry"
         \\abbr <key>="<expansion>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} c7296b38c1ab9bf9
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance c7296b38c1ab9bf92d449e676e443c9f428707c26d49c988bf655c14001417bc
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1331,12 +1328,12 @@ test "commit golden: a loop row edited beside a row whose data value resolves a 
         \\export <entry.name>=<entry.value>
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied/{~/.exports} 29699b753af0a7b0
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.exports} aa1d0b2afb890e36
+        \\part 0 expects-private no
+        \\path {~/.exports}
+        \\  file 7128997af61f937c0e69ef1d0627e5ce9c27596971727bab41cce7ba6609eec7 cache none
+        \\  provenance aa1d0b2afb890e362f6cb79a18416eab8625b826210e6d215ec4c59528a0b1ef
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1382,14 +1379,12 @@ test "commit golden: a first-contact loop file confirmed at the prompt with a ro
         \\abbr <entry.key>="<entry.expansion>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} 5eabd410fa3bbe11
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance 5eabd410fa3bbe111172fa70e837bb735f3790a8f79b3d74711dfa2e6044cf6e
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1435,12 +1430,12 @@ test "commit golden: a loop row edited in a file that resolves a secret" {
         \\abbr <entry.key>="<entry.expansion>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied/{~/.abbrs} 0f72e049784b8e06
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} 14389aecb957f8da
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 4f0c77cb7fa7df587c833d082580d74d7ef38d52bfa651e4f52aed83bc2f8af1 cache none
+        \\  provenance 14389aecb957f8da35d81b1f160ea7c8291c4b422dfe39ca6703f034409e1dba
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1490,14 +1485,12 @@ test "commit golden: two loops over one data source with disjoint where filters,
         \\abbr <entry.key>="<entry.expansion>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied/{~/.abbrs} 41b5a01af29747af
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} 5eabd410fa3bbe11
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance 5eabd410fa3bbe111172fa70e837bb735f3790a8f79b3d74711dfa2e6044cf6e
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1549,17 +1542,15 @@ test "commit golden: a managed data file row edited through its loop, another ro
         \\expansion = "git status -sb"
         \\note = "status"
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/.abbrs} 759912bfca82a599
-        \\applied-content/{~/abbrs.toml} 42cac2fc684eb169
-        \\applied/{~/.abbrs} 41b5a01af29747af
-        \\applied/{~/abbrs.toml} 3debab26fb235eac
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/.abbrs} aebc15626befc541
-        \\provenance/{~/abbrs.toml} 8343e82e82d9e99b
+        \\part 0 expects-private no
+        \\path {~/.abbrs}
+        \\  file 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834 cache 759912bfca82a5992eacefbf095bc264282830afe3c69f7b38251312a82a2834
+        \\  provenance aebc15626befc541b68c955798a436bb62017e7837d45eedb72d289dbd65c345
+        \\path {~/abbrs.toml}
+        \\  file 42cac2fc684eb169b9b9525b97a0e24e5911922bfb44bd6c79a7037cc4c96e15 cache 42cac2fc684eb169b9b9525b97a0e24e5911922bfb44bd6c79a7037cc4c96e15
+        \\  provenance 8343e82e82d9e99b9aef3b4a646ac137b73b5062429b933958a9f24b711fc087
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1611,17 +1602,15 @@ test "commit golden: a managed data file committed before its loop file, each ed
         \\abbr <entry.key>="<entry.expansion>"
         \\# mox: end
         \\--- state
-        \\applied/
-        \\applied-content/
-        \\applied-content/{~/abbrs.toml} 6a401119d05ed878
-        \\applied-content/{~/zabbrs} 10a0138cf5ed91f8
-        \\applied/{~/abbrs.toml} 9957d8bce1cea2b8
-        \\applied/{~/zabbrs} 16a84b369bc1ef04
         \\coupling/
         \\coupling/graph.json 353b9360c0adad2a
-        \\provenance/
-        \\provenance/{~/abbrs.toml} 8343e82e82d9e99b
-        \\provenance/{~/zabbrs} 5aeed2fd66143c80
+        \\part 0 expects-private no
+        \\path {~/abbrs.toml}
+        \\  file 6a401119d05ed87855bdbf980753d77f1117571ec6ad5919c0e551681d64a36c cache 6a401119d05ed87855bdbf980753d77f1117571ec6ad5919c0e551681d64a36c
+        \\  provenance 8343e82e82d9e99b9aef3b4a646ac137b73b5062429b933958a9f24b711fc087
+        \\path {~/zabbrs}
+        \\  file 10a0138cf5ed91f84655c728bbb1455fe1b8a2dde3c8110865596db052ceb3b3 cache 10a0138cf5ed91f84655c728bbb1455fe1b8a2dde3c8110865596db052ceb3b3
+        \\  provenance 5aeed2fd66143c801e0404d2ce67f19376d816b00debdf868698b2f0d137fc98
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
