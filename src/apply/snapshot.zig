@@ -288,7 +288,12 @@ pub fn saveTree(
     }
     const dest = try dirmodesPath(arena, snapshots_dir, id);
     if (std.fs.path.dirname(dest)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = manifest.items });
+    // One run may save several trees into one snapshot: each adds its own.
+    const prior = Io.Dir.cwd().readFileAlloc(io, dest, arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => "",
+        else => return e,
+    };
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dest, .data = try std.mem.concat(arena, u8, &.{ prior, manifest.items }) });
 }
 
 /// List snapshot ids, oldest first.
@@ -921,6 +926,38 @@ test "saveTree + restore round-trips directory modes and empty subdirs, leaving 
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast((try Io.Dir.cwd().statFile(io, try std.fs.path.join(a, &.{ root, "secret" }), .{})).permissions.toMode() & 0o777)));
     // The ancestor mox never captured is left exactly as it was.
     try std.testing.expectEqual(@as(u32, 0o701), try dirMode(io, ancestor));
+}
+
+test "saveTree: a second tree in one snapshot keeps the first tree's directory modes" {
+    if (!Io.File.Permissions.has_executable_bit) return; // no unix modes to preserve
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = try std.process.currentPathAlloc(io, a);
+    const base = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const home = try std.fs.path.join(a, &.{ base, "home" });
+    const snaps = try std.fs.path.join(a, &.{ base, "snaps" });
+    const one = try std.fs.path.join(a, &.{ home, "one" });
+    const two = try std.fs.path.join(a, &.{ home, "two" });
+    try Io.Dir.cwd().createDirPath(io, one);
+    try Io.Dir.cwd().createDirPath(io, two);
+    try write_mod.writeAtomic(io, try std.fs.path.join(a, &.{ one, "f" }), "1\n", 0o644);
+    try write_mod.writeAtomic(io, try std.fs.path.join(a, &.{ two, "f" }), "2\n", 0o644);
+    try write_mod.setMode(one, 0o700);
+    try write_mod.setMode(two, 0o750);
+
+    try saveTree(a, io, snaps, "id1", home, one);
+    try saveTree(a, io, snaps, "id1", home, two);
+    try Io.Dir.cwd().deleteTree(io, one);
+    try Io.Dir.cwd().deleteTree(io, two);
+
+    _ = try restore(a, io, snaps, "id1", home);
+    try std.testing.expectEqual(@as(u32, 0o700), try dirMode(io, one));
+    try std.testing.expectEqual(@as(u32, 0o750), try dirMode(io, two));
 }
 
 test "prune: drops a snapshot's directory-mode sidecar alongside its store" {
