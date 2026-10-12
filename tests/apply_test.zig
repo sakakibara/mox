@@ -8254,7 +8254,6 @@ test "apply: a symlink of every key format honours a false when gate" {
     try put(io, &tmp, "repo/.mox/attributes.toml",
         \\["a.json"]
         \\symlink = true
-        \\when = "os=plan9"
         \\
         \\["b.json"]
         \\symlink = true
@@ -8266,7 +8265,7 @@ test "apply: a symlink of every key format honours a false when gate" {
         \\symlink = true
         \\
     );
-    try put(io, &tmp, "repo/src/a.json", "/etc/hosts\n");
+    try put(io, &tmp, "repo/src/a.json", "// mox: when os=plan9\n/etc/hosts\n");
     try put(io, &tmp, "repo/src/b.json", "// mox: when os=plan9\n/etc/hosts\n");
     try put(io, &tmp, "repo/src/c.toml", "# mox: when os=plan9\n/etc/hosts\n");
     try put(io, &tmp, "repo/src/d.yaml", "# mox: when os=plan9\n/etc/hosts\n");
@@ -8483,4 +8482,19 @@ test "generator: a literal duplicate key is passed as written, one a key capture
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqualStrings("{\"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("lit-a.json")));
     try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/cap-a.json", "duplicate key"));
+}
+
+test "attributes: a symlink takes no directive key, whatever its key; its directives live in its head" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\"l.json\"]\nsymlink = true\nwhen = \"os=plan9\"\n");
+    try put(io, &tmp, "repo/src/l.json", "/etc/hosts\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/l.json", "when is a directive key, which a symlink takes as a head directive in its source"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath("l.json"), .{ .follow_symlinks = false }));
 }

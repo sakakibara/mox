@@ -54,11 +54,7 @@ pub fn composeFileTracked(
 ) !?[]u8 {
     // A symlink source holds its link target: text, never a document of its
     // key's format.
-    // Its attributes' `when` still decides whether the link is here at all.
     if (file.is_symlink and file.format != null) {
-        if (file.gate) |g| {
-            if (!dsl.axis.evaluate(try dsl.axis.parseString(arena, g), bindings)) return null;
-        }
         var as_text = file;
         as_text.format = null;
         as_text.gate = null;

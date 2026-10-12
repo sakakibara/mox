@@ -14,6 +14,8 @@ All notable changes to mox are documented here. The format follows
 - A strict-JSON target declares `own`, `disown`, `check`, `when` and
   `defaults` in its `.mox/attributes.toml` entry, where every other target
   writes head directives; fact discovery and the axis inventory read them.
+  A symlink, whatever its key, takes none of these attributes: its
+  directives live in the head of its source.
   Such a target needs no base: its attributes and overlays are a complete
   file.
 - A file whose source left the tree -- deleted, moved, or released -- is

@@ -316,14 +316,22 @@ fn validFactName(s: []const u8) bool {
 }
 
 /// Why `e`'s directive keys cannot be held for a target that is not strict
-/// JSON, naming the first one.
+/// JSON, or for a symlink of any key, naming the first one.
 fn directiveHome(e: Entry) []const u8 {
-    const tail = " is a directive key, which only a strict-JSON target takes; write it as a head directive in the file";
-    if (e.ownership == .own) return "own" ++ tail;
-    if (e.ownership == .disown) return "disown" ++ tail;
-    if (e.check.len > 0) return "check" ++ tail;
-    if (e.when != null) return "when" ++ tail;
-    return "defaults" ++ tail;
+    const names = [_][]const u8{ "own", "disown", "check", "when", "defaults" };
+    const link_tail = " is a directive key, which a symlink takes as a head directive in its source, whatever its key";
+    const json_tail = " is a directive key, which only a strict-JSON target takes; write it as a head directive in the file";
+    const which: usize = if (e.ownership == .own) 0 else if (e.ownership == .disown) 1 else if (e.check.len > 0) 2 else if (e.when != null) 3 else 4;
+    inline for (names, 0..) |n, k| {
+        if (k == which) return if (e.symlink) n ++ link_tail else n ++ json_tail;
+    }
+    unreachable;
+}
+
+/// True when `e` holds directive keys its target cannot take: one that is
+/// not strict JSON, or a symlink, whose directives live in its source.
+fn directivesMisplaced(e: Entry, key: []const u8) bool {
+    return e.hasDirectives() and (e.symlink or format_mod.resolve(key, e.jsonc) != .json);
 }
 
 /// Parse one entry's table. A schema violation is recorded in `err`, with the
@@ -390,7 +398,7 @@ fn parseEntry(arena: std.mem.Allocator, key: []const u8, tbl: anytype) !Entry {
         e.paths = l;
     }
     if (e.check.len > 0 and e.ownership == .none) return failedText(arena, e, "check requires own or disown in the same entry");
-    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return failedText(arena, e, directiveHome(e));
+    if (directivesMisplaced(e, key)) return failedText(arena, e, directiveHome(e));
     if (e.released and (e.mode != null or e.symlink or e.seed_once or e.jsonc or e.hasDirectives()))
         return failedText(arena, e, "released = true is a tombstone and takes no other keys");
     return e;
@@ -401,7 +409,7 @@ fn parseEntry(arena: std.mem.Allocator, key: []const u8, tbl: anytype) !Entry {
 /// -- checked as `load` checks them.
 pub fn invalidAt(e: Entry, key: []const u8) ?[]const u8 {
     if (e.jsonc and !format_mod.isJsonPath(key)) return "format = \"jsonc\" applies only to a .json path";
-    if (e.hasDirectives() and format_mod.resolve(key, e.jsonc) != .json) return directiveHome(e);
+    if (directivesMisplaced(e, key)) return directiveHome(e);
     return null;
 }
 

@@ -625,12 +625,14 @@ directives -- where the format has comments. Strict JSON has none, so a
 | JSONC (`.jsonc`, or `format = "jsonc"`) | head directive, `//` | head directive, `//` | line directive, `//` |
 | strict JSON (`.json`) | `own` / `disown` / `check` attribute | `when` attribute | `defaults` attribute |
 | generator source (`for ... into`, any key) | not allowed | the loop's own `when`, in its marker (`//` for a `.json` key) | not allowed |
+| symlink source (`symlink = true`, any key) | not allowed | head directive, its marker (`//` for a `.json` key) | line directive, its marker |
 | any other text file | not allowed | head directive, its marker | line directive, its marker |
 
 Each file has one home for its directives: a directive attribute on any
 target but strict JSON is refused ("write it as a head directive in the
-file"), and a `mox:` comment in a strict-JSON layer is refused naming its
-attribute. A generator source holds only its loop, so a directive outside
+file"), as it is on a symlink of any key, whose directives live in the head
+of its source; and a `mox:` comment in a strict-JSON layer is refused naming
+its attribute. A generator source holds only its loop, so a directive outside
 it is refused with the advice to gate the loop instead.
 
 ### Attributes (`.mox/attributes.toml`)
