@@ -214,10 +214,20 @@ fn parserFailure(arena: std.mem.Allocator, format: Format, text: []const u8, dis
             // A YAML file is a stream: zero documents, or several, are as
             // valid as one.
             var errs: std.ArrayList(yaml.Diagnostic) = .empty;
-            _ = yaml.parseStream(arena, text, .{ .errors = &errs }) catch |e| switch (e) {
+            var spans: yaml.Spans = .empty;
+            const docs = yaml.parseStream(arena, text, .{ .errors = &errs, .spans = &spans }) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => break :blk try fromSpan(text, errs.items, e),
             };
+            // YAML requires a mapping's keys to be unique; the parser keeps
+            // a repeat, so it is found here.
+            for (docs) |doc| {
+                if (try yamlDuplicate(arena, doc, "")) |dup| {
+                    const at: usize = if (spans.get(dup.path)) |sp| @min(@as(usize, @intCast(sp.start)), text.len) else 0;
+                    const lc = lineCol(text, lineOffset(text, lineCol(text, at).line));
+                    break :blk .{ .line = lc.line, .col = 1, .message = "duplicate key", .dup_key = dup.key };
+                }
+            }
             break :blk null;
         },
         .ini, .gitconfig => blk: {
@@ -240,6 +250,29 @@ fn fromSpan(text: []const u8, diags: anytype, e: anyerror) !Failure {
     var f: Failure = .{ .line = lc.line, .col = lc.col, .message = d.message, .err = e };
     if (std.mem.startsWith(u8, d.message, "duplicate key") and end > start) f.dup_key = unquoteKey(text[start..end]);
     return f;
+}
+
+const YamlDup = struct { key: []const u8, path: []const u8 };
+
+/// The first string key a YAML mapping repeats, with the dotted path of its
+/// value, or null.
+fn yamlDuplicate(arena: std.mem.Allocator, v: yaml.Value, path: []const u8) !?YamlDup {
+    switch (v) {
+        .map => |entries| {
+            var seen = std.StringHashMap(void).init(arena);
+            for (entries) |e| {
+                if (e.key != .string) continue;
+                const child = if (path.len == 0) e.key.string else try std.fmt.allocPrint(arena, "{s}.{s}", .{ path, e.key.string });
+                if ((try seen.getOrPut(e.key.string)).found_existing) return .{ .key = e.key.string, .path = child };
+                if (try yamlDuplicate(arena, e.value, child)) |d| return d;
+            }
+        },
+        .seq => |items| for (items, 0..) |item, i| {
+            if (try yamlDuplicate(arena, item, try std.fmt.allocPrint(arena, "{s}[{d}]", .{ path, i }))) |d| return d;
+        },
+        else => {},
+    }
+    return null;
 }
 
 /// A key token without its TOML/YAML/INI quotes.
@@ -609,4 +642,8 @@ test "quoteKey, errorWords and a reason with a secret" {
 test "a byte order mark gets its hint, and a layer's reason is the parser's own" {
     try expectFailure(.json, "\xEF\xBB\xBF{}\n", &.{ "s.json:1:1:", "strip the byte order mark" });
     try expectFailure(.toml, "a = 1\na = 2\n", &.{ "s.json:2:1:", "duplicate key \"a\"" });
+}
+
+test "a YAML mapping that repeats a key is refused naming it" {
+    try expectFailure(.yaml, "a: 1\nb:\n  c: 1\n  c: 2\n", &.{ "s.json:4:1:", "duplicate key \"c\"" });
 }

@@ -803,7 +803,9 @@ In the JSON family, a duplicate object key is refused where mox could have
 made it: in a layer of a multi-layer merge, which parsing would silently
 reduce to its last value, and in output where a key capture expanded. A
 single layer with no key capture is passed to its program as written: JSON
-permits duplicate keys, and what they mean is the program's call.
+permits duplicate keys, and what they mean is the program's call. TOML and
+YAML require a mapping's keys to be unique, so a repeated key is refused in
+any layer or output of those formats.
 
 A layer of a merge is read before captures expand, so a bare capture in a
 merged TOML or YAML layer is reported at its line and column with a hint to

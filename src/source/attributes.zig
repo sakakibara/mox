@@ -485,7 +485,14 @@ pub fn parseFailureNamed(arena: std.mem.Allocator, io: Io, root: []const u8, nam
         error.OutOfMemory => return e,
         else => {
             if (errs.items.len == 0) return generic;
-            const start: usize = @min(@as(usize, @intCast(errs.items[0].span.start)), content.len);
+            var start: usize = @min(@as(usize, @intCast(errs.items[0].span.start)), content.len);
+            // A line that goes on after a complete header or value is
+            // reported against that token; the error is what follows it.
+            if (std.mem.startsWith(u8, errs.items[0].message, "expected newline")) {
+                var i: usize = @min(@as(usize, @intCast(errs.items[0].span.end)), content.len);
+                while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+                if (i < content.len and content[i] != '\n') start = i;
+            }
             var line: usize = 1;
             var line_start: usize = 0;
             for (content[0..start], 0..) |c, i| if (c == '\n') {
@@ -962,4 +969,17 @@ test "write: a file holding a comment is refused, never rewritten" {
 
     const plain = try loadText(a, &tmp, "[\".ssh/config\"]\nmode = \"0600\" \n");
     try testing.expect(!plain.has_comment);
+}
+
+test "parseFailure: the column of a key after a table header" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, ".mox");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".mox/attributes.toml", .data = "[\"t\"] key = 1\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try testing.expectEqualStrings(".mox/attributes.toml:1:7: expected newline", try parseFailure(a, io, root));
 }
