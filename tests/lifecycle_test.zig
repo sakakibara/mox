@@ -1458,7 +1458,7 @@ test "doctor: detects a malformed state file" {
     try std.testing.expect(std.mem.indexOf(u8, r.out, "bad-provenance") != null);
 }
 
-test "doctor: a malformed attributes.toml skips the checks that read it, and the report is not healthy" {
+test "doctor: an attributes.toml that is not valid TOML stops the report with exit 2" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1471,9 +1471,8 @@ test "doctor: a malformed attributes.toml skips the checks that read it, and the
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "not valid toml [[[\n");
 
     const r = try h.run(&.{ "mox", "doctor" });
-    // A check that could not run is not a clean bill: the rc gates on it.
-    try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "check(s) skipped") != null);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox doctor: .mox/attributes.toml:1:") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "healthy") == null);
 }
 
@@ -6397,4 +6396,30 @@ test "orphans: a manifest from an aliased HOME, or an untagged one, is left alon
     try std.testing.expect(exists(io, untagged));
     try std.testing.expect(exists(io, leaf));
     try std.testing.expect((try mox.apply.applied.read(a, io, h.state, leaf)) != null);
+}
+
+test "attributes: a repo or private attributes file that is not valid TOML exits 2 in every command" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    for ([_][]const u8{ "repo/.mox/attributes.toml", "state/private/.mox/attributes.toml" }) |where| {
+        try writeRepo(io, &tmp, where, "[\".a\"]\nmode =\n");
+        for ([_][]const u8{ "apply", "status", "diff", "commit", "doctor" }) |cmd| {
+            const r = try h.run(&.{ "mox", cmd });
+            if (r.rc != 2 or std.mem.indexOf(u8, r.err, "attributes.toml:2:") == null) {
+                std.debug.print("{s} {s}: rc {d}\n{s}\n{s}\n", .{ where, cmd, r.rc, r.out, r.err });
+                return error.WrongExit;
+            }
+            try std.testing.expect(std.mem.indexOf(u8, r.out, "rebuilt provenance") == null);
+        }
+        try Io.Dir.cwd().deleteFile(io, try std.fs.path.join(a, &.{ h.root, where }));
+    }
+    const fix = try h.run(&.{ "mox", "doctor", "--rebuild-provenance" });
+    try std.testing.expect(fix.rc != 2);
 }

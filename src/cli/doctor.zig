@@ -70,6 +70,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
 
+    // An attributes file that is not valid TOML stops every command.
+    for ([_][2][]const u8{ .{ context.paths.repo_dir, ".mox/attributes.toml" }, .{ context.paths.private_dir, "private .mox/attributes.toml" } }) |f| {
+        if (try mox.source.attributes.tomlFailure(ctx.alloc, ctx.io, f[0], f[1])) |why| {
+            try ctx.err.print("mox doctor: {s}\n", .{why});
+            return 2;
+        }
+    }
+
     // A dedicated capture solely for the legacy-extras notice: every other
     // capture in this command tolerates its own failure independently (a
     // fact.toml problem must skip only the checks that need machine state,
@@ -226,7 +234,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     if (rebuild_prov) {
-        const rebuilt = try rebuildProvenance(ctx, src_dir);
+        const rebuilt = (try rebuildProvenance(ctx, src_dir)) orelse return 2;
         try ctx.out.print("  rebuilt provenance for {d} recorded file(s)\n", .{rebuilt});
         // A successful rebuild re-writes every recorded file's provenance, so
         // re-check whether any malformed records remain.
@@ -721,8 +729,9 @@ fn provenanceInSync(recorded: [mox.apply.applied.hash_hex_len]u8, composed: []co
 }
 
 /// Recompose every managed file that has a last-applied record and re-persist
-/// its provenance (and applied records). Returns the number rebuilt.
-fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
+/// its provenance (and applied records). Returns the number rebuilt, or null
+/// after reporting a private layer that cannot be merged.
+fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !?usize {
     const context = ctx.context.?;
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
     var bindings_map = try mox.machine.bindings.fromMachineState(ctx.alloc, m_state);
@@ -732,7 +741,7 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 
     const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch return 0;
-    const tree = (try apply_cmd.mergePrivate(ctx, "mox doctor", base_tree)) orelse return 2;
+    const tree = (try apply_cmd.mergePrivate(ctx, "mox doctor", base_tree)) orelse return null;
 
     var rebuilt: usize = 0;
     for (tree.files) |file| {

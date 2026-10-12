@@ -475,6 +475,22 @@ pub fn parseFailure(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]c
     return parseFailureNamed(arena, io, repo_dir, ".mox/attributes.toml");
 }
 
+/// Where and why the attributes file under `root` is not valid TOML, named
+/// `name`, or null when it is absent or parses.
+pub fn tomlFailure(arena: std.mem.Allocator, io: Io, root: []const u8, name: []const u8) !?[]const u8 {
+    const path = try std.fs.path.join(arena, &.{ root, ".mox", "attributes.toml" });
+    const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        error.OutOfMemory => return e,
+        else => return try parseFailureNamed(arena, io, root, name),
+    };
+    _ = toml.parse(arena, content, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return try parseFailureNamed(arena, io, root, name),
+    };
+    return null;
+}
+
 /// `parseFailure` for the attributes file under `root`, named `name`.
 pub fn parseFailureNamed(arena: std.mem.Allocator, io: Io, root: []const u8, name: []const u8) ![]const u8 {
     const generic = try std.fmt.allocPrint(arena, "{s}: not valid TOML", .{name});

@@ -276,7 +276,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         error.TomlParseError,
         => {
             try ctx.err.print("mox status: {s}\n", .{try mox.source.attributes.parseFailure(ctx.alloc, ctx.io, context.paths.repo_dir)});
-            return 1;
+            return 2;
         },
         else => return e,
     };
