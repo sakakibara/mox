@@ -6253,3 +6253,25 @@ test "status and diff preview the files of a generator that left the tree" {
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=a") != null);
     try std.testing.expect(std.mem.indexOf(u8, d.out, "edited") == null);
 }
+
+test "private: an attributes file that is not valid TOML is located and every command exits 2" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".mine\"]\nmode =\n");
+    for ([_][]const u8{ "apply", "status", "diff", "commit" }) |cmd| {
+        const r = try h.run(&.{ "mox", cmd });
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        const want = try std.fmt.allocPrint(a, "mox {s}: private .mox/attributes.toml:2:", .{cmd});
+        if (std.mem.indexOf(u8, r.err, want) == null) {
+            std.debug.print("{s}\n", .{r.err});
+            return error.NotLocated;
+        }
+    }
+}

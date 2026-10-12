@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const edit = @import("edit.zig");
@@ -67,7 +68,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         else => return e,
     };
 
-    const merged = try mox.private.layer.merge(ctx.alloc, ctx.io, tree, context.paths.private_dir, context.paths.home);
+    const merged = (try apply_cmd.mergePrivate(ctx, "mox remove", tree)) orelse return 2;
     const repo_file = fileops.findByLive(tree, live_path);
     // A path the repo does not manage belongs to the private layer alone.
     const private_only = repo_file == null;

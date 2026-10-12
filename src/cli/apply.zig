@@ -388,7 +388,7 @@ fn applyPass(
     // Every record this run writes names the repo it came from.
     const repo_tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
 
-    const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+    const tree = (try mergePrivate(ctx, "mox apply", base_tree)) orelse return 2;
 
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
     const home = m_state.home;
@@ -1937,6 +1937,19 @@ const StaleInput = struct {
 /// with its records forgotten. A released path is forgotten and never
 /// removed; an ignored one is left alone; the same file as a managed path
 /// (a case-only rename) is forgotten, nothing removed.
+/// The repo tree with the private layer merged, or null after naming where
+/// the private attributes file is not valid TOML: every command then exits 2.
+pub fn mergePrivate(ctx: *app.Ctx, cmd: []const u8, base_tree: mox.source.tree.ManagedTree) !?mox.source.tree.ManagedTree {
+    const context = ctx.context.?;
+    return mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, context.paths.home) catch |e| switch (e) {
+        error.TomlParseError => {
+            try ctx.err.print("{s}: {s}\n", .{ cmd, try mox.source.attributes.parseFailureNamed(ctx.alloc, ctx.io, context.paths.private_dir, "private .mox/attributes.toml") });
+            return null;
+        },
+        else => return e,
+    };
+}
+
 /// One tombstone this machine cannot match, as status and apply print it.
 pub fn printUnmatched(out: *std.Io.Writer, u: mox.apply.stale.Unmatched, home: []const u8) !void {
     try out.print("  WARN    released {f} matches nothing mox manages", .{display.of(u.live_path, home)});

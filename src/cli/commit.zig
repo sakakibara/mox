@@ -40,6 +40,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const paths_mod = @import("paths.zig");
 const lock_mod = @import("lock.zig");
@@ -1315,7 +1316,7 @@ fn commitRun(
         },
         else => return e,
     };
-    const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+    const tree = (try apply_cmd.mergePrivate(ctx, "mox commit", base_tree)) orelse return 2;
 
     // `bindings` is what every hypothetical configuration below clones
     // (cross-configuration verification, impact analysis); seed its static

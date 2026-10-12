@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const edit = @import("edit.zig");
@@ -72,7 +73,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         return 1;
     };
 
-    const merged = try mox.private.layer.merge(ctx.alloc, ctx.io, tree, context.paths.private_dir, context.paths.home);
+    const merged = (try apply_cmd.mergePrivate(ctx, "mox mv", tree)) orelse return 2;
     if (fileops.privateVaries(merged, file)) {
         try ctx.err.print("mox mv: {s}: the private layer still varies this file; move or remove its private overlays first\n", .{old_name});
         return 1;

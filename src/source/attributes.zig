@@ -472,8 +472,13 @@ pub fn load(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) !Attributes 
 /// Where and why `<repo_dir>/.mox/attributes.toml` is not valid TOML:
 /// `.mox/attributes.toml:<line>:<col>: <reason>`.
 pub fn parseFailure(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]const u8 {
-    const generic = ".mox/attributes.toml: not valid TOML";
-    const path = try std.fs.path.join(arena, &.{ repo_dir, ".mox", "attributes.toml" });
+    return parseFailureNamed(arena, io, repo_dir, ".mox/attributes.toml");
+}
+
+/// `parseFailure` for the attributes file under `root`, named `name`.
+pub fn parseFailureNamed(arena: std.mem.Allocator, io: Io, root: []const u8, name: []const u8) ![]const u8 {
+    const generic = try std.fmt.allocPrint(arena, "{s}: not valid TOML", .{name});
+    const path = try std.fs.path.join(arena, &.{ root, ".mox", "attributes.toml" });
     const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_bytes)) catch return generic;
     var errs: std.ArrayList(toml.Diagnostic) = .empty;
     _ = toml.parse(arena, content, .{ .errors = &errs }) catch |e| switch (e) {
@@ -487,7 +492,7 @@ pub fn parseFailure(arena: std.mem.Allocator, io: Io, repo_dir: []const u8) ![]c
                 line += 1;
                 line_start = i + 1;
             };
-            return std.fmt.allocPrint(arena, ".mox/attributes.toml:{d}:{d}: {s}", .{ line, start - line_start + 1, errs.items[0].message });
+            return std.fmt.allocPrint(arena, "{s}:{d}:{d}: {s}", .{ name, line, start - line_start + 1, errs.items[0].message });
         },
     };
     return generic;

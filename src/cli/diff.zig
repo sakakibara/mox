@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
@@ -232,7 +233,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         },
         else => return e,
     };
-    const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+    const tree = (try apply_cmd.mergePrivate(ctx, "mox diff", base_tree)) orelse return 2;
 
     const ruleset = try mox.source.ignore.load.load(ctx.alloc, ctx.io, context.paths.repo_dir, &bindings, &m_state);
     const home = m_state.home;

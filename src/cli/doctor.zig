@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const cli = @import("cli");
+const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
@@ -731,7 +732,7 @@ fn rebuildProvenance(ctx: *app.Ctx, src_dir: []const u8) !usize {
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
 
     const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch return 0;
-    const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+    const tree = (try apply_cmd.mergePrivate(ctx, "mox doctor", base_tree)) orelse return 2;
 
     var rebuilt: usize = 0;
     for (tree.files) |file| {

@@ -219,7 +219,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // says what is wrong with it here too, rather than surfacing a bare
     // `InvalidEntry` and leaving the reader to guess which file it meant.
     const base_tree = (try apply_cmd.walkTreeOrReport(ctx, "mox export", src_dir, m_state.home)) orelse return 2;
-    const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, base_tree, context.paths.private_dir, m_state.home);
+    const tree = (try apply_cmd.mergePrivate(ctx, "mox export", base_tree)) orelse return 2;
     if (as_tuple) |tuple| {
         // A value nothing in the tree names composes with every gate on that
         // axis closed and reports success; say so, since a mistyped value

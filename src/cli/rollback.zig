@@ -84,11 +84,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             else => return e,
         };
         if (base_tree) |bt| {
-            const tree = try mox.private.layer.merge(ctx.alloc, ctx.io, bt, context.paths.private_dir, context.paths.home);
-            for (tree.files) |f| {
+            const merged = mox.private.layer.merge(ctx.alloc, ctx.io, bt, context.paths.private_dir, context.paths.home) catch |e| switch (e) {
+                error.TomlParseError => blk: {
+                    try ctx.err.print("mox rollback: warning: {s}; whole-file restores proceed, partial targets cannot be re-patched\n", .{try mox.source.attributes.parseFailureNamed(ctx.alloc, ctx.io, context.paths.private_dir, "private .mox/attributes.toml")});
+                    break :blk null;
+                },
+                else => return e,
+            };
+            if (merged) |tree| for (tree.files) |f| {
                 if (f.own_paths.len == 0) continue;
                 try partials.put(f.live_path, f);
-            }
+            };
         }
     }
 
