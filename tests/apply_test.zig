@@ -8470,3 +8470,24 @@ test "status and diff: a file a live generator no longer produces is shown as ap
     const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/Id-two.inc") != null);
 }
+
+test "apply and status: an unreadable source is labelled the same way by both" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/.r", "r\n");
+    try put(io, &tmp, "state/private/.secret", "s\n");
+    const c = try cliSetup(a, io, &tmp);
+    const src = try std.fs.path.join(a, &.{ c.state, "private", ".secret" });
+    try Io.Dir.cwd().setFilePermissions(io, src, Io.File.Permissions.fromMode(0o000), .{});
+    defer Io.Dir.cwd().setFilePermissions(io, src, Io.File.Permissions.fromMode(0o644), .{}) catch {};
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(lineHasBoth(st.out, "~/.secret", "compose failed: AccessDenied"));
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(lineHasBoth(r.err, "~/.secret", "compose failed: AccessDenied"));
+}

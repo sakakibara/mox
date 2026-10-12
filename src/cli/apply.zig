@@ -2781,7 +2781,13 @@ fn applyGenerator(
     const shown = try display.alloc(ctx.alloc, file.live_path, home);
     var diag: mox.compose.interp.Diag = .{};
     const gen = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, bindings, m_state, secrets, &diag) catch |e| {
-        try ctx.err.print("mox apply: {s}: generator failed: {s}\n", .{ shown, @errorName(e) });
+        // A source that cannot be read is no generator failure yet: report
+        // it as status and diff do.
+        const what = switch (e) {
+            error.AccessDenied, error.PermissionDenied, error.IsDir, error.NotDir, error.FileNotFound => "compose failed",
+            else => "generator failed",
+        };
+        try ctx.err.print("mox apply: {s}: {s}: {s}\n", .{ shown, what, @errorName(e) });
         try ctx.err.flush();
         if (diag.capture()) |cap|
             try ctx.err.print("mox apply:   failing item: {s}\n", .{cap});
