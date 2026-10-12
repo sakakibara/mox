@@ -130,58 +130,48 @@ fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool)
     try w.writeAll(".\n");
 }
 
-/// The generators a run composed, and what they produce now: a manifest
-/// named in `known` is no orphan, and a path in `keep` is still produced.
-pub const Generators = struct {
-    known: std.StringHashMap(void),
-    keep: std.StringHashMap(void),
-
-    pub fn init(arena: std.mem.Allocator) Generators {
-        return .{ .known = .init(arena), .keep = .init(arena) };
-    }
-};
-
-/// The files of every generator that left the tree, as the orphan sweep
-/// would reach them, keyed as status and diff report them.
-pub fn orphansOf(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, gens: *Generators) ![]const mox.apply.generated.Orphan {
-    const context = ctx.context.?;
-    for (tree.files) |f| try gens.keep.put(f.live_path, {});
-    var released_names: std.StringHashMap(void) = .init(ctx.alloc);
-    for (tree.released) |p| try released_names.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(p)), {});
-    const released_live = try mox.apply.stale.releasedSet(ctx.alloc, tree.released);
-    const links = try mox.apply.stale.managedLinks(ctx.alloc, tree.files);
-    return mox.apply.generated.orphanLeaves(ctx.alloc, ctx.io, .{
-        .state_dir = context.paths.state_dir,
-        .snapshots_dir = context.paths.snapshots_dir,
-        .snap_id = "",
-        .home = context.paths.home,
-        .force = false,
-        .dry_run = true,
-        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
-        .released = &released_names,
-        .released_live = &released_live,
-        .links = &links,
-    }, &gens.known, &gens.keep);
+/// What the orphan sweep would do, judged exactly as apply judges it:
+/// `scan` is what this run learned of the tree's generators.
+pub fn orphanPlan(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan) ![]const mox.apply.generated.OrphanManifest {
+    for (tree.files) |f| try scan.kept(f.live_path);
+    const opts = try apply_cmd.orphanOptions(ctx, tree, ruleset, "", false, true);
+    return mox.apply.generated.planOrphans(ctx.alloc, ctx.io, opts, scan);
 }
 
 fn orphanRows(
     ctx: *app.Ctx,
     tree: mox.source.tree.ManagedTree,
-    gens: *Generators,
+    ruleset: *const mox.source.ignore.match.RuleSet,
+    scan: *mox.apply.generated.OrphanScan,
     rows: *std.Io.Writer,
     tally: *Tally,
     units: *std.ArrayList(mox.apply.drift.Unit),
 ) !void {
     const home = ctx.context.?.paths.home;
-    for (try orphansOf(ctx, tree, gens)) |o| {
-        const shown = try display.alloc(ctx.alloc, o.leaf, home);
-        if (o.clean) {
-            tally.add(.stale);
-            try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.stale.text(), shown });
-        } else {
-            tally.add(.drift);
-            try units.append(ctx.alloc, mox.apply.drift.vanished(o.leaf));
-            try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.drift.text(), shown });
+    for (try orphanPlan(ctx, tree, ruleset, scan)) |m| {
+        if (m.released) continue;
+        for (m.leaves) |leaf| {
+            const shown = try display.alloc(ctx.alloc, leaf.path, home);
+            switch (leaf.verdict) {
+                .gone, .ignored => {},
+                .remove => {
+                    tally.add(.stale);
+                    try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.stale.text(), shown });
+                },
+                .linked_parent => {
+                    tally.add(.stale);
+                    try rows.print("  {s:<8} {s} (its generator left the tree; {s})\n", .{ Label.stale.text(), shown, mox.apply.parent_link.reason });
+                },
+                .drift => {
+                    tally.add(.drift);
+                    try units.append(ctx.alloc, mox.apply.drift.vanished(leaf.path));
+                    try rows.print("  {s:<8} {s} (its generator left the tree)\n", .{ Label.drift.text(), shown });
+                },
+                .refused => {
+                    tally.add(.err);
+                    try rows.print("  {s:<8} {s} (its generator left the tree, not a file mox wrote)\n", .{ Label.err.text(), shown });
+                },
+            }
         }
     }
 }
@@ -325,7 +315,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // does (same classifier, `apply/drift.zig`) -- fed to the shared renderer
     // below so the two commands' drift summaries can never disagree.
     var units: std.ArrayList(mox.apply.drift.Unit) = .empty;
-    var gens: Generators = .init(ctx.alloc);
+    var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
     if (a.paths.len == 0) for (try mox.apply.stale.unmatchedTombstones(ctx.alloc, ctx.io, context.paths.state_dir, tree)) |u|
         try @import("apply.zig").printUnmatched(rows, u, home);
     if (a.paths.len == 0) for (tree.entry_errors) |e| {
@@ -339,29 +329,21 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still reports.
         if (file.head_error.len > 0) {
-            try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
+            try scan.walked(ctx.alloc, file.live_path);
             tally.add(.err);
             try rows.print("  {s:<8} {s} ({s})\n", .{ Label.err.text(), shown, file.head_error });
             continue;
         }
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so status has nothing to report for it.
+        var gdiag: mox.compose.interp.Diag = .{};
+        const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag);
+        try apply_cmd.scanGenerator(ctx, &scan, &ruleset, file.live_path, gen_out);
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
         if (ruleset.isPathIgnored(rel, false)) continue;
         // A GENERATOR: report each file in its current produced set with its
         // own clean/OUTDATED/DRIFT/MISSING state, one line per produced path.
         {
-            var gdiag: mox.compose.interp.Diag = .{};
-            const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| err: {
-                try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
-                break :err e;
-            };
-            if (gen_out) |maybe| {
-                if (maybe) |outs| {
-                    try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
-                    for (outs) |o| try gens.keep.put(o.live_path, {});
-                }
-            } else |_| {}
             if (gen_out catch |e| {
                 if (gdiag.capture()) |cap| {
                     try rows.print("  {s:<8} {s} (compose failed: {s}: {s})\n", .{ Label.err.text(), shown, @errorName(e), cap });
@@ -526,7 +508,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // Files whose source left the tree, as apply's sweeps would judge them.
     if (a.paths.len == 0) {
         try staleRows(ctx, tree, &ruleset, rows, &tally, &units);
-        try orphanRows(ctx, tree, &gens, rows, &tally, &units);
+        try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
     }
 
     // One order for every consumer -- the report and both serializers -- so

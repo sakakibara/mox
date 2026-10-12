@@ -735,30 +735,15 @@ fn applyPass(
     // count toward the exit code but do not add a report row; the existing
     // per-leaf message (kept, unmuted) is the only place this surfaces.
     if (sweep_ok) {
-        var known: std.StringHashMap(void) = .init(ctx.alloc);
-        for (gen_states.items) |g| {
-            try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(g.live_path)), {});
-        }
-        for (files) |f| {
-            if (f.head_error.len > 0) {
-                try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(f.live_path)), {});
-            }
-        }
-        for (compose_failed.items) |p| {
-            try known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(p)), {});
-        }
-        const swept = try mox.apply.generated.sweepOrphans(ctx.alloc, ctx.io, .{
-            .state_dir = context.paths.state_dir,
-            .snapshots_dir = context.paths.snapshots_dir,
-            .snap_id = snap_id,
-            .home = context.paths.home,
-            .force = force,
-            .dry_run = dry_run,
-            .repo = repo_tag,
-            .released = &released_names,
-            .released_live = &released_live,
-            .links = &tree_links,
-        }, &known, &keep_set, ctx.out, ctx.err);
+        var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
+        var kit = keep_set.keyIterator();
+        while (kit.next()) |p| try scan.kept(p.*);
+        for (gen_states.items) |g| try scan.walked(ctx.alloc, g.live_path);
+        for (files) |f| if (f.head_error.len > 0) try scan.walked(ctx.alloc, f.live_path);
+        for (compose_failed.items) |p| try scan.walked(ctx.alloc, p);
+        const orphan_opts = try orphanOptions(ctx, tree, &ruleset, snap_id, force, dry_run);
+        const plan = try mox.apply.generated.planOrphans(ctx.alloc, ctx.io, orphan_opts, &scan);
+        const swept = try mox.apply.generated.sweepOrphans(ctx.alloc, ctx.io, orphan_opts, plan, ctx.out, ctx.err);
         counts.removed += swept.removed;
         if (swept.removed > 0 and !dry_run) snapshotted = true;
         counts.fail += swept.error_refused;
@@ -1938,6 +1923,47 @@ const StaleInput = struct {
 /// with its records forgotten. A released path is forgotten and never
 /// removed; an ignored one is left alone; the same file as a managed path
 /// (a case-only rename) is forgotten, nothing removed.
+/// The options every orphan sweep and its preview judge with.
+pub fn orphanOptions(ctx: *app.Ctx, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, snap_id: []const u8, force: bool, dry_run: bool) !mox.apply.generated.Options {
+    const context = ctx.context.?;
+    const released_names = try ctx.alloc.create(std.StringHashMap(void));
+    released_names.* = .init(ctx.alloc);
+    for (tree.released) |p| try released_names.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(p)), {});
+    const released_live = try ctx.alloc.create(std.StringHashMap(void));
+    released_live.* = try mox.apply.stale.releasedSet(ctx.alloc, tree.released);
+    const links = try ctx.alloc.create(std.StringHashMap(void));
+    links.* = try mox.apply.stale.managedLinks(ctx.alloc, tree.files);
+    return .{
+        .state_dir = context.paths.state_dir,
+        .snapshots_dir = context.paths.snapshots_dir,
+        .snap_id = snap_id,
+        .home = context.paths.home,
+        .force = force,
+        .dry_run = dry_run,
+        .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
+        .released = released_names,
+        .released_live = released_live,
+        .links = links,
+        .ruleset = ruleset,
+    };
+}
+
+/// Record in `scan` what status and diff learned of `live` by composing it
+/// as a generator, the way apply's run records it: a generator's files
+/// that no ignore rule matches are kept, a failed one's prior files too.
+pub fn scanGenerator(ctx: *app.Ctx, scan: *mox.apply.generated.OrphanScan, ruleset: *const mox.source.ignore.match.RuleSet, live: []const u8, gen_out: anyerror!?[]mox.compose.catB.GeneratedFile) !void {
+    const context = ctx.context.?;
+    const outs = (gen_out catch {
+        try scan.failed(ctx.alloc, ctx.io, context.paths.state_dir, live);
+        return;
+    }) orelse return;
+    try scan.walked(ctx.alloc, live);
+    for (outs) |o| {
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, context.paths.home, o.live_path);
+        if (!ruleset.isPathIgnored(rel, false)) try scan.kept(o.live_path);
+    }
+}
+
 /// The repo tree with the private layer merged, or null after naming where
 /// the private attributes file is not valid TOML: every command then exits 2.
 pub fn mergePrivate(ctx: *app.Ctx, cmd: []const u8, base_tree: mox.source.tree.ManagedTree) !?mox.source.tree.ManagedTree {

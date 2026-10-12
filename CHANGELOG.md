@@ -108,9 +108,10 @@ All notable changes to mox are documented here. The format follows
   reads a new symlink record as clean and rewrites it in its own one-line
   form, which names no repo, so that symlink is never swept until the
   upgraded binary's next apply tags it again.
-- State is shared across repos, so the first apply after upgrading still
-  sweeps another repo's untagged generator manifests, as every apply did
-  before; once tagged, they are never swept again.
+- A generator manifest written before this release names no repo and is
+  never swept. The first apply that still produces the generator rewrites
+  its manifest tagged; a generator that left the tree before the upgrade
+  keeps its files, no longer tracked.
 
 ### Fixed
 - apply's summary counts a generator's dropped files, an orphaned

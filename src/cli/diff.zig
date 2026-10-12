@@ -263,16 +263,19 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(e.live_path, home), e.err });
         refused = true;
     };
-    var gens: status_mod.Generators = .init(ctx.alloc);
+    var scan: mox.apply.generated.OrphanScan = .init(ctx.alloc);
     for (files) |file| {
         // A head declaration the walk could not honor is this file's error
         // alone; every other file still diffs.
         if (file.head_error.len > 0) {
-            try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
+            try scan.walked(ctx.alloc, file.live_path);
             try ctx.err.print("  ERROR   {f} ({s})\n", .{ display.of(file.live_path, ctx.context.?.paths.home), file.head_error });
             if (file.head_error_attrs) refused = true;
             continue;
         }
+        var gdiag: mox.compose.interp.Diag = .{};
+        const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag);
+        try apply_cmd.scanGenerator(ctx, &scan, &ruleset, file.live_path, gen_out);
         // A tracked source matching an ignore rule (itself or a containing
         // directory) is never applied, so diff has nothing to compare it against.
         const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, file.live_path);
@@ -286,17 +289,6 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // clause. Diff what it produces -- the same set status reports and
         // apply writes -- rather than erroring on the generator itself.
         {
-            var gdiag: mox.compose.interp.Diag = .{};
-            const gen_out = mox.compose.catB.composeGenerator(ctx.alloc, ctx.io, file, &bindings, &m_state, secrets, &gdiag) catch |e| err: {
-                try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
-                break :err e;
-            };
-            if (gen_out) |maybe| {
-                if (maybe) |outs| {
-                    try gens.known.put(try ctx.alloc.dupe(u8, &mox.apply.generated.manifestName(file.live_path)), {});
-                    for (outs) |o| try gens.keep.put(o.live_path, {});
-                }
-            } else |_| {}
             if (gen_out catch |e| {
                 try ctx.err.print("mox diff: {f}: compose failed: {s}\n", .{ display.of(file.live_path, ctx.context.?.paths.home), @errorName(e) });
                 if (gdiag.capture()) |cap|
@@ -369,9 +361,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             } else try diffOne(ctx, context.paths.state_dir, sty, stat_mode, c.live_path, "", &.{}, &total, &changed);
         }
         // A file of a generator that left the tree, which apply would remove.
-        for (try status_mod.orphansOf(ctx, tree, &gens)) |o| {
-            if (!o.clean) continue;
-            try diffOne(ctx, context.paths.state_dir, sty, stat_mode, o.leaf, "", &.{}, &total, &changed);
+        for (try status_mod.orphanPlan(ctx, tree, &ruleset, &scan)) |m| {
+            if (m.released) continue;
+            for (m.leaves) |leaf| {
+                if (leaf.verdict != .remove) continue;
+                try diffOne(ctx, context.paths.state_dir, sty, stat_mode, leaf.path, "", &.{}, &total, &changed);
+            }
         }
     }
 

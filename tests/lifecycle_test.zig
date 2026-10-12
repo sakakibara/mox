@@ -6318,3 +6318,83 @@ test "rollback: a symlink mox planted is restored over, a user's link is not" {
     try std.testing.expectEqual(@as(u8, 1), r3.rc);
     try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf(".rc"), &buf)]);
 }
+
+test "orphans: status, diff and apply --dry-run judge an orphaned generator's files alike, honouring .moxignore" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/src/.config/kept.inc", "# mox: for id in \"data/ids.toml\" into \"kp-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n\n[[ids]]\nslug = \"b\"\n\n[[ids]]\nslug = \"c\"\n\n[[ids]]\nslug = \"d\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // g.inc leaves the tree: a stays clean, b is edited, c becomes a symlink,
+    // d is ignored. kept.inc is ignored as a source: apply still walks it.
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/id-b.inc"), .data = "edited\n" });
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".config/id-c.inc"));
+    try Io.Dir.cwd().symLink(io, "/etc/hosts", try h.liveOf(".config/id-c.inc"), .{});
+    try writeRepo(io, &tmp, "repo/.moxignore", ".config/id-d.inc\n.config/kept.inc\n");
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(lineWith(s.out, "STALE", "~/.config/id-a.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/id-b.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/id-c.inc (its generator left the tree)"));
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "id-d.inc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "kp-") == null);
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d.out, "kp-") == null);
+    const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-a.inc (generated, no longer produced)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-b.inc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-c.inc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-d.inc") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/kp-") == null);
+    _ = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(!exists(io, try h.liveOf(".config/id-a.inc")));
+    try std.testing.expectEqualStrings("k=d\n", try read(io, a, try h.liveOf(".config/id-d.inc")));
+    try std.testing.expect(exists(io, try h.liveOf(".config/kp-a.inc")));
+}
+
+test "orphans: a manifest from an aliased HOME, or an untagged one, is left alone" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.config/g.inc", "# mox: for id in \"data/ids.toml\" into \"id-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
+    // HOME spelled through a symlinked ancestor, as /tmp is to /private/tmp.
+    const alias_root = try std.fs.path.join(a, &.{ h.root, "aliasroot" });
+    try Io.Dir.cwd().symLink(io, h.root, alias_root, .{});
+    const alias = try std.fs.path.join(a, &.{ alias_root, std.fs.path.basename(h.home) });
+    const aliased = try h.otherHome(alias);
+    try std.testing.expectEqual(@as(u8, 0), (try aliased.run(&.{ "mox", "apply" })).rc);
+
+    // An untagged manifest in the v0.12.4 form, for a generator never in the tree.
+    const leaf = try h.liveOf(".config/old.inc");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = leaf, .data = "old\n" });
+    try mox.apply.applied.record(a, io, h.state, leaf, "old\n", "");
+    const untagged = try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try h.liveOf(".config/old-gen.inc")) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = untagged, .data = try std.fmt.allocPrint(a, "{s}\n", .{leaf}) });
+
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "a parent directory is a symlink") == null);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "generated", &mox.apply.generated.manifestName(try std.fs.path.join(a, &.{ alias, ".config", "g.inc" })) })));
+    try std.testing.expect(exists(io, untagged));
+    try std.testing.expect(exists(io, leaf));
+    try std.testing.expect((try mox.apply.applied.read(a, io, h.state, leaf)) != null);
+}

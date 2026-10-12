@@ -846,7 +846,11 @@ HOMEs share a state directory. After the walk, `mox apply` finds the records
 of this repo and HOME whose path no managed file -- repo or private layer,
 gated-off ones included, since a gate is not removal -- and no generator
 manifest names: a source that was deleted, moved, or released. The sweep of
-an orphaned generator's files takes only manifests of this repo and HOME.
+an orphaned generator's files takes only manifests of this repo and HOME
+that list no file outside it; an untagged manifest, written before manifests
+named their repo, is never swept. Both sweeps leave a `.moxignore`-matched
+file alone, and `status` and `diff` judge every such file exactly as the
+sweep would.
 
 - An unedited whole file or symlink is removed, snapshot-first, so `mox
   rollback` recovers it; an edited one is drift, kept until it is named:

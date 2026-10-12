@@ -25,6 +25,8 @@ const parent_link = @import("parent_link.zig");
 const write = @import("write.zig");
 const prov_map = @import("../provenance/root.zig").map;
 const dirent = @import("../source/dirent.zig");
+const source_path = @import("../source/path.zig");
+const ignore_match = @import("../source/ignore/match.zig");
 
 const max_content_bytes: usize = 64 * 1024 * 1024;
 
@@ -53,6 +55,9 @@ pub const Options = struct {
     /// Live paths the tree plants as symlinks: a leaf below one is never
     /// removed.
     links: ?*const std.StringHashMap(void) = null,
+    /// The ignore rules: an orphaned generator's file they match is left
+    /// alone, as the stale sweep leaves one.
+    ruleset: ?*const ignore_match.RuleSet = null,
 };
 
 pub const Result = struct {
@@ -179,111 +184,150 @@ pub fn manifestName(gen_live: []const u8) [64]u8 {
     return applied.contentHashHex(gen_live);
 }
 
-/// Prune ORPHANED manifests: every manifest in `<state>/generated/` whose
-/// name is not in `known` belongs to a generator that left the tree -- its
-/// source was deleted outside `mox remove`, or the file no longer parses as
-/// a generator. Each orphan's listed leaves are pruned against `keep`
-/// (snapshot-first, drift-refusing, exactly like a live generator's prune),
-/// then the manifest itself is dropped. A manifest another repo tagged is
-/// left alone; an untagged one is swept. A
-/// generator `.mox/attributes.toml` released has its manifest and its leaves'
-/// records forgotten, the leaves kept. Callers skip this sweep on a scoped
-/// apply (an unwalked generator is not an orphan) and in a run where any file
-/// failed to compose or carried a head error.
+/// What one apply run knows about generators, for the orphan sweep: the
+/// manifest names of every generator it walked (composed, failed or
+/// undecided), and every live path still produced or managed. apply, status
+/// and diff build it the same way, so they judge the same orphans.
+pub const OrphanScan = struct {
+    known: std.StringHashMap(void),
+    keep: std.StringHashMap(void),
+
+    pub fn init(arena: std.mem.Allocator) OrphanScan {
+        return .{ .known = .init(arena), .keep = .init(arena) };
+    }
+
+    /// A managed file's live path, or a file a generator produces this run.
+    pub fn kept(self: *OrphanScan, live: []const u8) !void {
+        try self.keep.put(live, {});
+    }
+
+    /// A file walked as a generator, or whose nature is undecided this run
+    /// (a head error, a failed compose): its manifest is no orphan.
+    pub fn walked(self: *OrphanScan, arena: std.mem.Allocator, live: []const u8) !void {
+        try self.known.put(try arena.dupe(u8, &manifestName(live)), {});
+    }
+
+    /// A generator that failed to compose: walked, and its prior files kept.
+    pub fn failed(self: *OrphanScan, arena: std.mem.Allocator, io: Io, state_dir: []const u8, live: []const u8) !void {
+        try self.walked(arena, live);
+        for (try readManifest(arena, io, state_dir, live)) |leaf| try self.keep.put(leaf, {});
+    }
+};
+
+/// How the orphan sweep judges one file of an orphaned generator.
+pub const LeafVerdict = enum {
+    /// Already gone: its records are forgotten.
+    gone,
+    /// Below a symlinked directory: left in place, its records forgotten.
+    linked_parent,
+    /// A path `.moxignore` matches: not mox's to touch.
+    ignored,
+    /// Now a directory, a special file, or unreadable: refused.
+    refused,
+    /// Now a symlink, or edited since mox wrote it: drift.
+    drift,
+    /// Unedited: removed, snapshot-first.
+    remove,
+};
+
+pub const PlannedLeaf = struct { path: []const u8, verdict: LeafVerdict };
+
+/// One orphaned manifest: released by a tombstone (its records forgotten,
+/// its files kept), or its files as the sweep would judge them.
+pub const OrphanManifest = struct {
+    path: []const u8,
+    released: bool,
+    leaves: []const PlannedLeaf,
+};
+
+/// Judge one file the way `removeLeaf` acts on it.
+pub fn judgeLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []const u8) !LeafVerdict {
+    if (parent_link.through(io, opts.home, live_path, opts.links)) return .linked_parent;
+    if (opts.ruleset) |rs| {
+        if (rs.isPathIgnored(try source_path.liveKeyRelToHome(arena, opts.home, live_path), false)) return .ignored;
+    }
+    switch (applied.inspectSymSite(io, arena, live_path)) {
+        .absent => return .gone,
+        .directory => return .refused,
+        .symlink => return .drift,
+        .other => {},
+    }
+    if (write.guardLiveRead(io, live_path) == .special) return .refused;
+    const content = Io.Dir.cwd().readFileAlloc(io, live_path, arena, .limited(max_content_bytes)) catch |e| switch (e) {
+        error.FileNotFound => return .gone,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .refused,
+    };
+    const rec = try applied.read(arena, io, opts.state_dir, live_path);
+    const clean = if (rec) |r| std.mem.eql(u8, &r, &applied.contentHashHex(content)) else false;
+    return if (clean) .remove else .drift;
+}
+
+/// Every orphaned manifest in `<state>/generated/` and what the sweep would
+/// do with it: a manifest `scan` does not know, tagged with `opts.repo`.
+/// An untagged manifest, another repo's or HOME's, or one listing a file
+/// outside this run's HOME is never an orphan here.
+pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts: Options, scan: *const OrphanScan) ![]const OrphanManifest {
+    var out: std.ArrayList(OrphanManifest) = .empty;
+    const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
+    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
+    outer: for (entries) |entry| {
+        if (entry.kind != .file or scan.known.contains(entry.name)) continue;
+        const path = try std.fs.path.join(arena, &.{ gen_dir_path, entry.name });
+        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
+        const r = (try repoOf(arena, bytes)) orelse continue;
+        if (!std.mem.eql(u8, r, opts.repo)) continue;
+        const leaves = try leavesOf(arena, bytes);
+        for (leaves) |leaf| if (!parent_link.underHome(leaf, opts.home)) continue :outer;
+        const released = if (try generatorOf(arena, bytes)) |g|
+            (if (opts.released_live) |rl| rl.contains(try stale.foldCase(arena, g)) else false)
+        else if (opts.released) |rel| rel.contains(entry.name) else false;
+        var planned: std.ArrayList(PlannedLeaf) = .empty;
+        for (leaves) |leaf| {
+            if (scan.keep.contains(leaf)) continue;
+            try planned.append(arena, .{ .path = leaf, .verdict = if (released) .gone else try judgeLeaf(arena, io, opts, leaf) });
+        }
+        try out.append(arena, .{ .path = path, .released = released, .leaves = try planned.toOwnedSlice(arena) });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Act on `plan`: a released manifest's files are forgotten and kept, and
+/// the manifest dropped; every other manifest's files are removed as
+/// `removeLeaf` decides, an ignored one left alone. A manifest is dropped
+/// only when nothing of it was refused or left, so the next apply retries.
+/// Callers skip this sweep on a scoped apply and in a run where anything
+/// failed.
 pub fn sweepOrphans(
     arena: std.mem.Allocator,
     io: Io,
     opts: Options,
-    known: *const std.StringHashMap(void),
-    keep: *const std.StringHashMap(void),
+    plan: []const OrphanManifest,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !Result {
     var result: Result = .{};
-    const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
-
-    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return result;
-
-    for (entries) |entry| {
-        if (entry.kind != .file) continue;
-        if (known.contains(entry.name)) continue;
-        const name = entry.name;
-        const path = try std.fs.path.join(arena, &.{ gen_dir_path, name });
-        const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_content_bytes)) catch continue;
-        if (try repoOf(arena, bytes)) |r| {
-            if (!std.mem.eql(u8, r, opts.repo)) continue;
-        }
-        const leaves = try leavesOf(arena, bytes);
-        const released = if (try generatorOf(arena, bytes)) |g|
-            (if (opts.released_live) |rl| rl.contains(try stale.foldCase(arena, g)) else false)
-        else if (opts.released) |rel| rel.contains(name) else false;
-        {
-            if (released) {
-                if (!opts.dry_run) {
-                    for (leaves) |leaf| {
-                        if (keep.contains(leaf)) continue;
-                        try forgetRecords(arena, io, opts.state_dir, leaf);
-                    }
-                    Io.Dir.cwd().deleteFile(io, path) catch {};
-                }
-                continue;
+    for (plan) |m| {
+        if (m.released) {
+            if (!opts.dry_run) {
+                for (m.leaves) |leaf| try forgetRecords(arena, io, opts.state_dir, leaf.path);
+                Io.Dir.cwd().deleteFile(io, m.path) catch {};
             }
+            continue;
         }
         var all_removed = true;
-        for (leaves) |leaf| {
-            if (keep.contains(leaf)) continue;
+        for (m.leaves) |leaf| {
+            if (leaf.verdict == .ignored) {
+                all_removed = false;
+                continue;
+            }
             const before = result.drift_refused + result.error_refused;
-            try removeLeaf(arena, io, opts, leaf, stdout, stderr, &result);
+            try removeLeaf(arena, io, opts, leaf.path, stdout, stderr, &result);
             if (result.drift_refused + result.error_refused > before) all_removed = false;
         }
-        // Keep the manifest while any leaf was refused (drifted or
-        // unsnapshottable), so the next apply retries instead of orphaning
-        // the leaf itself.
-        if (all_removed and !opts.dry_run) {
-            Io.Dir.cwd().deleteFile(io, path) catch {};
-        }
+        if (all_removed and !opts.dry_run) Io.Dir.cwd().deleteFile(io, m.path) catch {};
     }
     return result;
-}
-
-/// A file an orphaned generator produced that the orphan sweep would
-/// reach: `clean` when it is what mox last wrote (removed), else drift.
-pub const Orphan = struct { leaf: []const u8, clean: bool };
-
-/// What `sweepOrphans` would do, for status and diff: every existing leaf
-/// of a manifest of `opts.repo` (or an untagged one) whose name is not in
-/// `known`, not released
-/// and not in `keep`, less any below a symlinked directory.
-pub fn orphanLeaves(
-    arena: std.mem.Allocator,
-    io: Io,
-    opts: Options,
-    known: *const std.StringHashMap(void),
-    keep: *const std.StringHashMap(void),
-) ![]const Orphan {
-    var out: std.ArrayList(Orphan) = .empty;
-    const gen_dir_path = try std.fs.path.join(arena, &.{ opts.state_dir, "generated" });
-    const entries = dirent.sortedPath(arena, io, gen_dir_path, .{ .iterate = true }) catch return &.{};
-    for (entries) |entry| {
-        if (entry.kind != .file or known.contains(entry.name)) continue;
-        const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ gen_dir_path, entry.name }), arena, .limited(max_content_bytes)) catch continue;
-        if (try repoOf(arena, bytes)) |r| {
-            if (!std.mem.eql(u8, r, opts.repo)) continue;
-        }
-        const released = if (try generatorOf(arena, bytes)) |g|
-            (if (opts.released_live) |rl| rl.contains(try stale.foldCase(arena, g)) else false)
-        else if (opts.released) |rel| rel.contains(entry.name) else false;
-        if (released) continue;
-        for (try leavesOf(arena, bytes)) |leaf| {
-            if (keep.contains(leaf) or parent_link.through(io, opts.home, leaf, opts.links)) continue;
-            if (write.guardLiveRead(io, leaf) == .special) continue;
-            const content = Io.Dir.cwd().readFileAlloc(io, leaf, arena, .limited(max_content_bytes)) catch continue;
-            const rec = try applied.read(arena, io, opts.state_dir, leaf);
-            const clean = if (rec) |h| std.mem.eql(u8, &h, &applied.contentHashHex(content)) else false;
-            try out.append(arena, .{ .leaf = leaf, .clean = clean });
-        }
-    }
-    return out.toOwnedSlice(arena);
 }
 
 /// Remove every prior-set path not in `keep`, snapshot-first. `keep` holds the
