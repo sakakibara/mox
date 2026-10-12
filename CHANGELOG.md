@@ -15,7 +15,8 @@ All notable changes to mox are documented here. The format follows
   `defaults` in its `.mox/attributes.toml` entry, where every other target
   writes head directives; fact discovery and the axis inventory read them.
   A symlink, whatever its key, takes none of these attributes: its
-  directives live in the head of its source.
+  directives live in the head of its source. A directive key on any other
+  target is that file's error, naming the key and where the directive goes.
   Such a target needs no base: its attributes and overlays are a complete
   file.
 - A file whose source left the tree -- deleted, moved, or released -- is
@@ -160,10 +161,12 @@ All notable changes to mox are documented here. The format follows
   only, and doctor reports it. `mox private retire` stops expecting it. A
   private layer that is a symlink to a directory is followed instead of
   failing with `NotDir`.
+- An attributes entry that names neither a managed file nor a generated one
+  is a warning in `status` and `apply`.
 - An iCloud placeholder for a file not downloaded (`.name.icloud`) is junk,
   never a source.
-- A record whose live path is now a directory mox never wrote is forgotten
-  once, with a note, instead of failing every run.
+- A record whose live path is now a directory is forgotten once, with a
+  note, instead of failing every run.
 
 ### Upgrading
 - In a JSON-family generator template, a capture outside a string with a
@@ -182,6 +185,9 @@ All notable changes to mox are documented here. The format follows
 - A record written before records named their repo is never swept: a file
   deleted, drifted or gated off before the upgrade stays as it was, and the
   first apply after upgrading tags every file it still produces.
+- On a downgrade, 0.12.4 sees the snapshots rollback takes of what it
+  replaces as ordinary ones: a bare `mox rollback` may pick one, and its
+  prune leaves their `.undo` notes behind.
 - Downgrading after the upgrade keeps symlinks working: an older binary
   reads a new symlink record as clean and rewrites it in its own one-line
   form, which names no repo, so that symlink is never swept until the
@@ -203,8 +209,7 @@ All notable changes to mox are documented here. The format follows
   generator's files and an exact directory's removed entries in
   "removed"; it reported "0 removed" for a run that removed only those.
 - An attributes file that is not valid TOML is reported with its line,
-  column and reason, and a directive key on a target that is not strict
-  JSON names the key.
+  column and reason.
 
 ## [0.12.4] - 2026-10-11
 

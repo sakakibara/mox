@@ -632,6 +632,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         try droppedRows(ctx, try judgeDropped(ctx, tree, &ruleset, &scan, dropped.items), rows, &tally, &units);
         try orphanRows(ctx, tree, &ruleset, &scan, rows, &tally, &units);
         try untaggedRows(ctx, tree, rows, &scan);
+        try apply_cmd.warnUnmatchedEntries(ctx, rows, tree, &scan.keep);
     }
 
     // One order for every consumer -- the report and both serializers -- so

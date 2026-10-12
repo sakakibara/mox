@@ -791,6 +791,7 @@ fn applyPass(
             .dry_run = dry_run,
         }, &units, &counts, &snapshotted);
     }
+    if (!scoped) try warnUnmatchedEntries(ctx, ctx.out, tree, &produced);
     if (!scoped and !dry_run) try mox.apply.stale.markTombstones(ctx.alloc, ctx.io, context.paths.state_dir, repo_tag, tree.released);
 
     // Exact-directory sweep: after every managed file is written, remove live
@@ -1934,6 +1935,36 @@ fn notePrivate(ctx: *app.Ctx) !void {
     if (!try mox.private.expect.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir)) return;
     const tag = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home);
     try mox.private.expect.note(ctx.alloc, ctx.io, context.paths.state_dir, tag);
+}
+
+/// Warn, in `out`, of each attributes entry -- the repo's or the private
+/// layer's -- that names neither a managed file nor one a generator
+/// produces (`produced`, live paths). A tombstone and an entry that breaks
+/// the schema are reported elsewhere.
+pub fn warnUnmatchedEntries(ctx: *app.Ctx, out: *std.Io.Writer, tree: mox.source.tree.ManagedTree, produced: *const std.StringHashMap(void)) !void {
+    const context = ctx.context.?;
+    var managed = std.StringHashMap(void).init(ctx.alloc);
+    for (tree.files) |f| try managed.put(f.live_path, {});
+    for (tree.entry_errors) |e| try managed.put(e.live_path, {});
+    for ([_]struct { []const u8, []const u8 }{ .{ context.paths.repo_dir, "attributes" }, .{ context.paths.private_dir, "private attributes" } }) |layer| {
+        const attrs = mox.source.attributes.load(ctx.alloc, ctx.io, layer[0]) catch continue;
+        var keys: std.ArrayList([]const u8) = .empty;
+        var it = attrs.map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.released or e.value_ptr.err.len > 0) continue;
+            try keys.append(ctx.alloc, e.key_ptr.*);
+        }
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn f(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.f);
+        for (keys.items) |key| {
+            const live = try mox.source.path.joinKeyOnto(ctx.alloc, context.paths.home, key);
+            if (managed.contains(live) or produced.contains(live)) continue;
+            try out.print("  WARN    {s} entry [\"{s}\"] matches no source\n", .{ layer[1], key });
+        }
+    }
 }
 
 /// True after naming an attributes file, the repo's or the private

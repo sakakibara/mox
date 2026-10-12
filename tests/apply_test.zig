@@ -8618,3 +8618,23 @@ test "generator: a secret in the into path is a compose error naming its positio
     var it = dir.iterate();
     while (try it.next(io)) |e| try std.testing.expect(std.mem.indexOf(u8, e.name, "hunter") == null);
 }
+
+test "attributes: an entry that matches no source is a warning in status and apply" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try put(io, &tmp, "repo/src/.r", "r\n");
+    try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
+    try put(io, &tmp, "repo/src/.config/g.json", "// mox: for id in \"data/ids.toml\" into \"x-<id.slug>.json\"\n{}\n// mox: end\n");
+    try put(io, &tmp, "repo/.mox/attributes.toml", "[\".config/x-a.json\"]\nformat = \"jsonc\"\n\n[\".gone\"]\nmode = \"0600\"\n\n[\".r\"]\nmode = \"0600\"\n");
+    const c = try cliSetup(a, io, &tmp);
+    const st = try c.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "WARN    attributes entry [\".gone\"] matches no source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "x-a.json\"] matches no source") == null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "[\".r\"] matches") == null);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "WARN    attributes entry [\".gone\"] matches no source") != null);
+}

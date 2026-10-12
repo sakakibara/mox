@@ -684,6 +684,10 @@ format = "jsonc"
 - **Released.** `released = true` is the tombstone `mox remove` leaves (see
   Sources that leave the tree). It takes no other key.
 
+An entry that names neither a managed file nor a file a generator produces
+is a warning in `status` and `apply` (`WARN attributes entry ["<key>"]
+matches no source`), a tombstone excepted.
+
 An entry that breaks the schema -- an unknown key, a wrong type, a directive
 key on a target that is not strict JSON -- is that file's error alone: it is
 reported as the file's `ERROR`, and every other file still applies. One with
