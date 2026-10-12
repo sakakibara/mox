@@ -7748,3 +7748,41 @@ test "validation: no byte of a resolved secret reaches any command's output when
         try std.testing.expect(std.mem.indexOf(u8, res.out, "tokzq") == null and std.mem.indexOf(u8, res.err, "tokzq") == null);
     }
 }
+
+test "json capture: a TOML inf is a compose error naming its key, and a float follows the JavaScript number form" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/data/n.toml", "big = 1e300\nhuge = inf\nhalf = 0.5\n");
+    try put(io, &tmp, "repo/src/ok.json", "{\"b\": \"<data.n.big>\", \"h\": \"<data.n.half>\"}\n");
+    try put(io, &tmp, "repo/src/bad.json", "{\"x\": \"<data.n.huge>\"}\n");
+    const c = try cliSetup(a, io, &tmp);
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(lineHasBoth(r.err, "~/bad.json", "NotRepresentableInJson"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "data.n.huge is inf, not representable in JSON") != null);
+    try std.testing.expectEqualStrings("{\"b\": 1e+300, \"h\": 0.5}\n", try read(io, a, try c.homePath("ok.json")));
+}
+
+test "capture: text interpolation renders every data type exactly as before typed JSON captures existed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Expected bytes are what mox rendered before captures were typed.
+    try put(io, &tmp, "repo/data/n.toml", "i = 42\nneg = -7\nf1 = 0.0001\nf2 = 100000.0\nf3 = 1e300\nf4 = -0.0\nf5 = 1.5\nf6 = 3.0\nf7 = 1e-7\nf8 = 123456789.125\nf9 = 0.1\nb = true\ns = \"str\"\nd = 1979-05-27T07:32:00Z\nld = 1979-05-27\nlt = 07:32:00\n");
+    try put(io, &tmp, "repo/src/.vals", "i=<data.n.i>\nneg=<data.n.neg>\nf1=<data.n.f1>\nf2=<data.n.f2>\nf3=<data.n.f3>\nf4=<data.n.f4>\nf5=<data.n.f5>\nf6=<data.n.f6>\nf7=<data.n.f7>\nf8=<data.n.f8>\nf9=<data.n.f9>\nb=<data.n.b>\ns=<data.n.s>\nd=<data.n.d>\nld=<data.n.ld>\nlt=<data.n.lt>\n");
+    try put(io, &tmp, "repo/src/num.json", "{\"f1\": \"<data.n.f1>\", \"f2\": \"<data.n.f2>\", \"f3\": \"<data.n.f3>\", \"f4\": \"<data.n.f4>\", \"f6\": \"<data.n.f6>\", \"f7\": \"<data.n.f7>\", \"f8\": \"<data.n.f8>\", \"i\": \"<data.n.i>\"}\n");
+    const c = try cliSetup(a, io, &tmp);
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("i=42\nneg=-7\nf1=0.0001\nf2=100000.0\nf3=1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.0\nf4=-0.0\nf5=1.5\nf6=3.0\nf7=0.0000001\nf8=123456789.125\nf9=0.1\nb=true\ns=str\nd=1979-05-27T07:32:00Z\nld=1979-05-27\nlt=07:32:00\n", try read(io, a, try c.homePath(".vals")));
+    // A typed JSON number follows JavaScript's Number-to-string rule.
+    try std.testing.expectEqualStrings("{\"f1\": 0.0001, \"f2\": 100000, \"f3\": 1e+300, \"f4\": 0, \"f6\": 3, \"f7\": 1e-7, \"f8\": 123456789.125, \"i\": 42}\n", try read(io, a, try c.homePath("num.json")));
+}

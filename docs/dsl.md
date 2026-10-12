@@ -298,10 +298,11 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   private layer shadows the repo, exactly as `mox data` resolves it).
   `KEY` is a top-level key; `<data.FILE.TABLE.KEY>` reads a scalar one table
   deep. Only these two depths exist. A string renders as its exact bytes, an
-  integer/bool as its TOML literal; a JSON string that is the capture alone
-  emits the value in its own JSON type (see Captures in JSON). A missing file or key is a compose error
-  unless a `default` rescues it; a non-scalar value (array/table) is always an
-  error, even with a default.
+  integer/bool as its TOML literal, a float in decimal notation with a
+  fractional part (`1.5`, `3.0`, `0.0001`); a JSON string that is the
+  capture alone emits the value in its own JSON type (see Captures in JSON).
+  A missing file or key is a compose error unless a `default` rescues it; a
+  non-scalar value (array/table) is always an error, even with a default.
 - `<a | b | c>` - a chain: first non-empty member wins.
 - `<a | default "x">` - literal fallback when the chain is empty.
 - `<secret:URI>` - resolve a secret and splice its value mid-line. The schemes
@@ -355,10 +356,14 @@ with no chain and no default, emits the scalar in its own JSON type:
 
 composes to `{ "port": 8080, "debug": false }` when `data/server.toml` holds
 `port = 8080` and `debug = false`. A TOML integer or float becomes a number, a
-bool a bool, a string a string, and a date-time stays a string. The type is
-the value's as resolved, so a private `data/` file that shadows it with
-another TOML type changes the emitted type too; store a TOML string to keep a
-string. Anything else -- a chain, a default, text around the capture, a key
+bool a bool, a string a string, and a date-time stays a string. A number is
+written as JavaScript writes it: the shortest digits that read back as the
+same value, in decimal notation for 1e-7 <= |x| < 1e21 (`100000`, `0.0001`,
+`3`) and in exponent notation otherwise (`1e+300`, `1e-7`). A TOML `inf`
+or `nan`, which JSON cannot hold, is a compose error naming the capture. The
+type is the value's as resolved, so a private `data/` file that shadows it
+with another TOML type changes the emitted type too; store a TOML string to
+keep a string. Anything else -- a chain, a default, text around the capture, a key
 -- is a string. A key capture that expands to a key its object already holds
 is refused (see Validation). A capture written outside a string
 (`"port": <data.server.port>`) is not JSON and is refused, with the hint to

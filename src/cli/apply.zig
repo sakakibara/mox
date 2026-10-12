@@ -76,6 +76,7 @@ fn captureOrReport(ctx: *app.Ctx, env: mox.env.Env, repo_dir: []const u8, privat
 /// errors a user can act on; apply and export print the same one.
 pub fn explainComposeError(w: *std.Io.Writer, prefix: []const u8, e: anyerror) !void {
     switch (e) {
+        error.NotRepresentableInJson => try w.print("{s}:   JSON has no inf or nan: store a finite number, or a TOML string to emit a string\n", .{prefix}),
         error.UnknownShell => try w.print("{s}:   accepted shells: fish, zsh, bash, powershell\n", .{prefix}),
         error.ReservedAxisName => try w.print("{s}:   \"path\" is a reserved axis name; the path= axis no longer exists\n", .{prefix}),
         error.SecretEmpty => try w.print("{s}:   the backend answered with nothing; refusing to write an empty credential over a working one (check the entry exists and is populated)\n", .{prefix}),

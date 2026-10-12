@@ -101,9 +101,11 @@ pub fn expand(
                 switch (sc.kind) {
                     .integer, .boolean => try out.appendSlice(arena, sc.text),
                     .float => if (finiteNumber(sc.text))
-                        try out.appendSlice(arena, sc.text)
-                    else
-                        try appendJsonString(arena, &out, sc.text),
+                        try out.appendSlice(arena, try jsNumber(arena, std.fmt.parseFloat(f64, sc.text) catch unreachable))
+                    else {
+                        if (ctx.diag) |d| d.set(try std.fmt.allocPrint(arena, "{s} is {s}, not representable in JSON", .{ content[1 .. content.len - 1], sc.text }));
+                        return error.NotRepresentableInJson;
+                    },
                     .string, .datetime => try appendJsonString(arena, &out, sc.text),
                 }
                 continue;
@@ -130,6 +132,57 @@ fn nextIsColon(rest: []const json.Token) bool {
         return tok.kind == .colon;
     }
     return false;
+}
+
+/// A finite float as JavaScript's Number-to-string writes it: the shortest
+/// digits that read back as the same value, in decimal notation for
+/// 1e-7 <= |x| < 1e21 and in exponent notation otherwise.
+pub fn jsNumber(arena: std.mem.Allocator, x: f64) ![]const u8 {
+    if (x == 0) return "0";
+    const sci = try std.fmt.allocPrint(arena, "{e}", .{@abs(x)});
+    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    var digits: std.ArrayList(u8) = .empty;
+    for (sci[0..e_at]) |c| if (c != '.') try digits.append(arena, c);
+    const k: i64 = @intCast(digits.items.len);
+    const n: i64 = (std.fmt.parseInt(i64, sci[e_at + 1 ..], 10) catch unreachable) + 1;
+    var out: std.ArrayList(u8) = .empty;
+    if (x < 0) try out.append(arena, '-');
+    const d = digits.items;
+    if (k <= n and n <= 21) {
+        try out.appendSlice(arena, d);
+        try out.appendNTimes(arena, '0', @intCast(n - k));
+    } else if (0 < n and n <= 21) {
+        try out.appendSlice(arena, d[0..@intCast(n)]);
+        try out.append(arena, '.');
+        try out.appendSlice(arena, d[@intCast(n)..]);
+    } else if (-6 < n and n <= 0) {
+        try out.appendSlice(arena, "0.");
+        try out.appendNTimes(arena, '0', @intCast(-n));
+        try out.appendSlice(arena, d);
+    } else {
+        try out.append(arena, d[0]);
+        if (k > 1) {
+            try out.append(arena, '.');
+            try out.appendSlice(arena, d[1..]);
+        }
+        try out.print(arena, "e{c}{d}", .{ @as(u8, if (n - 1 < 0) '-' else '+'), @abs(n - 1) });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+test "jsNumber follows JavaScript's Number-to-string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { x: f64, want: []const u8 }{
+        .{ .x = 0.0001, .want = "0.0001" },              .{ .x = 100000.0, .want = "100000" },
+        .{ .x = 1e300, .want = "1e+300" },               .{ .x = -0.0, .want = "0" },
+        .{ .x = 1.5, .want = "1.5" },                    .{ .x = 3.0, .want = "3" },
+        .{ .x = 1e-7, .want = "1e-7" },                  .{ .x = 1.5e-7, .want = "1.5e-7" },
+        .{ .x = 0.000001, .want = "0.000001" },          .{ .x = 1e21, .want = "1e+21" },
+        .{ .x = 1e20, .want = "100000000000000000000" }, .{ .x = -123.25, .want = "-123.25" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c.want, try jsNumber(a, c.x));
 }
 
 /// True when a TOML float's rendering is a JSON number (not nan or inf).

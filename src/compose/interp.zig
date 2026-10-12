@@ -21,6 +21,8 @@ pub const InterpError = error{
     MalformedDataCapture,
     DataRefWithoutContext,
     SecretRefWithoutContext,
+    /// A TOML inf or nan float captured as a JSON value, which has no form.
+    NotRepresentableInJson,
     OutOfMemory,
 } || secret.uri.ParseError || secret.resolver.ResolveError;
 
