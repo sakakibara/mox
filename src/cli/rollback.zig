@@ -41,7 +41,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         // when named.
         var ids: std.ArrayList([]const u8) = .empty;
         for (try mox.apply.snapshot.list(ctx.alloc, ctx.io, context.paths.snapshots_dir)) |id| {
-            if (try mox.apply.snapshot.undoes(ctx.alloc, ctx.io, context.paths.snapshots_dir, id) == null) try ids.append(ctx.alloc, id);
+            switch (try mox.apply.snapshot.undoNote(ctx.alloc, ctx.io, context.paths.snapshots_dir, id)) {
+                .of => {},
+                .none => try ids.append(ctx.alloc, id),
+                .corrupt => {
+                    try ctx.err.print("mox rollback: warning: the undo note of snapshot {s} cannot be read; it counts as an ordinary snapshot\n", .{id});
+                    try ids.append(ctx.alloc, id);
+                },
+            }
         }
         if (ids.items.len == 0) {
             try ctx.err.writeAll("mox rollback: no snapshots to roll back to\n");
@@ -128,13 +135,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         .state_dir = context.paths.state_dir,
         .repo = try mox.apply.applied.repoTag(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.home),
         .undo = &undo,
-    }) catch |e| switch (e) {
-        error.SnapshotNotFound => {
-            try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
-            return 1;
-        },
-        else => return e,
+    }) catch |e| {
+        // Whatever was kept before the failure stays recoverable: say where.
+        if (undo.id) |u| try ctx.out.print("  what it replaced is kept in snapshot {s} ('mox rollback {s}' puts it back)\n", .{ u, u });
+        switch (e) {
+            error.SnapshotNotFound => {
+                try ctx.err.print("mox rollback: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
+                return 1;
+            },
+            else => return e,
+        }
     };
+    for (restored.warnings) |w| try ctx.err.print("mox rollback: warning: {s}\n", .{w});
 
     var repatched: usize = 0;
     var failed: usize = 0;
@@ -143,6 +155,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         switch (r.why) {
             .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
             .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
+            .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; the snapshot copy is at {s})\n", .{ shown, r.reason, r.snapshot_path }),
             .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; the snapshot copy is at {s})\n", .{ shown, r.snapshot_path }),
         }
         failed += 1;

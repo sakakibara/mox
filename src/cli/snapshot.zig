@@ -14,9 +14,14 @@ fn list(ctx: *app.Ctx, _: cli.Args(Spec)) anyerror!u8 {
         return 0;
     }
     for (ids) |id| {
-        if (try mox.apply.snapshot.undoes(ctx.alloc, ctx.io, context.paths.snapshots_dir, id)) |of| {
-            try ctx.out.print("{s} (what rolling back {s} replaced)\n", .{ id, of });
-        } else try ctx.out.print("{s}\n", .{id});
+        switch (try mox.apply.snapshot.undoNote(ctx.alloc, ctx.io, context.paths.snapshots_dir, id)) {
+            .of => |of| try ctx.out.print("{s} (what rolling back {s} replaced)\n", .{ id, of }),
+            .none => try ctx.out.print("{s}\n", .{id}),
+            .corrupt => {
+                try ctx.err.print("mox snapshot: warning: the undo note of snapshot {s} cannot be read\n", .{id});
+                try ctx.out.print("{s}\n", .{id});
+            },
+        }
     }
     return 0;
 }

@@ -6725,7 +6725,8 @@ test "rollback: a planted link it puts back is drift, replaced only by --overwri
     // What rollback replaced, the file apply wrote, is kept in its own
     // snapshot, which a bare rollback never picks.
     const kept = std.mem.indexOf(u8, rb.out, "is kept in snapshot ") orelse return error.TestExpectedKeptSnapshot;
-    const undo_id = rb.out[kept + "is kept in snapshot ".len ..][0..mox.apply.snapshot.id_len];
+    const after = rb.out[kept + "is kept in snapshot ".len ..];
+    const undo_id = after[0 .. std.mem.indexOfScalar(u8, after, ' ') orelse after.len];
     const sl = try h.run(&.{ "mox", "snapshot" });
     try std.testing.expect(std.mem.indexOf(u8, sl.out, "(what rolling back") != null);
 
@@ -6928,4 +6929,76 @@ test "add --own and --disown: a live file that does not parse is refused with it
         try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
     }
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try h.srcOf("x.toml"), .{}));
+}
+
+test "rollback: the link it put back is rolled back again by its own snapshot" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try plantedThenFile(a, io, &tmp, false);
+    const h = s.h;
+    const live = try h.liveOf(".config/c.toml");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    const kept = std.mem.indexOf(u8, rb.out, "is kept in snapshot ") orelse return error.TestExpectedKeptSnapshot;
+    const after = rb.out[kept + "is kept in snapshot ".len ..];
+    const undo_id = after[0 .. std.mem.indexOfScalar(u8, after, ' ') orelse after.len];
+    const back = try h.run(&.{ "mox", "rollback", undo_id });
+    try std.testing.expectEqual(@as(u8, 0), back.rc);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, live, .{ .follow_symlinks = false })).kind == .file);
+    try std.testing.expectEqualStrings("a = 1\n", try read(io, a, live));
+    try std.testing.expectEqualStrings("a = 0\nb = \"keep\"\n", try read(io, a, s.inrepo));
+}
+
+test "rollback: an entry that cannot be restored is that entry's error, and the rest are restored" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".foo"), .data = "old foo\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".bar"), .data = "old bar\n" });
+    try writeRepo(io, &tmp, "repo/src/.foo", "repo foo\n");
+    try writeRepo(io, &tmp, "repo/src/.bar", "repo bar\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".bar"));
+    try Io.Dir.cwd().createDirPath(io, try h.liveOf(".bar"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".bar/inner"), .data = "precious\n" });
+
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(lineWith(rb.err, "ERROR", "~/.bar (not restored:"));
+    try std.testing.expectEqualStrings("old foo\n", try read(io, a, try h.liveOf(".foo")));
+    try std.testing.expectEqualStrings("precious\n", try read(io, a, try h.liveOf(".bar/inner")));
+    try std.testing.expect(std.mem.indexOf(u8, rb.out, "is kept in snapshot ") != null);
+}
+
+test "rollback: a link already as the snapshot has it is not counted as restored" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/t1", "1\n");
+    try writeRepo(io, &tmp, "repo/t2", "2\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".foo\"]\nsymlink = true\n");
+    try writeRepo(io, &tmp, "repo/src/.foo", try std.fs.path.join(a, &.{ h.repo, "t1" }));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.foo", try std.fs.path.join(a, &.{ h.repo, "t2" }));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // Back to t1 by hand: the snapshot's link is already there.
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".foo"));
+    try Io.Dir.cwd().symLink(io, try std.fs.path.join(a, &.{ h.repo, "t1" }), try h.liveOf(".foo"), .{});
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expect(std.mem.indexOf(u8, rb.out, "Restored 0 file(s)") != null);
 }

@@ -7947,7 +7947,7 @@ test "apply: every delete, rename or truncating write sits where it was judged" 
         .{ "src/apply/run_scripts.zig", "sweepCheckDirs", 2 },
         .{ "src/apply/snapshot.zig", "notePlanted", 1 },
         .{ "src/apply/snapshot.zig", "prune", 4 },
-        .{ "src/apply/snapshot.zig", "restoreDir", 1 },
+        .{ "src/apply/snapshot.zig", "restoreLinkEntry", 1 },
         .{ "src/apply/snapshot.zig", "saveSymlink", 1 },
         .{ "src/apply/snapshot.zig", "saveTree", 1 },
         .{ "src/apply/snapshot.zig", "take", 1 },

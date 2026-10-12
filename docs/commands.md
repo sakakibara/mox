@@ -1066,12 +1066,19 @@ before these notes notes none. A restored file no longer counts as a link.
 Before rollback replaces anything at a live path, it keeps what is there in
 a snapshot of its own, named in its report and in `mox snapshot`;
 `rollback` with no id never picks such a snapshot, and `mox rollback
-<id>` puts it back. An `attributes.toml` that is not
+<id>` puts it back; it does not count toward `MOX_SNAPSHOT_RETENTION`, and
+goes when the snapshot it undoes is pruned. An entry that cannot be
+restored is that entry's `ERROR`, naming its snapshot copy, and the rest
+are still restored; a link already as the snapshot has it is left alone
+and not counted. Notes rollback cannot read (a snapshot's planted links,
+or what a snapshot of its own undoes) are a warning, and treated as
+absent. An `attributes.toml` that is not
 valid TOML or cannot be read is a warning here, not exit 2: whole files
 are still restored, and partial targets cannot be re-patched.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10); apply prunes
-the rest. A value that is not an integer warns and the default stands.
+the oldest of the rest, ordering same-second snapshots by their `-N`
+suffix. A value that is not an integer warns and the default stands.
 
 ## update
 

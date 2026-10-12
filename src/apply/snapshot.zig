@@ -119,33 +119,54 @@ pub fn saveSymlink(
 /// Note in snapshot `id` that its symlink for `live_path` is one mox planted,
 /// pointing at `target`, so rollback can tell it from a link the user made.
 /// The notes live in the `<id>.records` sidecar, one line per link.
-pub fn notePlanted(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id: []const u8, live_path: []const u8, target: []const u8) !void {
+pub fn notePlanted(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id: []const u8, live_path: []const u8, target: []const u8, tag: []const u8) !void {
     const path = try recordsPath(arena, snapshots_dir, id);
     const prior = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => "",
         else => return e,
     };
-    const line = try std.fmt.allocPrint(arena, "planted {s} {s}\n", .{ try applied.pctEncode(arena, live_path), try applied.pctEncode(arena, target) });
+    const line = try std.fmt.allocPrint(arena, "planted {s} {s} {s}\n", .{ try applied.pctEncode(arena, live_path), try applied.pctEncode(arena, target), try applied.pctEncode(arena, tag) });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try std.mem.concat(arena, u8, &.{ prior, line }) });
 }
 
-/// The links snapshot `id` notes as planted: live path to target. A snapshot
-/// taken before these notes existed notes none.
-fn plantedOf(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id: []const u8) !std.StringHashMap([]const u8) {
-    var out = std.StringHashMap([]const u8).init(arena);
+/// A link a snapshot notes as planted: its target, and the repo and HOME
+/// tag its record named.
+pub const Planted = struct { target: []const u8, tag: []const u8 };
+
+/// The links snapshot `id` notes as planted, by live path. A snapshot taken
+/// before these notes existed notes none; one whose notes cannot be read
+/// is reported through `corrupt` and notes none either.
+fn plantedOf(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id: []const u8, corrupt: *bool) !std.StringHashMap(Planted) {
+    var out = std.StringHashMap(Planted).init(arena);
     const bytes = Io.Dir.cwd().readFileAlloc(io, try recordsPath(arena, snapshots_dir, id), arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return out,
-        else => return e,
+        error.OutOfMemory => return e,
+        else => {
+            corrupt.* = true;
+            return out;
+        },
     };
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
-        var parts = std.mem.splitScalar(u8, line, ' ');
-        if (!std.mem.eql(u8, parts.next() orelse continue, "planted")) continue;
-        const live = (try applied.pctDecode(arena, parts.next() orelse continue)) orelse continue;
-        const target = (try applied.pctDecode(arena, parts.next() orelse continue)) orelse continue;
-        try out.put(live, target);
+        if (line.len == 0) continue;
+        const entry = (try parsePlanted(arena, line)) orelse {
+            corrupt.* = true;
+            out.clearRetainingCapacity();
+            return out;
+        };
+        try out.put(entry.live, .{ .target = entry.target, .tag = entry.tag });
     }
     return out;
+}
+
+fn parsePlanted(arena: std.mem.Allocator, line: []const u8) !?struct { live: []const u8, target: []const u8, tag: []const u8 } {
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    if (!std.mem.eql(u8, parts.next() orelse return null, "planted")) return null;
+    const live = (try applied.pctDecode(arena, parts.next() orelse return null)) orelse return null;
+    const target = (try applied.pctDecode(arena, parts.next() orelse return null)) orelse return null;
+    const tag = (try applied.pctDecode(arena, parts.next() orelse return null)) orelse return null;
+    if (parts.next() != null) return null;
+    return .{ .live = live, .target = target, .tag = tag };
 }
 
 fn recordsPath(arena: std.mem.Allocator, snapshots_dir: []const u8, id: []const u8) ![]const u8 {
@@ -281,23 +302,56 @@ pub fn list(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8) ![]cons
     var ids: std.ArrayList([]const u8) = .empty;
     errdefer ids.deinit(arena);
 
-    // dirent.sorted gives a total order, so ids come out oldest-first by their
-    // timestamped names -- the order prune relies on to drop the oldest.
     for (try dirent.sorted(arena, io, dir)) |entry| {
         if (entry.kind != .directory) continue;
         try ids.append(arena, entry.name);
     }
+    // Oldest first, a same-second `-N` suffix by its number: the order
+    // prune drops by and `rollback` takes the newest from.
+    std.mem.sort([]const u8, ids.items, {}, olderId);
     return ids.toOwnedSlice(arena);
 }
 
-/// Delete the oldest snapshots so at most `keep` remain.
+fn olderId(_: void, a: []const u8, b: []const u8) bool {
+    const sa = splitId(a);
+    const sb = splitId(b);
+    const o = std.mem.order(u8, sa.base, sb.base);
+    if (o != .eq) return o == .lt;
+    if (sa.n != sb.n) return sa.n < sb.n;
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn splitId(id: []const u8) struct { base: []const u8, n: u64 } {
+    if (id.len > id_len and id[id_len] == '-') {
+        if (std.fmt.parseInt(u64, id[id_len + 1 ..], 10)) |n| return .{ .base = id[0..id_len], .n = n } else |_| {}
+    }
+    return .{ .base = id, .n = 1 };
+}
+
+/// Delete the oldest snapshots so at most `keep` remain. A snapshot a
+/// rollback took of what it replaced does not count, and goes with the
+/// snapshot it undoes.
 pub fn prune(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, keep: usize) !void {
-    const ids = try list(arena, io, snapshots_dir);
-    if (ids.len <= keep) return;
+    var own: std.ArrayList([]const u8) = .empty;
+    var undos: std.ArrayList(struct { id: []const u8, of: []const u8 }) = .empty;
+    for (try list(arena, io, snapshots_dir)) |id| switch (try undoNote(arena, io, snapshots_dir, id)) {
+        .of => |of| try undos.append(arena, .{ .id = id, .of = of }),
+        .none, .corrupt => try own.append(arena, id),
+    };
+    var drop: std.ArrayList([]const u8) = .empty;
+    if (own.items.len > keep) try drop.appendSlice(arena, own.items[0 .. own.items.len - keep]);
+    const kept = own.items[if (own.items.len > keep) own.items.len - keep else 0..];
+    for (undos.items) |u| {
+        const alive = for (kept) |k| {
+            if (std.mem.eql(u8, k, u.of)) break true;
+        } else false;
+        if (!alive) try drop.append(arena, u.id);
+    }
+    if (drop.items.len == 0) return;
 
     var dir = try Io.Dir.cwd().openDir(io, snapshots_dir, .{ .iterate = true });
     defer dir.close(io);
-    for (ids[0 .. ids.len - keep]) |id| {
+    for (drop.items) |id| {
         try dir.deleteTree(io, id);
         // Drop the directory-mode sidecar beside the store it described.
         dir.deleteFile(io, try std.fmt.allocPrint(arena, "{s}.dirmodes", .{id})) catch {};
@@ -308,6 +362,8 @@ pub fn prune(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, keep: 
 
 pub const Restored = struct {
     count: usize = 0,
+    /// Problems with the snapshot's own notes, which never stop a restore.
+    warnings: []const []const u8 = &.{},
     /// Entries not restored because a directory above their live path is a
     /// symlink: each names its live path and the snapshot copy left behind.
     refused: []const Refused = &.{},
@@ -317,6 +373,8 @@ pub const Refused = struct {
     live_path: []const u8,
     snapshot_path: []const u8,
     why: Why,
+    /// For `failed`: what went wrong.
+    reason: []const u8 = "",
 
     pub const Why = enum {
         /// A directory above the live path is a symlink.
@@ -325,6 +383,8 @@ pub const Refused = struct {
         is_link,
         /// A symlink sits where the snapshot has a directory.
         dir_over_link,
+        /// Restoring it failed; `reason` says how.
+        failed,
     };
 };
 
@@ -341,10 +401,12 @@ fn entryRefusal(arena: std.mem.Allocator, io: Io, home: []const u8, live: []cons
     const why = refusal(io, home, live) orelse return null;
     if (why != .is_link) return why;
     const sd = state_dir orelse return why;
-    const recorded = (applied.readSymlink(arena, io, sd, live) catch return why) orelse return why;
+    // A link mox planted counts as planted whether or not rollback put it
+    // back since.
+    const recorded = (applied.readSymlinkRecord(arena, io, sd, live) catch return why) orelse return why;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = Io.Dir.cwd().readLink(io, live, &buf) catch return why;
-    return if (applied.sameSymlinkTarget(buf[0..n], recorded)) null else why;
+    return if (applied.sameSymlinkTarget(buf[0..n], recorded.target)) null else why;
 }
 
 /// The records rollback keeps in step with what it restores.
@@ -355,7 +417,7 @@ pub const Records = struct {
     /// Where an entry the restore replaces is kept first.
     undo: ?*Undo = null,
     /// The links the snapshot notes as planted; `restoreExcept` reads them.
-    planted: ?*const std.StringHashMap([]const u8) = null,
+    planted: ?*const std.StringHashMap(Planted) = null,
 };
 
 /// The snapshot a rollback keeps the entries it replaces in, taken on the
@@ -381,13 +443,21 @@ fn undoPath(arena: std.mem.Allocator, snapshots_dir: []const u8, id: []const u8)
     return std.fmt.allocPrint(arena, "{s}.undo", .{try std.fs.path.join(arena, &.{ snapshots_dir, id })});
 }
 
-/// The snapshot `id` undoes when a rollback took it, else null.
-pub fn undoes(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id: []const u8) !?[]const u8 {
+/// What snapshot `id`'s `<id>.undo` sidecar says: none, the snapshot it
+/// undoes, or that it cannot be read (the caller warns and treats it as
+/// none).
+pub const UndoNote = union(enum) { none, of: []const u8, corrupt };
+
+pub fn undoNote(arena: std.mem.Allocator, io: Io, snapshots_dir: []const u8, id: []const u8) !UndoNote {
     const bytes = Io.Dir.cwd().readFileAlloc(io, try undoPath(arena, snapshots_dir, id), arena, .limited(4096)) catch |e| switch (e) {
-        error.FileNotFound => return null,
-        else => return e,
+        error.FileNotFound => return .none,
+        error.OutOfMemory => return e,
+        else => return .corrupt,
     };
-    return std.mem.trim(u8, bytes, " \n");
+    const of = std.mem.trim(u8, bytes, " \n");
+    if (of.len < id_len or of.len > id_len + 8) return .corrupt;
+    for (of) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-')) return .corrupt;
+    return .{ .of = of };
 }
 
 /// Keep what is at `live` in the rollback's own snapshot before the restore
@@ -401,7 +471,7 @@ fn keepReplaced(arena: std.mem.Allocator, io: Io, r: Records, home: []const u8, 
             const id = try u.take(arena, io);
             try saveSymlink(arena, io, u.snapshots_dir, id, home, live, target);
             if (try applied.readSymlinkRecord(arena, io, r.state_dir, live)) |rec| {
-                if (applied.sameSymlinkTarget(rec.target, target)) try notePlanted(arena, io, u.snapshots_dir, id, live, target);
+                if (applied.sameSymlinkTarget(rec.target, target)) try notePlanted(arena, io, u.snapshots_dir, id, live, target, rec.repo orelse "");
             }
         },
         .other => {
@@ -463,12 +533,16 @@ pub fn restoreExcept(
     var result: Restored = .{};
     var refused: std.ArrayList(Refused) = .empty;
     var book = records;
+    var warnings: std.ArrayList([]const u8) = .empty;
     if (book) |*b| {
-        const planted = try arena.create(std.StringHashMap([]const u8));
-        planted.* = try plantedOf(arena, io, snapshots_dir, id);
+        var corrupt = false;
+        const planted = try arena.create(std.StringHashMap(Planted));
+        planted.* = try plantedOf(arena, io, snapshots_dir, id, &corrupt);
+        if (corrupt) try warnings.append(arena, try std.fmt.allocPrint(arena, "the planted-link notes of snapshot {s} cannot be read; its links restore with no record", .{id}));
         b.planted = planted;
     }
     try restoreDir(arena, io, dir, snap_dir_path, "", home, skip, skipped, &result, &refused, book);
+    result.warnings = try warnings.toOwnedSlice(arena);
     try restoreDirModes(arena, io, snapshots_dir, id, home, &refused);
     result.refused = try refused.toOwnedSlice(arena);
     return result;
@@ -535,7 +609,6 @@ fn restoreDir(
     refused: *std.ArrayList(Refused),
     records: ?Records,
 ) !void {
-    const state_dir: ?[]const u8 = if (records) |r| r.state_dir else null;
     // Raw iterate() is sound here: a restore replays EVERY entry to disk, so
     // the order it visits them cannot be observed in the result.
     var iter = dir.iterate();
@@ -552,66 +625,101 @@ fn restoreDir(
                 const sub_abs = try std.fs.path.join(arena, &.{ abs_prefix, entry.name });
                 try restoreDir(arena, io, sub, sub_abs, rel, home, skip, skipped, result, refused, records);
             },
-            .file => {
+            .file, .sym_link => {
                 const target = try source_path.joinKeyOnto(arena, home, rel);
-                // A withheld partial target is re-patched by the caller, through
-                // a link the user made; only a symlinked parent stops it here.
-                const withheld = skip != null and skip.?.contains(target);
-                const why_opt: ?Refused.Why = if (withheld)
-                    (if (parent_link.through(io, home, target, null)) Refused.Why.parent_link else null)
+                const done = if (entry.kind == .file)
+                    restoreFileEntry(arena, io, dir, entry.name, abs_prefix, target, home, skip, skipped, result, refused, records)
                 else
-                    try entryRefusal(arena, io, home, target, state_dir);
-                if (why_opt) |why| {
-                    try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
-                    continue;
-                }
-                const content = try dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024 * 1024));
-                if (skip != null and skip.?.contains(target)) {
-                    if (skipped) |out| try out.append(arena, .{ .live_path = target, .content = content });
-                    continue;
-                }
-                const st = try dir.statFile(io, entry.name, .{});
-                if (records) |r| try keepReplaced(arena, io, r, home, target, content);
-                try write_mod.writeAtomic(io, target, content, write_mod.modeOf(st.permissions));
-                if (records) |r| try applied.forgetSymlink(arena, io, r.state_dir, target);
-                result.count += 1;
-            },
-            .sym_link => {
-                var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const n = try dir.readLink(io, entry.name, &buf);
-                const target = try source_path.joinKeyOnto(arena, home, rel);
-                // The link is already there: nothing to replace.
-                const same = switch (applied.inspectSymSite(io, arena, target)) {
-                    .symlink => |cur| applied.sameSymlinkTarget(cur, buf[0..n]),
-                    else => false,
+                    restoreLinkEntry(arena, io, dir, entry.name, abs_prefix, target, home, result, refused, records);
+                done catch |e| switch (e) {
+                    error.OutOfMemory => return e,
+                    else => try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = .failed, .reason = @errorName(e) }),
                 };
-                if (!same) {
-                    if (try entryRefusal(arena, io, home, target, state_dir)) |why| {
-                        try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, entry.name }), .why = why });
-                        continue;
-                    }
-                    if (std.fs.path.dirname(target)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
-                    if (records) |r| try keepReplaced(arena, io, r, home, target, null);
-                    switch (applied.inspectSymSite(io, arena, target)) {
-                        .absent => {},
-                        else => try Io.Dir.cwd().deleteFile(io, target),
-                    }
-                    try Io.Dir.cwd().symLink(io, buf[0..n], target, .{});
-                }
-                // A link mox planted is recorded as rolled back, drift until
-                // applied again; any other link is left with no record, as a
-                // link the user made reads.
-                if (records) |r| {
-                    const was = if (r.planted) |p| p.get(target) else null;
-                    if (was != null and applied.sameSymlinkTarget(was.?, buf[0..n])) {
-                        try applied.recordRolledBackLink(arena, io, r.state_dir, target, buf[0..n], r.repo);
-                    } else try applied.forget(arena, io, r.state_dir, target);
-                }
-                result.count += 1;
             },
             else => {},
         }
     }
+}
+
+fn restoreFileEntry(
+    arena: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    name: []const u8,
+    abs_prefix: []const u8,
+    target: []const u8,
+    home: []const u8,
+    skip: ?*const std.StringHashMap(void),
+    skipped: ?*std.ArrayList(Withheld),
+    result: *Restored,
+    refused: *std.ArrayList(Refused),
+    records: ?Records,
+) !void {
+    const state_dir: ?[]const u8 = if (records) |r| r.state_dir else null;
+    // A withheld partial target is re-patched by the caller, through a link
+    // the user made; only a symlinked parent stops it here.
+    const withheld = skip != null and skip.?.contains(target);
+    const why_opt: ?Refused.Why = if (withheld)
+        (if (parent_link.through(io, home, target, null)) Refused.Why.parent_link else null)
+    else
+        try entryRefusal(arena, io, home, target, state_dir);
+    if (why_opt) |why| {
+        try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, name }), .why = why });
+        return;
+    }
+    const content = try dir.readFileAlloc(io, name, arena, .limited(64 * 1024 * 1024));
+    if (withheld) {
+        if (skipped) |out| try out.append(arena, .{ .live_path = target, .content = content });
+        return;
+    }
+    const st = try dir.statFile(io, name, .{});
+    if (records) |r| try keepReplaced(arena, io, r, home, target, content);
+    try write_mod.writeAtomic(io, target, content, write_mod.modeOf(st.permissions));
+    if (records) |r| try applied.forgetSymlink(arena, io, r.state_dir, target);
+    result.count += 1;
+}
+
+fn restoreLinkEntry(
+    arena: std.mem.Allocator,
+    io: Io,
+    dir: Io.Dir,
+    name: []const u8,
+    abs_prefix: []const u8,
+    target: []const u8,
+    home: []const u8,
+    result: *Restored,
+    refused: *std.ArrayList(Refused),
+    records: ?Records,
+) !void {
+    const state_dir: ?[]const u8 = if (records) |r| r.state_dir else null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dir.readLink(io, name, &buf);
+    // The link is already there: nothing is restored, records and all.
+    switch (applied.inspectSymSite(io, arena, target)) {
+        .symlink => |cur| if (applied.sameSymlinkTarget(cur, buf[0..n])) return,
+        else => {},
+    }
+    if (try entryRefusal(arena, io, home, target, state_dir)) |why| {
+        try refused.append(arena, .{ .live_path = target, .snapshot_path = try std.fs.path.join(arena, &.{ abs_prefix, name }), .why = why });
+        return;
+    }
+    if (std.fs.path.dirname(target)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
+    if (records) |r| try keepReplaced(arena, io, r, home, target, null);
+    switch (applied.inspectSymSite(io, arena, target)) {
+        .absent => {},
+        else => try Io.Dir.cwd().deleteFile(io, target),
+    }
+    try Io.Dir.cwd().symLink(io, buf[0..n], target, .{});
+    // A link the snapshot notes as planted is recorded as rolled back, with
+    // the tag its record named: drift until applied again. Any other link is
+    // left with no record, as a link the user made reads.
+    if (records) |r| {
+        const was = if (r.planted) |p| p.get(target) else null;
+        if (was != null and applied.sameSymlinkTarget(was.?.target, buf[0..n])) {
+            try applied.recordRolledBackLink(arena, io, r.state_dir, target, buf[0..n], was.?.tag);
+        } else try applied.forget(arena, io, r.state_dir, target);
+    }
+    result.count += 1;
 }
 
 test "saveSymlink + restore round-trips a symlink, not a regular file" {
@@ -653,7 +761,7 @@ fn failingReadLinkFor(target: []const u8) type {
     };
 }
 
-test "restore: a symlink whose readLink fails propagates instead of silently skipping it" {
+test "restore: a symlink whose readLink fails is that entry's failure, never skipped in silence" {
     if (!Io.File.Permissions.has_executable_bit) return; // symlink create is privileged on Windows
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -675,7 +783,11 @@ test "restore: a symlink whose readLink fails propagates instead of silently ski
     vtable.dirReadLink = failingReadLinkFor("link").dirReadLink;
     const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
 
-    try std.testing.expectError(error.Unexpected, restore(a, faulty, snaps, "id1", home));
+    // Reported as that entry's failure, never skipped in silence.
+    const res = try restore(a, faulty, snaps, "id1", home);
+    try std.testing.expectEqual(@as(usize, 1), res.refused.len);
+    try std.testing.expect(res.refused[0].why == .failed);
+    try std.testing.expectEqualStrings("Unexpected", res.refused[0].reason);
 }
 
 var stat_fail_target: []const u8 = "";
@@ -708,7 +820,7 @@ test "save: a live-file stat failure propagates instead of degrading the preserv
     try std.testing.expectError(error.Unexpected, save(a, faulty, snaps, "id1", home, live, "token\n"));
 }
 
-test "restore: a snapshot entry's stat failure propagates instead of degrading the restored mode to 0644" {
+test "restore: a snapshot entry's stat failure is that entry's failure, never a restore at 0644" {
     if (!Io.File.Permissions.has_executable_bit) return; // no unix modes to preserve
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -730,7 +842,11 @@ test "restore: a snapshot entry's stat failure propagates instead of degrading t
     vtable.dirStatFile = failingStatFile;
     const faulty: Io = .{ .userdata = io.userdata, .vtable = &vtable };
 
-    try std.testing.expectError(error.Unexpected, restore(a, faulty, snaps, "id1", home));
+    // Reported as that entry's failure, never skipped in silence.
+    const res = try restore(a, faulty, snaps, "id1", home);
+    try std.testing.expectEqual(@as(usize, 1), res.refused.len);
+    try std.testing.expect(res.refused[0].why == .failed);
+    try std.testing.expectEqualStrings("Unexpected", res.refused[0].reason);
 }
 
 fn dirMode(io: Io, path: []const u8) !u32 {
@@ -885,4 +1001,57 @@ test "liveKeyUnderHome: the key a snapshot is filed by, and null for a path outs
 
     try std.testing.expect((try source_path.liveKeyUnderHome(a, "/home/me", "/etc/passwd")) == null);
     try std.testing.expect((try source_path.liveKeyUnderHome(a, "/home/me", "/home/melon/.zshrc")) == null);
+}
+
+test "list: a same-second suffix orders by number, and prune keeps rollback's own snapshots out of the count" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "20260101T000000Z", "20260101T000000Z-2", "20260101T000000Z-10", "20260101T000001Z" }) |id| try tmp.dir.createDirPath(io, id);
+    const snaps = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const ids = try list(a, io, snaps);
+    try std.testing.expectEqualStrings("20260101T000000Z-2", ids[1]);
+    try std.testing.expectEqualStrings("20260101T000000Z-10", ids[2]);
+
+    // The newest snapshot undoes the one before it: it does not count.
+    try tmp.dir.writeFile(io, .{ .sub_path = "20260101T000001Z.undo", .data = "20260101T000000Z-10\n" });
+    try prune(a, io, snaps, 1);
+    const left = try list(a, io, snaps);
+    try std.testing.expectEqual(@as(usize, 2), left.len);
+    try std.testing.expectEqualStrings("20260101T000000Z-10", left[0]);
+}
+
+test "restore: a planted link is recorded with the tag its snapshot noted, and a corrupt note is a warning" {
+    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "home");
+    try tmp.dir.createDirPath(io, "state");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const home = try std.fs.path.join(a, &.{ root, "home" });
+    const snaps = try std.fs.path.join(a, &.{ root, "snaps" });
+    const state = try std.fs.path.join(a, &.{ root, "state" });
+    const link = try std.fs.path.join(a, &.{ home, "l" });
+
+    try saveSymlink(a, io, snaps, "id1", home, link, "/t");
+    try notePlanted(a, io, snaps, "id1", link, "/t", "repo-then");
+    const res = try restoreExcept(a, io, snaps, "id1", home, null, null, .{ .state_dir = state, .repo = "repo-now" });
+    try std.testing.expectEqual(@as(usize, 1), res.count);
+    const rec = (try applied.readSymlinkRecord(a, io, state, link)).?;
+    try std.testing.expect(rec.rolled_back);
+    try std.testing.expectEqualStrings("repo-then", rec.repo.?);
+
+    try Io.Dir.cwd().deleteFile(io, link);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try recordsPath(a, snaps, "id1"), .data = "planted %zz\n" });
+    const bad = try restoreExcept(a, io, snaps, "id1", home, null, null, .{ .state_dir = state, .repo = "repo-now" });
+    try std.testing.expectEqual(@as(usize, 1), bad.count);
+    try std.testing.expect(bad.warnings.len == 1);
+    try std.testing.expect((try applied.readSymlinkRecord(a, io, state, link)) == null);
 }

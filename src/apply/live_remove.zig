@@ -89,7 +89,7 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
 
 fn notePlanted(arena: std.mem.Allocator, io: Io, c: Ctx, state_dir: []const u8, live_path: []const u8, target: []const u8) !void {
     const rec = (try applied.readSymlinkRecord(arena, io, state_dir, live_path)) orelse return;
-    if (applied.sameSymlinkTarget(rec.target, target)) try snapshot.notePlanted(arena, io, c.snapshots_dir, c.snap_id, live_path, target);
+    if (applied.sameSymlinkTarget(rec.target, target)) try snapshot.notePlanted(arena, io, c.snapshots_dir, c.snap_id, live_path, target, rec.repo orelse "");
 }
 
 fn holds(arena: std.mem.Allocator, io: Io, live_path: []const u8, want: []const u8) bool {
