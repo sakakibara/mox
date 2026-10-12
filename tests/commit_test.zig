@@ -11009,3 +11009,31 @@ test "commit: a source layer or live file that does not parse is named with its 
     try std.testing.expect(std.mem.indexOf(u8, r.err, "FormatViolation") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "ParseError") == null);
 }
+
+test "commit: a partially owned file whose layer does not parse is reported located, and nothing is claimed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 1\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[a]\nj = 2\n");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/app.toml.d/os=darwin.toml", "[a]\nj = = 2\n");
+    const live = try h.liveOf("app.toml");
+    const cur = try read(io, a, live);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = try std.mem.replaceOwned(u8, a, cur, "k = 1", "k = 5") });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "export A=2\n" });
+
+    const r = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "FormatViolation") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try tilde(a, "~/app.toml: this machine's sources do not compose: src/app.toml.d/os=darwin.toml:2:5:")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "committed ~/.zshrc")) != null);
+    try std.testing.expectEqualStrings("export A=2\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "src", ".zshrc" })));
+    try std.testing.expectEqualStrings("[a]\nj = = 2\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "src", "app.toml.d", "os=darwin.toml" })));
+}

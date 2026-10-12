@@ -2039,6 +2039,12 @@ fn commitRun(
     // own source, when it was first classified above.
     const baseline = try ctx.alloc.alloc([]const impact.ConfigOutput, tree.files.len);
     @memset(baseline, &.{});
+    // A layer that refuses its key fails the files that edit was routed from,
+    // and the edit is left out; settling below restores their sources. So
+    // does a path the plan backstop refuses, for every unit editing it, and a
+    // file this machine cannot compose, which cannot be verified.
+    const plan_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
+    @memset(plan_failed, null);
     // A dry run collects its routes without marking the files they come from
     // affected; those are the files `--yes` would snapshot.
     const snapshotted = try ctx.alloc.dupe(bool, affected);
@@ -2049,10 +2055,17 @@ fn commitRun(
     for (tree.files, 0..) |file, fidx| {
         if (!snapshotted[fidx] and !coupling_only[fidx]) continue;
         const space = spaces[fidx].?;
+        var bdiag: mox.compose.interp.Diag = .{};
         baseline[fidx] = if (coupling_only[fidx])
             coupling_baseline[fidx]
         else
-            (try impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets, null)).per_config;
+            (impact.snapshot(ctx.alloc, ctx.io, file, space.configs, &m_state, secrets, &bdiag) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => {
+                    plan_failed[fidx] = try std.fmt.allocPrint(ctx.alloc, "this machine's sources do not compose: {s}", .{try impact.failText(ctx.alloc, e, &bdiag)});
+                    continue;
+                },
+            }).per_config;
         // A partial file's per-configuration snapshot is the CANONICAL OWNED
         // serialization of that configuration's compose, so the guard compares
         // owned content, never text layout. Pre-existing own-declaration
@@ -2086,11 +2099,6 @@ fn commitRun(
         }
         try plan.set(ctx.alloc, path, try replaceTokens(ctx.alloc, try plan.bytesOf(ctx.alloc, path), renames.items));
     }
-    // A layer that refuses its key fails the files that edit was routed from,
-    // and the edit is left out; settling below restores their sources. So
-    // does a path the plan backstop refuses, for every unit editing it.
-    const plan_failed = try ctx.alloc.alloc(?[]const u8, tree.files.len);
-    @memset(plan_failed, null);
     const leaf_plan_failed = try ctx.alloc.alloc(?[]const u8, generated.leaves.items.len);
     @memset(leaf_plan_failed, null);
     var struct_before: std.StringHashMap(?[]const u8) = .init(ctx.alloc);
