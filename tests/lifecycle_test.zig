@@ -7220,3 +7220,21 @@ test "rollback: an entry that holds a redacted secret is refused, never written"
     try std.testing.expectEqualStrings(before, try read(io, a, live));
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "redacted") == null);
 }
+
+test "snapshot ids: MOX_TEST_CLOCK sets them in a -Dtest-clock build and nowhere else" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .extra_env = &.{.{ .name = "MOX_TEST_CLOCK", .value = "1783671300" }} });
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const ids = try testutil.snapshotIds(h);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqual(mox.apply.snapshot.takes_test_clock, std.mem.eql(u8, ids[0], "20260710T081500Z"));
+}

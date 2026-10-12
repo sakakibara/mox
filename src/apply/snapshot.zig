@@ -27,6 +27,7 @@ const write_mod = @import("write.zig");
 const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
 const prov_map = @import("../provenance/root.zig").map;
+const build_options = @import("build_options");
 
 pub const id_len = "YYYYMMDDTHHMMSSZ".len;
 
@@ -50,7 +51,13 @@ pub fn formatId(epoch_secs: u64) [id_len]u8 {
     return out;
 }
 
+/// The epoch seconds `idNow` gives instead of the real clock, set from
+/// `MOX_TEST_CLOCK` in a build made with `-Dtest-clock` and never otherwise.
+pub var test_clock: ?u64 = null;
+pub const takes_test_clock = build_options.test_clock;
+
 pub fn idNow(io: Io) [id_len]u8 {
+    if (build_options.test_clock) if (test_clock) |secs| return formatId(secs);
     const now = Io.Clock.real.now(io).toSeconds();
     return formatId(if (now > 0) @intCast(now) else 0);
 }

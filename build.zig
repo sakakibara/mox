@@ -55,6 +55,9 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    // Snapshot ids read MOX_TEST_CLOCK instead of the real clock: for a binary
+    // a differential test drives, never for one that ships.
+    build_options.addOption(bool, "test_clock", b.option(bool, "test-clock", "Take snapshot ids from MOX_TEST_CLOCK (test builds only)") orelse false);
     lib_mod.addOptions("build_options", build_options);
 
     const exe_mod = b.createModule(.{
