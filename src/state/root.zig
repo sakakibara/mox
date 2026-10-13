@@ -63,12 +63,19 @@ fn nonEmptyDir(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
 pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
     const store = try Store.init(arena, opts.state_dir);
 
-    if (!opts.writes) if (try holdReaders(arena, io, store)) |why| return why;
+    // A reader takes the readers lock as it looks for the store: one found
+    // missing then reads as empty, whatever is created after.
+    const no_store = if (opts.writes) false else switch (try holdReaders(arena, io, store)) {
+        .ok => false,
+        .no_store => true,
+        .stop => |why| return why,
+    };
+    if (builtin.is_test) if (before_reader_load) |f| f(io);
     var report: recovery.Report = .{};
-    var loaded = try recovery.loadCurrent(arena, io, store, &report);
+    var loaded: recovery.Loaded = if (no_store) .{ .gen = null, .base = "" } else try recovery.loadCurrent(arena, io, store, &report);
     if (report.newer) |v| return .{ .refused = try std.fmt.allocPrint(arena, "mox: state written by a newer mox (v{d}); upgrade mox to use {s}\n", .{ v, opts.state_dir }) };
     if (!exists(io, store.current)) {
-        if (exists(io, store.v2) and nonEmptyDir(arena, io, store.gen)) {
+        if (!no_store and exists(io, store.v2) and nonEmptyDir(arena, io, store.gen)) {
             var probe: recovery.Report = .{};
             const adopted = try recovery.recover(arena, io, store, loaded, .{ .writes = false, .unlocked = !opts.locked }, &probe);
             if (adopted.gen == null) {
@@ -85,7 +92,7 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
         loaded = .{ .gen = null, .base = "" };
         report.restarted = true;
     }
-    if (!report.exhausted or opts.repair) {
+    if (!no_store and (!report.exhausted or opts.repair)) {
         loaded = try recovery.recover(arena, io, store, loaded, .{ .writes = opts.writes and opts.locked, .unlocked = !opts.locked }, &report);
     }
     const part = try draft.partOf(arena, io, opts.repo_dir, opts.home);
@@ -154,17 +161,18 @@ pub fn quarantineUnreadable(arena: std.mem.Allocator, io: Io, store: Store, repo
 var held_readers: ?lock.Readers = null;
 
 /// Hold the readers lock until `releaseReaders`, so no generation or blob the
-/// command reads is deleted under it. Nothing to hold before the store
-/// exists, nor when the lock file is missing and cannot be created; any
-/// other failure is why the command cannot run.
-fn holdReaders(arena: std.mem.Allocator, io: Io, store: Store) !?Opened {
-    if (held_readers != null) return null;
+/// command reads is deleted under it: `no_store` when there is no store to
+/// hold it in. A lock file that is missing and cannot be created is read
+/// without; any other failure is why the command cannot run.
+fn holdReaders(arena: std.mem.Allocator, io: Io, store: Store) !union(enum) { ok, no_store, stop: Opened } {
+    if (held_readers != null) return .ok;
     switch (lock.holdReaders(io, store.readers)) {
         .held => |r| held_readers = r,
-        .no_store, .unavailable => {},
-        .failed => |e| return try readersFailure(arena, store.readers, e),
+        .no_store => return .no_store,
+        .unavailable => {},
+        .failed => |e| return .{ .stop = try readersFailure(arena, store.readers, e) },
     }
-    return null;
+    return .ok;
 }
 
 fn readersFailure(arena: std.mem.Allocator, path: []const u8, e: anyerror) !Opened {
@@ -185,6 +193,10 @@ pub fn releaseReaders() void {
     held_readers = null;
 }
 
+/// The test seam between a reader's attempt at the readers lock and its
+/// load.
+pub var before_reader_load: ?*const fn (Io) void = null;
+
 pub const Expectation = union(enum) {
     expects: bool,
     /// The command must not run; the message says why.
@@ -197,9 +209,12 @@ pub const Expectation = union(enum) {
 /// a dead run's journal included.
 pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !Expectation {
     const store = try Store.init(arena, state_dir);
-    const readers: ?lock.Readers = switch (lock.holdReaders(io, store.readers)) {
+    const attempt = lock.holdReaders(io, store.readers);
+    if (builtin.is_test) if (before_reader_load) |f| f(io);
+    const readers: ?lock.Readers = switch (attempt) {
         .held => |r| r,
-        .no_store, .unavailable => null,
+        .no_store => return .{ .expects = false },
+        .unavailable => null,
         .failed => |e| return switch (try readersFailure(arena, store.readers, e)) {
             .refused => |why| .{ .refused = why },
             .unsupported => |errno| .{ .unsupported = errno },

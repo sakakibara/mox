@@ -954,6 +954,51 @@ test "readers: a readers.lock that cannot be opened names its path and what to d
     try std.testing.expect(contains(ap.err, readers));
 }
 
+var raced_harness: ?Harness = null;
+var unlocked_reads: usize = 0;
+var locked_reads: usize = 0;
+
+fn noteRead(io: Io, store: mox.state.Store) void {
+    if (mox.state.lock.readersHeld(io, store.readers)) locked_reads += 1 else unlocked_reads += 1;
+}
+
+test "readers: a store created between a reader's start checks and its load is read only under its lock" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    raced_harness = h;
+    defer raced_harness = null;
+    defer mox.state.before_reader_load = null;
+    defer mox.state.recovery.on_read_current = null;
+    // status reads the private expectation first; snapshot opens the state
+    // directly.
+    for ([_][]const u8{ "status", "snapshot" }) |cmd| {
+        Io.Dir.cwd().deleteTree(io, h.state) catch {};
+        unlocked_reads = 0;
+        locked_reads = 0;
+        mox.state.recovery.on_read_current = null;
+        mox.state.before_reader_load = struct {
+            fn commitFirst(_: Io) void {
+                mox.state.before_reader_load = null;
+                const r = raced_harness.?.run(&.{ "mox", "apply" }) catch unreachable;
+                std.testing.expectEqual(@as(u8, 0), r.rc) catch unreachable;
+                mox.state.recovery.on_read_current = noteRead;
+            }
+        }.commitFirst;
+        const r = try h.run(&.{ "mox", cmd });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(mox.state.before_reader_load == null);
+        try std.testing.expect(exists(io, try statePath(h, &.{ "v2", "current" })));
+        try std.testing.expectEqual(@as(usize, 0), unlocked_reads);
+    }
+}
+
 fn trashIds(h: Harness) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var d = Io.Dir.cwd().openDir(h.io, try statePath(h, &.{"trash"}), .{ .iterate = true }) catch return out.items;

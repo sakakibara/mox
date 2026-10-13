@@ -56,7 +56,11 @@ pub fn parseCurrent(bytes: []const u8) ?Current {
     return .{ .id = first, .parent = second };
 }
 
+/// The test seam each read of `current` passes.
+pub var on_read_current: ?*const fn (Io, Store) void = null;
+
 pub fn readCurrent(arena: std.mem.Allocator, io: Io, store: Store) ![]const u8 {
+    if (builtin.is_test) if (on_read_current) |f| f(io, store);
     return Io.Dir.cwd().readFileAlloc(io, store.current, arena, .limited(4096)) catch |e| switch (e) {
         error.FileNotFound => "",
         error.OutOfMemory => return e,
