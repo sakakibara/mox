@@ -3,6 +3,7 @@
 //! that opens anything there.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 pub const generation = @import("generation.zig");

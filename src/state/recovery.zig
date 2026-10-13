@@ -6,6 +6,7 @@
 //! runs it with writes off and reaches the same state in memory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const json = @import("json");
 const generation = @import("generation.zig");
@@ -319,7 +320,7 @@ pub fn commit(d: *Draft, opts: CommitOptions) !?[]const u8 {
         Io.Dir.cwd().deleteFile(io, j.path) catch {};
         return null;
     }
-    if (before_commit_point) |f| f(io);
+    if (builtin.is_test) if (before_commit_point) |f| f(io);
     const now = try readCurrent(arena, io, d.store);
     if (!std.mem.eql(u8, now, d.base)) {
         var report: Report = .{};

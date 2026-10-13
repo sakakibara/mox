@@ -146,7 +146,7 @@ fn startKnown(s: []const u8) bool {
 }
 
 /// The test seam for a filesystem that cannot lock.
-pub var forced_failure: ?anyerror = null;
+pub var forced_failure: ?Io.File.LockError = null;
 
 const windows = std.os.windows;
 const Overlapped = extern struct {
@@ -168,8 +168,8 @@ fn winOverlapped() Overlapped {
     return .{ .offset_high = win_lock_offset_high };
 }
 
-fn tryLockFile(io: Io, file: Io.File) !bool {
-    if (forced_failure) |e| return e;
+fn tryLockFile(io: Io, file: Io.File) Io.File.LockError!bool {
+    if (builtin.is_test) if (forced_failure) |e| return e;
     if (is_windows) {
         var ov = winOverlapped();
         if (LockFileEx(file.handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov).toBool()) return true;
@@ -377,7 +377,7 @@ test "lock: a filesystem that cannot lock fails closed, naming the errno" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const sd = try tmpState(a, io, &tmp);
-    for ([_]struct { anyerror, []const u8 }{ .{ error.FileLocksUnsupported, "ENOTSUP" }, .{ error.SystemResources, "ENOLCK" } }) |c| {
+    for ([_]struct { Io.File.LockError, []const u8 }{ .{ error.FileLocksUnsupported, "ENOTSUP" }, .{ error.SystemResources, "ENOLCK" } }) |c| {
         forced_failure = c[0];
         defer forced_failure = null;
         const got = try acquire(a, io, sd, "apply");
