@@ -231,6 +231,82 @@ test "state: an uninstall whose commit finds the state changed exits 2 and strip
     try std.testing.expect(contains(try read(io, a, gen), ".zshrc"));
 }
 
+/// An owned TOML target applied once, its owned record's canonical blob
+/// then deleted, beside a plain file.
+fn ownedWithoutCanonical(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, h: Harness) ![]const u8 {
+    try writeRepo(io, tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 1\n");
+    try writeRepo(io, tmp, "repo/src/.plain", "p1\n");
+    try writeRepo(io, tmp, "home/app.toml", "[a]\nk = 0\n\n[b]\nx = 1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const store = try mox.state.Store.init(a, h.state);
+    const g = (try mox.state.recovery.readGeneration(a, io, store, try currentId(h), null)).?;
+    const hex = g.paths.get(try h.liveOf("app.toml")).?.owned.?.canonical_blob.?;
+    const blob = try statePath(h, &.{ "v2", "blobs", &hex });
+    try Io.Dir.cwd().deleteFile(io, blob);
+    return blob;
+}
+
+test "state: an owned record whose canonical blob is gone is an error naming it, never a first contact" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    const blob = try ownedWithoutCanonical(a, io, &tmp, h);
+    const remedy = "mox apply --overwrite ~/app.toml";
+
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 1), s.rc);
+    try std.testing.expect(contains(s.out, blob) or contains(s.err, blob));
+    try std.testing.expect(contains(s.out, remedy) or contains(s.err, remedy));
+
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(contains(d.out, blob) or contains(d.err, blob));
+
+    const doc = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(contains(doc.out, blob));
+
+    // apply fails that file only: the other still writes, and the owned
+    // target is neither patched nor written whole.
+    try writeRepo(io, &tmp, "repo/src/.plain", "p2\n");
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 2\n");
+    const before = try read(io, a, try h.liveOf("app.toml"));
+    const ap = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), ap.rc);
+    try std.testing.expect(contains(ap.err, blob));
+    try std.testing.expectEqualStrings("p2\n", try read(io, a, try h.liveOf(".plain")));
+    try std.testing.expectEqualStrings(before, try read(io, a, try h.liveOf("app.toml")));
+
+    try testutil.gitTracked(io, a, h.repo);
+    const c = try h.run(&.{ "mox", "commit", "--yes" });
+    try std.testing.expect(contains(c.out, blob) or contains(c.err, blob));
+
+    // The remedy as printed writes the owned keys again and records them.
+    const fixed = try h.run(&.{ "mox", "apply", "--overwrite", try h.liveOf("app.toml") });
+    try std.testing.expectEqual(@as(u8, 0), fixed.rc);
+    try std.testing.expect(contains(try read(io, a, try h.liveOf("app.toml")), "k = 2"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "state: rollback re-patches an owned target whose record lost its canonical blob, never restoring it whole" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    _ = try ownedWithoutCanonical(a, io, &tmp, h);
+    try writeRepo(io, &tmp, "home/app.toml", "[a]\nk = 1\n\n[b]\nx = 2\n");
+    _ = try h.run(&.{ "mox", "rollback" });
+    const live = try read(io, a, try h.liveOf("app.toml"));
+    try std.testing.expect(contains(live, "x = 2"));
+}
+
 /// The id `current` names.
 const currentId = testutil.currentId;
 

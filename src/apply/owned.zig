@@ -55,6 +55,12 @@ pub fn classify(
 /// subtrees, `.disown` compares the whole document minus them. One entry
 /// point so every consumer (apply, status, diff, commit) stays a single
 /// code path parameterized by mode.
+/// Why an owned target whose record lost its canonical text stops: what it
+/// recorded cannot be compared against, and the remedy.
+pub fn canonicalMissingWhy(arena: std.mem.Allocator, blob_path: []const u8, shown: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "its owned record's canonical text, {s}, is missing or damaged, so its drift cannot be judged; `mox apply --overwrite {s}` writes the owned keys again", .{ blob_path, shown });
+}
+
 pub fn classifyMode(
     arena: std.mem.Allocator,
     mode: applied.Mode,

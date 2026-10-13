@@ -530,7 +530,7 @@ fn diffOne(
 /// its exit contract.
 fn diffPartial(
     ctx: *app.Ctx,
-    st: *const State,
+    st: *State,
     sty: style.Style,
     stat_mode: bool,
     file: mox.source.tree.ManagedFile,
@@ -607,6 +607,11 @@ fn diffPartial(
         },
     };
     const record = try st.readOwned(live_path);
+    if (record) |r| if (r.canonical_missing) |b| {
+        const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(live_path, ctx.context.?.paths.home)});
+        try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, try owned_mod.canonicalMissingWhy(ctx.alloc, b, shown) });
+        return;
+    };
     var secret_paths: std.ArrayList(mox.source.tree.OwnPath) = .empty;
     if (record) |r| try secret_paths.appendSlice(ctx.alloc, try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths));
     for (secret_scope, flags) |p, flagged| {

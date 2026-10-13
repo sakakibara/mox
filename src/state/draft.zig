@@ -153,19 +153,41 @@ pub const Draft = struct {
         return true;
     }
 
-    pub fn readOwned(d: *const Draft, live: []const u8) !?applied.OwnedRecord {
+    /// The owned record of `live`. One whose canonical text is missing or
+    /// damaged is still a record: `canonical_missing` names where it was.
+    pub fn readOwned(d: *Draft, live: []const u8) !?applied.OwnedRecord {
         const o = d.ownedRec(live) orelse return null;
-        var canonical: ?[]const u8 = null;
-        if (!o.secret) canonical = (try blob.get(d.arena, d.io, d.store.blobs, o.canonical_blob orelse return null)) orelse return null;
-        return .{
+        var rec: applied.OwnedRecord = .{
             .mode = o.mode,
-            .canonical = canonical,
+            .canonical = null,
             .canonical_hash = o.canonical_sha256,
             .secret = o.secret,
             .own_paths = o.own_paths,
             .secret_paths = o.secret_paths,
             .live_path = live,
         };
+        if (o.secret) return rec;
+        const h = o.canonical_blob orelse {
+            rec.canonical_missing = d.store.blobs;
+            return rec;
+        };
+        if (try blob.get(d.arena, d.io, d.store.blobs, h)) |bytes| {
+            rec.canonical = bytes;
+        } else if (try d.reloadOnce()) {
+            return d.readOwned(live);
+        } else rec.canonical_missing = try blob.pathOf(d.arena, d.store.blobs, h);
+        return rec;
+    }
+
+    /// Every live path whose owned record keeps no readable canonical text,
+    /// with where it should be.
+    pub fn missingCanonicals(d: *Draft) ![]const MissingCanonical {
+        var out: std.ArrayList(MissingCanonical) = .empty;
+        for (d.gen.paths.keys()) |k| {
+            const rec = (try d.readOwned(k)) orelse continue;
+            if (rec.canonical_missing) |b| try out.append(d.arena, .{ .live = k, .blob = b });
+        }
+        return out.items;
     }
 
     /// The symlink record for `live`, rolled back or not.
@@ -656,6 +678,8 @@ pub const Draft = struct {
         return d.gen.displaced.count() > 0;
     }
 };
+
+pub const MissingCanonical = struct { live: []const u8, blob: []const u8 };
 
 /// A writable draft over an empty store at `state_dir`, for unit tests.
 pub fn testDraft(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !*Draft {

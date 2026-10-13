@@ -1162,6 +1162,12 @@ it commits -- something other than mox wrote it while the run held the lock
 without going on, so an apply runs no `scripts/post` and uninstall strips
 nothing.
 
+An owned target whose record has lost its canonical text -- the blob
+under `v2/blobs/` is missing or damaged -- is an `ERROR` in `status`,
+`diff`, `commit` and `apply`, naming the blob and the remedy, `mox apply
+--overwrite <path>`, which writes the owned keys again; apply leaves that
+file alone otherwise and goes on with the rest, and `mox doctor` lists it.
+
 A generation that cannot be read is skipped for the one before it, with a
 warning, and writes go on. When none can be read, every command reads an
 empty state with a warning and every command that writes refuses: `mox:

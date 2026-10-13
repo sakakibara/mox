@@ -2564,7 +2564,15 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
         },
     };
 
-    const record = try st.readOwned(live_path);
+    var record = try st.readOwned(live_path);
+    if (record) |r| if (r.canonical_missing) |b| {
+        if (!in.force) {
+            try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, try owned_mod.canonicalMissingWhy(ctx.alloc, b, shown) });
+            counts.fail += 1;
+            return;
+        }
+        record = null;
+    };
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
 
     const composed_canon = switch (mode) {

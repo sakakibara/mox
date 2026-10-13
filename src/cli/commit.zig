@@ -5498,7 +5498,7 @@ fn processPartialFile(
     fidx: usize,
     spaces: []?FileSpace,
     repo_dir: []const u8,
-    st: *const State,
+    st: *State,
     skipped_secret: *usize,
 ) !HunkOutcome {
     const arena = cc.arena;
@@ -5571,6 +5571,10 @@ fn processPartialFile(
     };
 
     const record = try st.readOwned(live_path);
+    if (record) |r| if (r.canonical_missing) |b| {
+        try partialManual(cc, ra, file, fidx, spaces, repo_dir, "  ERROR   {f} ({s})\n", .{ shown, try owned_mod.canonicalMissingWhy(arena, b, try std.fmt.allocPrint(arena, "{f}", .{shown})) });
+        return .cont;
+    };
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(arena, r.own_paths) else &.{};
 
     // Only owned drift is committable: clean has nothing to route, and
@@ -6261,7 +6265,7 @@ fn finalNewlineManual(cc: *const ClassCtx, ra: *const RunAccum, live_path: []con
 /// Whether the live file at a path mox recorded no longer holds what was
 /// recorded there: a special inode, content whose hash differs, or for an
 /// owned record an owned form that differs or cannot be extracted.
-fn editedSinceRecord(arena: std.mem.Allocator, io: Io, st: *const State, file: mox.source.tree.ManagedFile) !bool {
+fn editedSinceRecord(arena: std.mem.Allocator, io: Io, st: *State, file: mox.source.tree.ManagedFile) !bool {
     const live_path = file.live_path;
     const recorded = st.read(live_path);
     const owned = if (recorded == null) (try st.readOwned(live_path)) orelse return false else null;
@@ -6276,6 +6280,7 @@ fn editedSinceRecord(arena: std.mem.Allocator, io: Io, st: *const State, file: m
     };
     if (recorded) |hash| return !std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(live));
     const rec = owned.?;
+    if (rec.canonical_missing != null) return true;
     const format = file.format orelse return true;
     const doc = mox.apply.partial.OwnedDoc.parse(arena, format, live) catch |e| switch (e) {
         error.OutOfMemory => return e,

@@ -1232,7 +1232,7 @@ fn ownAnnotation(arena: std.mem.Allocator, file: mox.source.tree.ManagedFile) ![
 /// document (OUTDATED), clean when all equal. A composed document violating
 /// its declaration, or an unparseable composed/live file, is ERROR --
 /// the same shapes apply refuses.
-fn partialCell(ctx: *app.Ctx, st: *const State, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), why: *?[]const u8) !Label {
+fn partialCell(ctx: *app.Ctx, st: *State, file: mox.source.tree.ManagedFile, composed: []const u8, units: *std.ArrayList(mox.apply.drift.Unit), why: *?[]const u8) !Label {
     const partial_mod = mox.apply.partial;
     const owned_mod = mox.apply.owned;
     const err_cell: Label = .err;
@@ -1273,6 +1273,10 @@ fn partialCell(ctx: *app.Ctx, st: *const State, file: mox.source.tree.ManagedFil
     };
 
     const record = try st.readOwned(file.live_path);
+    if (record) |r| if (r.canonical_missing) |b| {
+        why.* = try owned_mod.canonicalMissingWhy(ctx.alloc, b, try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(file.live_path, ctx.context.?.paths.home)}));
+        return err_cell;
+    };
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};
     const class = try owned_mod.classifyMode(ctx.alloc, mode, &owned, &live_doc, file.own_paths, record, record_paths);
     if (mox.apply.drift.ownedFile(file.live_path, class, record)) |u| try units.append(ctx.alloc, u);

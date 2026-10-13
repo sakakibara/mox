@@ -232,19 +232,27 @@ fn doctorOpened(ctx: *app.Ctx, opened: state_cli.Opened, fix: bool, rebuild_prov
 
     // Malformed provenance records (rebuildable).
     const bad_prov = try findMalformedProvenance(ctx.alloc, st);
-    var problems = bad_prov.len;
     for (bad_prov) |p| {
         try ctx.out.print("  bad-provenance {s} (fails to read)\n", .{p});
     }
 
-    problems += try stateRows(ctx, st, opened.report, fix);
+    // Owned records whose canonical text is gone: apply refuses each until
+    // it is written again.
+    const missing = try st.missingCanonicals();
+    for (missing) |m| {
+        const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(m.live, context.paths.home)});
+        try ctx.out.print("  missing-canonical {s} ({s})\n", .{ shown, try mox.apply.owned.canonicalMissingWhy(ctx.alloc, m.blob, shown) });
+    }
+
+    const other_problems = missing.len + try stateRows(ctx, st, opened.report, fix);
+    var problems = bad_prov.len + other_problems;
 
     if (rebuild_prov) {
         const rebuilt = (try rebuildProvenance(ctx, st, src_dir)) orelse return 2;
         try ctx.out.print("  rebuilt provenance for {d} recorded file(s)\n", .{rebuilt});
         // A successful rebuild re-writes every recorded file's provenance, so
         // re-check whether any malformed records remain.
-        problems = (try findMalformedProvenance(ctx.alloc, st)).len;
+        problems = (try findMalformedProvenance(ctx.alloc, st)).len + other_problems;
     }
 
     if (rebuild_coupling) {
