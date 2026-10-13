@@ -49,7 +49,7 @@ const HeldLock = struct {
     io: Io,
 
     fn take(h: Harness, command: []const u8) !HeldLock {
-        try Io.Dir.cwd().createDirPath(h.io, h.state);
+        try testutil.markState(h);
         const path = try statePath(h, &.{"mox.lock"});
         const f = try Io.Dir.cwd().createFile(h.io, path, .{ .read = true, .truncate = false });
         if (!try f.tryLock(h.io, .exclusive)) return error.LockTaken;
@@ -245,6 +245,7 @@ test "state: a generation a newer mox wrote is refused" {
     try writeRepo(io, &tmp, "repo/src/.zshrc", "x\n");
     try writeRepo(io, &tmp, "state/v2/current", "20260101T000000Z\n");
     try writeRepo(io, &tmp, "state/v2/gen/20260101T000000Z.json", "{\"v\":3}");
+    try testutil.markState(h);
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(contains(r.err, "state written by a newer mox (v3)"));
@@ -931,6 +932,7 @@ test "state: mv and export run the start checks, refusing a state a newer mox wr
     try writeRepo(io, &tmp, "repo/src/.zshrc", "x\n");
     try writeRepo(io, &tmp, "state/v2/current", "20260101T000000Z\n");
     try writeRepo(io, &tmp, "state/v2/gen/20260101T000000Z.json", "{\"v\":3}");
+    try testutil.markState(h);
     const mv = try h.run(&.{ "mox", "mv", ".zshrc", ".zshrc2" });
     try std.testing.expectEqual(@as(u8, 2), mv.rc);
     try std.testing.expect(contains(mv.err, "state written by a newer mox (v3)"));
@@ -1712,13 +1714,13 @@ test "uninstall: a state directory holding nothing mox made is refused, and noth
     const before = try treeOf(a, io, target);
     const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots", "--purge-trash", "--purge-private" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(contains(r.err, "nothing mox made"));
+    try std.testing.expect(contains(r.err, "is not a mox state directory"));
     const after = try treeOf(a, io, target);
     try std.testing.expectEqual(before.count(), after.count());
     for (before.keys(), before.values()) |k, v| try std.testing.expectEqualStrings(v, after.get(k).?);
 }
 
-test "uninstall: with MOX_STATE_DIR=. in a home directory, it removes only what mox made there" {
+test "state directory: MOX_STATE_DIR=. in a home directory is refused, and nothing is created or removed there" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1730,23 +1732,17 @@ test "uninstall: with MOX_STATE_DIR=. in a home directory, it removes only what 
     h = try withState(h, ".");
     try writeRepo(io, &tmp, "home/Documents/thesis.txt", "precious\n");
     try writeRepo(io, &tmp, "home/.bashrc", "alias l=ls\n");
-    const docs = try std.fs.path.join(a, &.{ h.home, "Documents", "thesis.txt" });
-    const bashrc = try std.fs.path.join(a, &.{ h.home, ".bashrc" });
-    const first = try h.run(&.{ "mox", "uninstall" });
-    try std.testing.expectEqual(@as(u8, 2), first.rc);
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.home, "mox.lock" })));
-
     try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.home, "v2" })));
-    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
-    try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expectEqualStrings("precious\n", try read(io, a, docs));
-    try std.testing.expectEqualStrings("alias l=ls\n", try read(io, a, bashrc));
-    try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
-    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.home, "v2" })));
-    try std.testing.expect(contains(r.out, "kept ~/Documents (not made by mox)"));
-    try std.testing.expect(contains(r.out, "kept ~/.bashrc (not made by mox)"));
+    const names = try namesIn(a, io, h.home);
+    for ([_][]const []const u8{ &.{ "mox", "uninstall" }, &.{ "mox", "apply" }, &.{ "mox", "uninstall", "--purge-snapshots" } }) |argv| {
+        const r = try h.run(argv);
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        try std.testing.expect(contains(r.err, "is not a mox state directory"));
+        const now = try namesIn(a, io, h.home);
+        try std.testing.expectEqual(names.len, now.len);
+    }
+    try std.testing.expectEqualStrings("precious\n", try read(io, a, try std.fs.path.join(a, &.{ h.home, "Documents", "thesis.txt" })));
+    try std.testing.expectEqualStrings("alias l=ls\n", try read(io, a, try std.fs.path.join(a, &.{ h.home, ".bashrc" })));
 }
 
 test "uninstall: an entry of the state directory mox did not make is kept and listed, and a link in it is not followed" {
@@ -1784,9 +1780,8 @@ test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept an
     const a = arena.allocator();
     var h = try setup(a, io, &tmp);
 
-    // A home directory named as the state directory, with a lock file a
-    // run left in it.
-    try writeRepo(io, &tmp, "homelike/mox.lock", "");
+    // A home directory named as the state directory, marked as mox's.
+    try writeRepo(io, &tmp, "homelike/.mox-state", "mox state 1\n");
     try writeRepo(io, &tmp, "homelike/bin/user-script", "#!/bin/sh\n");
     try writeRepo(io, &tmp, "homelike/tmp/notes", "mine\n");
     try writeRepo(io, &tmp, "homelike/trash/old-photos/a.jpg", "jpg\n");
@@ -1801,12 +1796,11 @@ test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept an
     try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds notes, which mox did not make)", .{try statePath(foreign, &.{"tmp"})})));
     try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds old-photos, which mox did not make)", .{try statePath(foreign, &.{"trash"})})));
 
-    // Without the lock file, a bin/ and tmp/ of the user's are not mox's.
-    try Io.Dir.cwd().deleteFile(io, try statePath(foreign, &.{"mox.lock"}));
-    for ([_][]const u8{ "readers.lock", "readers.gate" }) |n| Io.Dir.cwd().deleteFile(io, try statePath(foreign, &.{n})) catch {};
+    // Without the marker, a bin/ and tmp/ of the user's are not mox's.
+    for ([_][]const u8{ ".mox-state", "mox.lock", "readers.lock", "readers.gate" }) |n| Io.Dir.cwd().deleteFile(io, try statePath(foreign, &.{n})) catch {};
     const refused = try foreign.run(&.{ "mox", "uninstall" });
     try std.testing.expectEqual(@as(u8, 2), refused.rc);
-    try std.testing.expect(contains(refused.err, "nothing mox made"));
+    try std.testing.expect(contains(refused.err, "is not a mox state directory"));
 
     // A real state: the scripts' bin/ apply made, the package managers'
     // scratch files and a trash generation are mox's, and go.
@@ -1822,6 +1816,186 @@ test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept an
     const ok = try h.run(&.{ "mox", "uninstall", "--purge-trash" });
     try std.testing.expectEqual(@as(u8, 0), ok.rc);
     for ([_][]const u8{ "bin", "tmp", "trash" }) |n| try std.testing.expect(!exists(io, try statePath(h, &.{n})));
+}
+
+/// The top-level entry names of `dir`, sorted; none when it is absent.
+fn namesIn(a: std.mem.Allocator, io: Io, dir: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return out.items;
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| try out.append(a, try a.dupe(u8, e.name));
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out.items;
+}
+
+/// A home directory named as the state directory: a script of the user's
+/// in `bin/`, notes in `v2/`, a photo in `snapshots/`.
+fn homeLike(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, h: Harness) !Harness {
+    try writeRepo(io, tmp, "homelike/bin/user-script", "#!/bin/sh\n");
+    try writeRepo(io, tmp, "homelike/v2/notes", "notes\n");
+    try writeRepo(io, tmp, "homelike/trash/photo", "jpg\n");
+    try writeRepo(io, tmp, "homelike/.bashrc", "alias l=ls\n");
+    return withState(h, try std.fs.path.join(a, &.{ h.root, "homelike" }));
+}
+
+fn expectHomeLikeKept(io: Io, a: std.mem.Allocator, h: Harness) !void {
+    try std.testing.expectEqualStrings("#!/bin/sh\n", try read(io, a, try statePath(h, &.{ "bin", "user-script" })));
+    try std.testing.expectEqualStrings("notes\n", try read(io, a, try statePath(h, &.{ "v2", "notes" })));
+    try std.testing.expectEqualStrings("jpg\n", try read(io, a, try statePath(h, &.{ "trash", "photo" })));
+    try std.testing.expectEqualStrings("alias l=ls\n", try read(io, a, try statePath(h, &.{".bashrc"})));
+}
+
+/// The setup a run that reaches the script runner needs: a managed file and
+/// a pre script.
+fn withScript(io: Io, a: std.mem.Allocator, tmp: *std.testing.TmpDir, h: Harness) !void {
+    try writeRepo(io, tmp, "repo/src/.zshrc", "v1\n");
+    try writeRepo(io, tmp, "repo/scripts/pre/00-noop.sh", "#!/bin/sh\nexit 0\n");
+    try chmodPath(a, try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "00-noop.sh" }), 0o755);
+}
+
+test "state directory: one that holds no marker is refused by every command, and nothing in it is read, created or removed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+    try withScript(io, a, &tmp, h);
+    h = try homeLike(a, io, &tmp, h);
+    const names = try namesIn(a, io, h.state);
+    const before = try treeOf(a, io, h.state);
+    const commands = [_][]const []const u8{
+        &.{ "mox", "apply" },
+        &.{ "mox", "apply", "--dry-run" },
+        &.{ "mox", "status" },
+        &.{ "mox", "diff" },
+        &.{ "mox", "snapshot" },
+        &.{ "mox", "export", try std.fs.path.join(a, &.{ h.root, "out" }) },
+        &.{ "mox", "mv", try h.liveOf(".zshrc"), try h.liveOf(".zshrc2") },
+        &.{ "mox", "add", try h.liveOf(".zshrc") },
+        &.{ "mox", "facts", "set", "x", "y" },
+        &.{ "mox", "trigger", "every", "k", "1" },
+        &.{ "mox", "uninstall", "--purge-snapshots", "--purge-trash", "--purge-private" },
+    };
+    for (commands) |argv| {
+        const r = try h.run(argv);
+        if (r.rc != 2 or !contains(r.err, "is not a mox state directory")) std.debug.print("{s}: rc {d}\n{s}\n", .{ argv[1], r.rc, r.err });
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        try std.testing.expect(contains(r.err, try std.fmt.allocPrint(a, "{s} is not a mox state directory", .{h.state})));
+        try std.testing.expect(contains(r.err, "point MOX_STATE_DIR at a dedicated directory"));
+        const now = try namesIn(a, io, h.state);
+        try std.testing.expectEqual(names.len, now.len);
+        for (names, now) |x, y| try std.testing.expectEqualStrings(x, y);
+        const after = try treeOf(a, io, h.state);
+        try std.testing.expectEqual(before.count(), after.count());
+        for (before.keys(), before.values()) |k, v| try std.testing.expectEqualStrings(v, after.get(k).?);
+    }
+    try std.testing.expect(!exists(io, try h.liveOf(".zshrc")));
+}
+
+test "state directory: a stray empty mox.lock is no evidence, and one the marker makes mox's keeps every entry mox did not make, through every command" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+    try withScript(io, a, &tmp, h);
+    h = try homeLike(a, io, &tmp, h);
+    try writeRepo(io, &tmp, "homelike/mox.lock", "");
+    const refused = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 2), refused.rc);
+    try std.testing.expect(contains(refused.err, "is not a mox state directory"));
+    try writeRepo(io, &tmp, "homelike/.mox-state", "mox state 1\n");
+    for ([_][]const []const u8{
+        &.{ "mox", "status" },
+        &.{ "mox", "apply" },
+        &.{ "mox", "status" },
+        &.{ "mox", "uninstall", "--purge-snapshots", "--purge-trash" },
+    }) |argv| {
+        const r = try h.run(argv);
+        if (std.mem.eql(u8, argv[1], "uninstall")) {
+            try std.testing.expectEqual(@as(u8, 0), r.rc);
+            try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds user-script, which mox did not make)", .{try statePath(h, &.{"bin"})})));
+            try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds photo, which mox did not make)", .{try statePath(h, &.{"trash"})})));
+            try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds notes, which mox did not make)", .{try statePath(h, &.{"v2"})})));
+        }
+        try expectHomeLikeKept(io, a, h);
+    }
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
+}
+
+test "state directory: a fresh state, an absent or empty one, gets the marker on its first write, and a reader creates nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    _ = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(!exists(io, h.state));
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    _ = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(usize, 0), (try namesIn(a, io, h.state)).len);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const marker = try statePath(h, &.{".mox-state"});
+    try std.testing.expectEqualStrings("mox state 1\n", try read(io, a, marker));
+    if (builtin.os.tag != .windows) {
+        const st = try Io.Dir.cwd().statFile(io, marker, .{});
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+
+    // A state directory that holds only the private layer is one the user
+    // set up before the first run.
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const p = try setup(a, io, &tmp2);
+    try writeRepo(io, &tmp2, "repo/src/.zshrc", "v1\n");
+    try writeRepo(io, &tmp2, "state/private/.p", "private\n");
+    try std.testing.expectEqual(@as(u8, 0), (try p.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("private\n", try read(io, a, try p.liveOf(".p")));
+    try std.testing.expect(exists(io, try statePath(p, &.{".mox-state"})));
+}
+
+test "state directory: a full uninstall removes the marker last, and one that keeps mox's entries keeps it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const marker = try statePath(h, &.{".mox-state"});
+    const kept = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 0), kept.rc);
+    try std.testing.expect(exists(io, marker));
+    try std.testing.expect(contains(kept.out, try std.fmt.allocPrint(a, "kept {s}", .{marker})));
+    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, marker));
+    const line = try std.fmt.allocPrint(a, "  removed {s}\n", .{marker});
+    const at = std.mem.indexOf(u8, r.out, line) orelse return error.MarkerNotRemoved;
+    try std.testing.expect(std.mem.indexOf(u8, r.out[at + line.len ..], "  removed ") == null);
+    for (try namesIn(a, io, h.state)) |n| {
+        const lockish = std.mem.eql(u8, n, "mox.lock") or std.mem.eql(u8, n, "readers.lock") or std.mem.eql(u8, n, "readers.gate");
+        if (!lockish) std.debug.print("left: {s}\n", .{n});
+        try std.testing.expect(lockish);
+    }
 }
 
 /// Readers that overlap one another, each its own holder as a separate mox

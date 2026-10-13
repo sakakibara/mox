@@ -16,6 +16,7 @@ pub const id = @import("id.zig");
 pub const lock = @import("lock.zig");
 pub const durable = @import("durable.zig");
 pub const dump = @import("dump.zig");
+pub const marker = @import("marker.zig");
 const quote = @import("quote.zig");
 
 pub const Draft = draft.Draft;
@@ -61,8 +62,13 @@ fn nonEmptyDir(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
     return entries.len > 0;
 }
 
-/// Load the state for a command: recovery, then the draft.
+/// Load the state for a command: the state directory accepted as mox's,
+/// then recovery and the draft.
 pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
+    switch (try marker.accept(arena, io, opts.state_dir)) {
+        .refused => |why| return .{ .refused = why },
+        .accepted => |k| if (k == .fresh and opts.writes) try marker.mark(arena, io, opts.state_dir),
+    }
     const store = try Store.init(arena, opts.state_dir);
 
     // A reader takes the readers lock as it looks for the store: one found
@@ -147,7 +153,31 @@ pub fn isStateEntry(name: []const u8) bool {
     return false;
 }
 
-pub const Deleted = struct { path: []const u8, err: ?anyerror = null };
+pub const Deleted = struct {
+    path: []const u8,
+    err: ?anyerror = null,
+    /// Why it was kept: it holds what mox did not make.
+    kept: ?[]const u8 = null,
+};
+
+/// Why `name`, a top-level entry of a state directory named as one this
+/// module makes, is not mox's: null when it is, or when its name alone
+/// decides. The store is mox's only while it holds nothing but what mox
+/// puts there.
+pub fn notOwn(arena: std.mem.Allocator, io: Io, state_dir: []const u8, name: []const u8) !?[]const u8 {
+    if (!isHistory(name)) return null;
+    return marker.whyNotOwn(arena, io, try std.fs.path.join(arena, &.{ state_dir, name }), storeEntry);
+}
+
+/// A durable write's temporary file, left by a crash.
+fn isTemp(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, ".tmp-");
+}
+
+fn storeEntry(e: @import("../source/dirent.zig").Entry) bool {
+    for ([_][]const u8{ "gen", "blobs", "pending", "quarantine", "current", draft.secret_key_name, "cleanup-deferred" }) |n| if (std.mem.eql(u8, e.name, n)) return true;
+    return isTemp(e.name);
+}
 
 /// Claim an id for a run that trashes without a journal, as a journal's id
 /// is claimed.
@@ -164,13 +194,15 @@ pub fn excludeReaders(arena: std.mem.Allocator, io: Io, state_dir: []const u8, w
 }
 
 /// Delete the history, `v2/`, whatever state it is in: no generation needs
-/// to be readable. Waits for the readers first.
+/// to be readable. One holding what mox did not make is kept whole. Waits
+/// for the readers first.
 pub fn purgeHistory(arena: std.mem.Allocator, io: Io, state_dir: []const u8, wait: ?lock.Wait) !?Deleted {
     const store = try Store.init(arena, state_dir);
     const excl = try lock.waitExclusive(io, store.readers, store.v2, wait);
     defer if (excl) |x| x.release();
     const h = try history(arena, io, state_dir);
     if (!h.present) return null;
+    if (try notOwn(arena, io, state_dir, draft.store_dir_name)) |why| return .{ .path = h.path, .kept = why };
     Io.Dir.cwd().deleteTree(io, h.path) catch |e| return .{ .path = h.path, .err = e };
     return .{ .path = h.path };
 }
@@ -239,6 +271,10 @@ pub const Expectation = union(enum) {
 /// Whether this repo and HOME expect a private layer, read without the lock,
 /// a dead run's journal included.
 pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !Expectation {
+    switch (try marker.accept(arena, io, state_dir)) {
+        .refused => |why| return .{ .refused = why },
+        .accepted => {},
+    }
     const store = try Store.init(arena, state_dir);
     const attempt = lock.holdReaders(io, store.readers, store.v2);
     if (builtin.is_test) if (before_reader_load) |f| f(io);
@@ -275,4 +311,5 @@ test {
     _ = lock;
     _ = durable;
     _ = dump;
+    _ = marker;
 }

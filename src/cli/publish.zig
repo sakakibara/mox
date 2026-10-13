@@ -173,7 +173,10 @@ const Spec = struct {
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
 
-    const lk = (try lock_mod.acquireForCommand(ctx, "publish")) orelse return 2;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "publish", 2)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
 
     // A half-resolved tree must not be committed and sent out, the same

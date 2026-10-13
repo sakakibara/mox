@@ -5118,6 +5118,7 @@ test "apply: stale check staging in state is swept before composing" {
     try tmp.dir.createDirPath(io, "repo/src");
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/a.conf", .data = "x = 1\n" });
     const c = try cliSetup(a, io, &tmp);
+    try testutil.markState(c);
 
     // A crashed run's leftovers: candidate cleartext and its output capture.
     const stale_dir = try std.fs.path.join(a, &.{ c.state, "check-deadbeefdeadbeef" });
@@ -7849,7 +7850,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
 
     const allowed = [_]struct { []const u8, []const u8, usize }{
         .{ "src/apply/live_remove.zig", "remove", 2 },
-        .{ "src/apply/run_scripts.zig", "moxBinDir", 4 },
+        .{ "src/apply/run_scripts.zig", "moxBinDir", 2 },
         .{ "src/apply/run_scripts.zig", "runCheck", 1 },
         .{ "src/apply/run_scripts.zig", "sweepCheckDirs", 2 },
         .{ "src/apply/snapshot.zig", "restoreFile", 1 },
@@ -7942,6 +7943,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/state/lock.zig", "acquire", 2 },
         .{ "src/state/lock.zig", "openReaders", 1 },
         .{ "src/state/lock.zig", "release", 1 },
+        .{ "src/state/marker.zig", "mark", 1 },
         .{ "src/state/recovery.zig", "commit", 3 },
         .{ "src/state/recovery.zig", "recover", 7 },
         .{ "src/state/recovery.zig", "writeGeneration", 1 },

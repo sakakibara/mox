@@ -181,6 +181,12 @@ pub fn snapshotIds(h: Harness) ![]const []const u8 {
     return (try dumpOf(h)).ids(h.a);
 }
 
+/// Mark `h`'s state directory as mox's, as a run that made it would have,
+/// for a test that puts files there before its first command.
+pub fn markState(h: Harness) !void {
+    try mox.state.marker.mark(h.a, h.io, h.state);
+}
+
 /// The id `current` names in `h`'s state.
 pub fn currentId(h: Harness) ![]const u8 {
     const bytes = try Io.Dir.cwd().readFileAlloc(h.io, try std.fs.path.join(h.a, &.{ h.state, "v2", "current" }), h.a, .limited(4096));

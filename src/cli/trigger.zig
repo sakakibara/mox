@@ -3,12 +3,20 @@ const cli = @import("cli");
 const app = @import("app.zig");
 const mox = @import("../root.zig");
 
-/// The trigger state a check reads and saves. Under `mox apply` a script's
-/// checks go to the run's pending records, which apply keeps only when the
-/// script exits 0; run by hand, they go straight to the state file.
-fn loadState(ctx: *app.Ctx, context: app.Context) !mox.trigger.state.State {
+/// The trigger state a check reads and saves, in a state directory accepted
+/// as mox's: null, once that is said, for one that is not. Under `mox apply`
+/// a script's checks go to the run's pending records, which apply keeps only
+/// when the script exits 0; run by hand, they go straight to the state file.
+fn loadState(ctx: *app.Ctx, context: app.Context) !?mox.trigger.state.State {
+    switch (try mox.state.marker.acceptForWrite(ctx.alloc, ctx.io, context.paths.state_dir)) {
+        .refused => |why| {
+            try ctx.err.writeAll(why);
+            return null;
+        },
+        .accepted => {},
+    }
     const pending = context.env.get(ctx.alloc, mox.trigger.state.pending_env);
-    return mox.trigger.state.loadForCheck(ctx.alloc, ctx.io, context.paths.triggers_path, pending);
+    return try mox.trigger.state.loadForCheck(ctx.alloc, ctx.io, context.paths.triggers_path, pending);
 }
 
 const HashSpec = struct {
@@ -21,7 +29,7 @@ fn hash(ctx: *app.Ctx, a: cli.Args(HashSpec)) anyerror!u8 {
         try ctx.err.writeAll("mox trigger hash: usage: mox trigger hash <file>...\n");
         return 2;
     }
-    var state = try loadState(ctx, context);
+    var state = (try loadState(ctx, context)) orelse return 2;
     const changed = try state.checkHash(ctx.alloc, a.files);
     try state.save();
     return if (changed) 0 else 1;
@@ -33,7 +41,7 @@ const SeenVersionSpec = struct {
 
 fn seenVersion(ctx: *app.Ctx, a: cli.Args(SeenVersionSpec)) anyerror!u8 {
     const context = ctx.context.?;
-    var state = try loadState(ctx, context);
+    var state = (try loadState(ctx, context)) orelse return 2;
     const first_time = try state.checkSeenVersion(ctx.alloc, a.key);
     try state.save();
     return if (first_time) 0 else 1;
@@ -46,7 +54,7 @@ const EverySpec = struct {
 
 fn every(ctx: *app.Ctx, a: cli.Args(EverySpec)) anyerror!u8 {
     const context = ctx.context.?;
-    var state = try loadState(ctx, context);
+    var state = (try loadState(ctx, context)) orelse return 2;
     const ready = try state.checkEvery(ctx.alloc, a.key, a.interval);
     try state.save();
     return if (ready) 0 else 1;

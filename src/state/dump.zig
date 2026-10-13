@@ -21,7 +21,7 @@ const Hex = [applied.hash_hex_len]u8;
 
 /// The entries of the state directory that hold the records this dump
 /// reports; everything else there is listed by the caller as it is.
-pub const store_entries = [_][]const u8{ "v2", "mox.lock", "readers.lock", "readers.gate" };
+pub const store_entries = [_][]const u8{ "v2", "mox.lock", "readers.lock", "readers.gate", @import("marker.zig").marker_name };
 
 /// The directory under `state_dir` a run's journal is created in, at its
 /// first change: what the run displaces is recorded there before the run

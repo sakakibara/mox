@@ -25,7 +25,10 @@ fn retire(ctx: *app.Ctx, a: cli.Args(RetireSpec)) anyerror!u8 {
     const shown = display.of(context.paths.private_dir, context.paths.home);
     // A dry run reads without the lock; a real one takes it.
     var lk: ?lock_mod.Lock = null;
-    if (!a.dry_run) lk = (try lock_mod.acquireForCommand(ctx, "private retire")) orelse return 1;
+    if (!a.dry_run) lk = switch (try lock_mod.acquireForCommand(ctx, "private retire", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer if (lk) |l| l.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .private, .writes = !a.dry_run, .locked = !a.dry_run })) orelse return 2;
     return state_cli.finish(ctx, st, .{}, retireOpened(ctx, a, st, shown));

@@ -9,6 +9,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const marker = @import("marker.zig");
+
 const is_windows = builtin.os.tag == .windows;
 pub const lock_name = "mox.lock";
 
@@ -43,6 +45,8 @@ pub const Outcome = union(enum) {
     held: Held,
     /// The filesystem cannot lock: the errno, by name.
     unsupported: []const u8,
+    /// The directory is not a mox state directory; nothing was created.
+    refused: []const u8,
 };
 
 /// A holder line, parsed.
@@ -79,10 +83,14 @@ pub fn isBootId(s: []const u8) bool {
     return true;
 }
 
-/// Take the lock under `state_dir` for `command`.
+/// Take the lock under `state_dir` for `command`, once the directory is
+/// accepted as mox's and marked.
 pub fn acquire(arena: std.mem.Allocator, io: Io, state_dir: []const u8, command: []const u8) !Outcome {
     const path = try std.fs.path.join(arena, &.{ state_dir, lock_name });
-    Io.Dir.cwd().createDirPath(io, state_dir) catch {};
+    switch (try marker.acceptForWrite(arena, io, state_dir)) {
+        .refused => |why| return .{ .refused = why },
+        .accepted => {},
+    }
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
     const got = tryLockFile(io, file) catch |e| {
         file.close(io);

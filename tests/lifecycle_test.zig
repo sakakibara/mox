@@ -878,7 +878,7 @@ test "add -r: a coupling-graph persistence failure warns once for the whole walk
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/b.conf", .data = "b\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "home/.config/app/c.conf", .data = "c\n" });
 
-    try Io.Dir.cwd().createDirPath(io, h.state);
+    try testutil.markState(h);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "coupling" }), .data = "" });
 
     const r = try h.run(&.{ "mox", "add", "-r", ".config/app" });
@@ -1278,7 +1278,7 @@ test "add: a coupling-graph persistence failure warns, but the add itself still 
 
     // A plain FILE where the coupling dir belongs: saveGraph's createDirPath
     // fails, so the rebuild this add triggers cannot persist.
-    try Io.Dir.cwd().createDirPath(io, h.state);
+    try testutil.markState(h);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "coupling" }), .data = "" });
 
     const r = try h.run(&.{ "mox", "add", "notes.txt" });
@@ -4087,6 +4087,7 @@ test "apply: the mox-bin warning prints once per run, not once per stage" {
     try writeExecScript(io, &tmp, sub, body, try std.fs.path.join(a, &.{ root, sub }));
 
     const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    try testutil.markState(h);
     const applied = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), applied.rc);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, applied.err, "not on the scripts' PATH"));
@@ -4107,13 +4108,14 @@ test "apply: a bin directory that cannot be opened is a warning, not an aborted 
     try chmodPath(a, bin, 0o000);
     defer chmodPath(a, bin, 0o755) catch {};
     const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true });
+    try testutil.markState(h);
     const r = try h.run(&.{ "mox", "apply", "--defaults" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "not on the scripts' PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "could not be opened") != null);
 }
 
-test "apply --dry-run: the state bin directory is left as it is, since nothing is spawned" {
+test "apply --dry-run: the state bin directory is left as it is, since nothing is spawned, and a real run removes nothing mox did not make there" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4122,6 +4124,7 @@ test "apply --dry-run: the state bin directory is left as it is, since nothing i
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "repo/src/.rc", "base\n");
+    try testutil.markState(h);
     const bin = try std.fs.path.join(a, &.{ h.state, "bin" });
     try Io.Dir.cwd().createDirPath(io, bin);
     const keep = try std.fs.path.join(a, &.{ bin, "keep.txt" });
@@ -4131,7 +4134,7 @@ test "apply --dry-run: the state bin directory is left as it is, since nothing i
     try std.testing.expect(exists(io, keep));
     const real = try h.run(&.{ "mox", "apply", "--defaults" });
     try std.testing.expectEqual(@as(u8, 0), real.rc);
-    try std.testing.expect(!exists(io, keep));
+    try std.testing.expect(exists(io, keep));
 }
 
 test "rollback: the state bin directory is left as it is when no check hook runs" {
@@ -7249,6 +7252,7 @@ test "uninstall: at a terminal, a state it cannot open is refused before it asks
     try writeRepo(io, &tmp, "state/trash/20260101T000000Z/src/.old", "recoverable\n");
     try writeRepo(io, &tmp, "state/v2/current", "20260101T000000Z\n");
     try writeRepo(io, &tmp, "state/v2/gen/20260101T000000Z.json", "{\"v\":3}");
+    try testutil.markState(h);
     var env = try gitEnv(h);
     try env.put("MOX_REPO", h.repo);
     try env.put("MOX_STATE_DIR", h.state);

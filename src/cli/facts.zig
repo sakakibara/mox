@@ -76,7 +76,10 @@ fn run(ctx: *app.Ctx, args: cli.Args(BareSpec)) anyerror!u8 {
 
     // The interview may persist answers into facts.toml; guard that
     // read-modify-write with the command lock, as `facts set` and `apply` do.
-    const lk = (try lock_mod.acquireForCommand(ctx, "facts")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "facts", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
@@ -203,7 +206,10 @@ fn setRun(ctx: *app.Ctx, a: cli.Args(SetSpec)) anyerror!u8 {
         try ctx.err.print("mox facts set: {s} names a machine axis; the machine's own value is used, so a fact cannot set it\n", .{a.name});
         return 2;
     }
-    const lk = (try lock_mod.acquireForCommand(ctx, "facts set")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "facts set", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
     const answers = [_]mox.machine.state.Fact{
         .{ .name = a.name, .value = a.value },
@@ -337,7 +343,10 @@ fn askRun(ctx: *app.Ctx, a: cli.Args(AskSpec)) anyerror!u8 {
         return 0;
     }
 
-    const lk = (try lock_mod.acquireForCommand(ctx, "facts ask")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "facts ask", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
 
     const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);

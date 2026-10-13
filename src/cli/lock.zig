@@ -15,19 +15,31 @@ const state_lock = mox.state.lock;
 
 pub const Lock = state_lock.Lock;
 
-/// Take the lock for `command`, printing why to stderr and returning null
-/// when it cannot be taken. On success the caller owns the returned Lock and
-/// must `release()` it (typically via `defer`).
-pub fn acquireForCommand(ctx: *app.Ctx, command: []const u8) !?Lock {
+pub const Taken = union(enum) {
+    lock: Lock,
+    /// The lock was not taken, and why was said: the command exits with
+    /// this code.
+    exit: u8,
+};
+
+/// Take the lock for `command`, printing why to stderr when it cannot be
+/// taken: the command then exits `busy`, or 2 for a state directory that is
+/// not mox's. On success the caller owns the returned Lock and must
+/// `release()` it (typically via `defer`).
+pub fn acquireForCommand(ctx: *app.Ctx, command: []const u8, busy: u8) !Taken {
     switch (try state_lock.acquire(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, command)) {
-        .acquired => |l| return l,
+        .acquired => |l| return .{ .lock = l },
         .held => |h| {
             try printHeld(ctx, h);
-            return null;
+            return .{ .exit = busy };
         },
         .unsupported => |errno| {
             try printUnsupported(ctx, errno);
-            return null;
+            return .{ .exit = busy };
+        },
+        .refused => |why| {
+            try ctx.err.writeAll(why);
+            return .{ .exit = 2 };
         },
     }
 }

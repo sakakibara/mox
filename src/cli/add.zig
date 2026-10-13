@@ -703,7 +703,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // add mutates the repo (source file, attributes, coupling graph), so it
     // takes the single-writer lock like every other mutator.
-    const lk = (try lock_mod.acquireForCommand(ctx, "add")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "add", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
 
     if (!a.force) {

@@ -160,7 +160,8 @@ pub const PackageBackends = struct {
     }
 
     /// `scratch_dir` stages a manager's own export file and a plugin's stdin;
-    /// mox's state directory keeps both inside a directory mox already owns.
+    /// mox's state directory keeps both inside a directory mox already owns,
+    /// marked here as mox's before anything is staged in it.
     /// `env` is what every backend and plugin runs under; apply hands its
     /// script environment so a bootstrap's PATH addition reaches the probes
     /// that follow in the same run. Plugins are discovered only when
@@ -184,6 +185,13 @@ pub const PackageBackends = struct {
         err: *std.Io.Writer,
         diag: ?*mox.packages.manifest.Diag,
     ) !mox.packages.backend.Registry {
+        switch (try mox.state.marker.acceptForWrite(arena, io, scratch_dir)) {
+            .refused => |why| {
+                try err.writeAll(why);
+                return error.NotStateDirectory;
+            },
+            .accepted => {},
+        }
         self.proc = .{
             .io = io,
             .env = env,

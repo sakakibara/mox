@@ -1343,6 +1343,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     // then on (by whichever path the adapter now invokes it).
     // The scripted installer leaves `brew` where the adapter looks for it.
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try testutil.markState(h);
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
     // The installer is what puts `brew` in the prefix: present before it
     // runs, it would be found there and nothing bootstrapped.
@@ -2040,6 +2041,7 @@ test "bootstrap: an absent manager is installed and used by the same apply" {
 
     // The scripted installer leaves `brew` where the adapter looks for it.
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try testutil.markState(h);
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
     // The installer is what puts `brew` in the prefix: present before it
     // runs, it would be found there and nothing bootstrapped.
@@ -2146,6 +2148,7 @@ test "apply: a batch that failed after landing a row says so, and the landed row
     );
     try writeManifest(io, h, a, "h.toml", "backend = \"halfway\"\n\n[[packages]]\nname = \"one\"\n\n[[packages]]\nname = \"two\"\n");
     const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    try testutil.markState(h);
     const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
     try Io.Dir.cwd().createDirPath(io, post_dir);
     const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
@@ -3124,6 +3127,7 @@ test "bootstrap: a manager installed with no row to install still re-captures th
         .{home},
     ) });
     const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    try testutil.markState(h);
     const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
     try Io.Dir.cwd().createDirPath(io, post_dir);
     const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
@@ -3331,6 +3335,7 @@ test "commit: a row recorded into the private layer is data there, never a manag
     // so that is where commit records the row.
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ h.repo, "data", "packages" }));
     const private_pkgs = try std.fs.path.join(a, &.{ h.state, "private", "data", "packages" });
+    try testutil.markState(h);
     try Io.Dir.cwd().createDirPath(io, private_pkgs);
     const private_manifest = try std.fs.path.join(a, &.{ private_pkgs, "local.toml" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = private_manifest, .data = "backend = \"brew\"\n" });
@@ -3366,6 +3371,7 @@ test "commit: a row recorded into the private layer is data there, never a manag
     // symlink in the source tree.
     if (@import("builtin").os.tag == .windows) return;
     const elsewhere = try std.fs.path.join(a, &.{ h.state, "elsewhere.toml" });
+    try testutil.markState(h);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = elsewhere, .data = after });
     try Io.Dir.cwd().deleteFile(io, private_manifest);
     try Io.Dir.cwd().symLink(io, elsewhere, private_manifest, .{});
@@ -4005,6 +4011,7 @@ test "apply: a failed batch that landed a row has the machine re-read, so a fact
         .{home},
     ) });
     const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    try testutil.markState(h);
     const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
     try Io.Dir.cwd().createDirPath(io, post_dir);
     const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
@@ -4183,6 +4190,7 @@ test "bootstrap: an installer that exits 0 without installing its manager is a f
         .data = try std.fmt.allocPrint(a, "[[facts]]\nname = \"fakeportshome\"\ncandidates = [\"{s}\"]\n", .{made}),
     });
     const seen = try std.fs.path.join(a, &.{ h.state, "seen.txt" });
+    try testutil.markState(h);
     const post_dir = try std.fs.path.join(a, &.{ h.repo, "scripts", "post" });
     try Io.Dir.cwd().createDirPath(io, post_dir);
     const post = try std.fs.path.join(a, &.{ post_dir, "00-record.sh" });
@@ -4645,6 +4653,7 @@ fn brewBootstrap(a: std.mem.Allocator, io: Io, h: Harness, installer_code: u8, s
     , .{mox.apply.applied.contentHashHex(installer)}));
 
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try testutil.markState(h);
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
     // The installer is what puts `brew` in the prefix: present before it
     // runs, it would be found there and nothing bootstrapped.
@@ -4861,6 +4870,7 @@ test "bootstrap: off macOS brew's installer is not preceded by sudo -v" {
         \\
     , .{mox.apply.applied.contentHashHex(installer)}));
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try testutil.markState(h);
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
     // The installer is what puts `brew` in the prefix: present before it
     // runs, it would be found there and nothing bootstrapped.
@@ -5135,6 +5145,7 @@ test "apply: a volume short of space is named before the installs, which still r
     );
     // brew is found in this prefix, so the prefix is the volume measured.
     const prefix = try std.fs.path.join(a, &.{ h.state, "prefix" });
+    try testutil.markState(h);
     const prefix_bin = try std.fs.path.join(a, &.{ prefix, "bin" });
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ prefix_bin, "brew" }), .data = "" });
@@ -5216,6 +5227,7 @@ test "bootstrap: a brew in a known prefix but off PATH is used, never installed 
         \\
     );
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try testutil.markState(h);
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
     const brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = brew, .data = "" });

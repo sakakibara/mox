@@ -18,6 +18,19 @@ kept, so it steps out of whatever a symlink before it names. On Windows, one
 relative to a drive's current directory (`C:x`) or to the current drive's
 root (`\x`) is refused, asking for an absolute path.
 
+The state directory says it is mox's. mox writes `<state dir>/.mox-state`,
+one line naming the format (`mox state 1`), 0600, when it creates the
+directory. Every command but `version`, help, `upgrade`, `path`, `git`,
+`secret`, `data` and `edit` first checks the directory, and uses it only
+when it is absent, empty, or holds nothing but the private layer and the
+lock files (mox creates it, with the marker, when it first writes; a command
+that only reads finds an empty state and creates nothing), or when it holds
+the marker. Any other directory is refused, exit 2, before anything in it is
+read or changed: `mox: <dir> is not a mox state directory: it holds no
+.mox-state marker, so mox leaves it as it is; point MOX_STATE_DIR at a
+dedicated directory`. So a `MOX_STATE_DIR` that names a home or another
+directory by mistake is left as it is.
+
 Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
 `rollback`, `uninstall`, `update`, `private retire`, `facts set`, `facts
 ask`, a bare `facts` that reaches the interview, and `doctor` under
@@ -1379,13 +1392,17 @@ removed. `bin/`, `tmp/` and `trash/` are names a home directory holds too,
 so each is mox's only while it is a directory holding nothing but what mox
 puts there: in `bin/` the link to (on Windows, the copy of) the running
 `mox`, in `tmp/` the package managers' per-process scratch files, and in
-`trash/` the directories named by run id. One holding anything else is kept
-and listed with the first entry mox did not make, and does not count as
-mox's when uninstall decides whether the directory is a state directory at
-all. A state directory that exists but holds none of mox's entries is
-refused, exit 2, before anything is created, followed or removed in it, so a
-`MOX_STATE_DIR` naming a home or another directory by mistake is left as it
-is. The user's source repo is never touched.
+`trash/` the directories named by run id. `v2/` is mox's only while it holds
+nothing but the entries mox makes in it. One holding anything else is kept
+whole and listed with the first entry mox did not make. A directory that is
+not a mox state directory (see the top of this page) is refused, exit 2,
+before anything is created, followed or removed in it; an absent or empty
+one has no state to remove. The marker, `.mox-state`, is removed last, once
+the directory holds nothing else of mox's but the lock files, so an
+uninstall that stopped partway leaves a directory the next run still takes
+for mox's; while anything of mox's is kept (the history, trash, the private
+layer) the marker is kept and listed. The user's source repo is never
+touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |

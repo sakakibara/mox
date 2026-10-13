@@ -600,8 +600,10 @@ fresh, current env, never the pre-stage's stale projection.
 
 Setup scripts and check hooks find the running mox first on their `PATH`,
 through `<state dir>/bin`, a directory mox owns: it holds the running mox
-and nothing else, and anything else placed there is removed on every apply
-that is not a dry run (a dry run spawns nothing and leaves it alone).
+and nothing else, refreshed on every apply that is not a dry run (a dry run
+spawns nothing and leaves it alone). mox replaces only its own entry there:
+when the directory holds anything else, mox removes nothing, leaves the
+directory off `PATH` for that run and warns, naming what it found.
 Every setup script (both stages) also gets `MOX_PATH`, naming a writable file
 private to this run (deleted when the run ends). A script that installs a tool
 somewhere `tool=` would not otherwise see -- neither `$PATH` nor this repo's

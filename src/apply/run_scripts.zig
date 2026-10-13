@@ -400,17 +400,25 @@ pub const bin_dir_name = "bin";
 pub const bin_entry_name = if (builtin.os.tag == .windows) "mox.exe" else "mox";
 pub const bin_entry_kind: Io.File.Kind = if (builtin.os.tag == .windows) .file else .sym_link;
 
+/// True when `e`, an entry of the bin directory, is what `moxBinDir` puts
+/// there, judged by name and kind without following a link.
+pub fn isBinEntry(e: dirent.Entry) bool {
+    return std.mem.eql(u8, e.name, bin_entry_name) and e.kind == bin_entry_kind;
+}
+
 /// A directory under the state dir holding only the running mox, refreshed
 /// on every call, for scripts and check hooks to find `mox` on PATH. Every
 /// setup script calls `mox` (a `mox trigger` staleness gate is the idiom),
 /// but a bootstrap runs mox by absolute path before its directory is on PATH,
 /// so those calls would resolve to nothing and the script would report
-/// success having done nothing. Only mox is exposed: anything else found in
-/// the directory is removed, since the directory leads every script's PATH.
-/// On Windows the running binary is copied in (a `.cmd` shim would swallow a
-/// caller's `call` and re-split the arguments); elsewhere it is a symlink.
-/// Null, with the reason in `why`, when mox cannot locate itself or the
-/// directory cannot be made to hold it.
+/// success having done nothing. Only mox is exposed, and only mox's own entry
+/// is ever replaced: a directory holding anything else is left as it is and
+/// kept off PATH, since it leads every script's PATH and mox did not make
+/// what else it holds. On Windows the running binary is copied in (a `.cmd`
+/// shim would swallow a caller's `call` and re-split the arguments);
+/// elsewhere it is a symlink. The caller has accepted the state directory as
+/// mox's. Null, with the reason in `why`, when mox cannot locate itself or
+/// the directory cannot be made to hold it.
 pub fn moxBinDir(arena: std.mem.Allocator, io: Io, state_dir: []const u8, why: *?[]const u8) !?[]const u8 {
     why.* = null;
     const exe = std.process.executablePathAlloc(io, arena) catch {
@@ -422,7 +430,6 @@ pub fn moxBinDir(arena: std.mem.Allocator, io: Io, state_dir: []const u8, why: *
         why.* = try std.fmt.allocPrint(arena, "{s} could not be created: {s}", .{ dir, @errorName(e) });
         return null;
     };
-    const keep: []const u8 = bin_entry_name;
     var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| {
         why.* = try std.fmt.allocPrint(arena, "{s} could not be opened: {s}", .{ dir, @errorName(e) });
         return null;
@@ -433,22 +440,24 @@ pub fn moxBinDir(arena: std.mem.Allocator, io: Io, state_dir: []const u8, why: *
         return null;
     };
     for (entries) |entry| {
-        if (std.mem.eql(u8, entry.name, keep)) continue;
-        const stray = try std.fs.path.join(arena, &.{ dir, entry.name });
-        Io.Dir.cwd().deleteTree(io, stray) catch |e| {
-            why.* = try std.fmt.allocPrint(arena, "{s} could not be removed from {s}: {s}", .{ entry.name, dir, @errorName(e) });
-            return null;
-        };
+        if (isBinEntry(entry)) continue;
+        why.* = try std.fmt.allocPrint(arena, "{s} holds {s}, which mox did not make, so mox leaves the directory as it is", .{ dir, entry.name });
+        return null;
     }
-    const target = try std.fs.path.join(arena, &.{ dir, keep });
+    const target = try std.fs.path.join(arena, &.{ dir, bin_entry_name });
+    Io.Dir.cwd().deleteFile(io, target) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => {
+            why.* = try std.fmt.allocPrint(arena, "{s} could not be replaced: {s}", .{ target, @errorName(e) });
+            return null;
+        },
+    };
     if (builtin.os.tag == .windows) {
-        Io.Dir.cwd().deleteTree(io, target) catch {};
         Io.Dir.cwd().copyFile(exe, Io.Dir.cwd(), target, io, .{}) catch |e| {
             why.* = try std.fmt.allocPrint(arena, "{s} could not be copied into {s}: {s}", .{ exe, dir, @errorName(e) });
             return null;
         };
     } else {
-        Io.Dir.cwd().deleteTree(io, target) catch {};
         Io.Dir.cwd().symLink(io, exe, target, .{}) catch |e| {
             why.* = try std.fmt.allocPrint(arena, "{s} could not be linked into {s}: {s}", .{ exe, dir, @errorName(e) });
             return null;
@@ -1282,21 +1291,29 @@ test "buildScriptEnv: a script's PATH leads with a directory holding only the ru
         try testing.expectEqualStrings(try std.process.executablePathAlloc(testing.io, a), buf[0..n]);
     }
 
-    // A stray beside mox would shadow the system tools for every script; it
-    // is removed on the next refresh, and a directory squatting on mox's
-    // name is replaced.
-    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ bin, "git" }), .data = "#!/bin/sh\n" });
-    try Io.Dir.cwd().deleteTree(testing.io, try std.fs.path.join(a, &.{ bin, name }));
-    try Io.Dir.cwd().createDirPath(testing.io, try std.fs.path.join(a, &.{ bin, name, "inner" }));
+    // The refresh replaces only its own entry.
     var why: ?[]const u8 = null;
     try testing.expect((try moxBinDir(a, testing.io, state_dir, &why)) != null);
     try testing.expect(why == null);
-    var dir2 = try Io.Dir.cwd().openDir(testing.io, bin, .{ .iterate = true });
-    defer dir2.close(testing.io);
-    const after = try dirent.sorted(a, testing.io, dir2);
-    try testing.expectEqual(@as(usize, 1), after.len);
-    try testing.expectEqualStrings(name, after[0].name);
-    try testing.expect((try Io.Dir.cwd().statFile(testing.io, try std.fs.path.join(a, &.{ bin, name }), .{})).kind != .directory);
+
+    // A stray beside mox would shadow the system tools for every script, and
+    // mox did not make it: the directory is left as it is and kept off PATH.
+    try Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ bin, "git" }), .data = "#!/bin/sh\n" });
+    try testing.expect((try moxBinDir(a, testing.io, state_dir, &why)) == null);
+    try testing.expect(std.mem.indexOf(u8, why.?, "holds git, which mox did not make") != null);
+    try testing.expectEqualStrings("#!/bin/sh\n", try Io.Dir.cwd().readFileAlloc(testing.io, try std.fs.path.join(a, &.{ bin, "git" }), a, .limited(64)));
+    const off_path = try buildScriptEnv(a, testing.io, Environ{ .map = &parent }, "/repo", state_dir, "/home/me", &.{}, true);
+    try testing.expectEqualStrings("/usr/bin:/bin", off_path.map.get("PATH").?);
+    try testing.expect(off_path.mox_bin_unavailable != null);
+
+    // An entry on mox's name that is not what mox puts there is not mox's
+    // either.
+    try Io.Dir.cwd().deleteFile(testing.io, try std.fs.path.join(a, &.{ bin, "git" }));
+    try Io.Dir.cwd().deleteTree(testing.io, try std.fs.path.join(a, &.{ bin, name }));
+    try Io.Dir.cwd().createDirPath(testing.io, try std.fs.path.join(a, &.{ bin, name, "inner" }));
+    try testing.expect((try moxBinDir(a, testing.io, state_dir, &why)) == null);
+    try testing.expect(std.mem.indexOf(u8, why.?, "which mox did not make") != null);
+    try testing.expect((try Io.Dir.cwd().statFile(testing.io, try std.fs.path.join(a, &.{ bin, name, "inner" }), .{})).kind == .directory);
 }
 
 test "buildScriptEnv: a non-ASCII fact name is skipped, not garbled into underscores" {

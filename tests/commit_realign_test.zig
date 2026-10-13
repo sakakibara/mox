@@ -1117,7 +1117,7 @@ fn runLayout(gpa: Allocator, io: Io, sw: Sweep, st: State, budget: *Budget, seen
     const h = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
     // What the sources and state hold before mox first writes the file: a
     // first-contact commit starts from here.
-    try tmp.dir.createDirPath(io, "state");
+    try testutil.markState(h);
     const unapplied = try snapshot(a, io, h.root);
     const applied = try h.run(&.{ "mox", "apply" });
     const live_path = try h.liveOf(base_rel);

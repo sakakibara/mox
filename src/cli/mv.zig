@@ -30,7 +30,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const old_name = a.old;
     const new_name = a.new;
 
-    const lk = (try lock_mod.acquireForCommand(ctx, "mv")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "mv", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
     // It reads the private expectation, so a state mox cannot use refuses first.
     _ = (try state_cli.open(ctx, .{ .writes = false, .locked = true })) orelse return 2;

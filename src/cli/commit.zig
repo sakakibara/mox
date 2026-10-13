@@ -1186,7 +1186,10 @@ fn commitRun(
         color,
     ) };
 
-    const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "commit", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .commit, .writes = !dry_run, .locked = true, .records_secrets = !dry_run })) orelse return 2;
     return state_cli.finish(ctx, st, .{}, commitOpened(ctx, st, sty, dry_run, yes, abort_on_prompt, paths, package_rows));

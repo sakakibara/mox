@@ -186,7 +186,10 @@ fn applyPass(
 
     // Lock contention exits with the error code, not the drift code: another
     // apply must finish or be cleared first, not a decision the user resolves.
-    const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 2;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "apply", 2)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .apply, .writes = !dry_run, .locked = true, .records_secrets = !dry_run })) orelse return 2;
     // Every exit after the first write commits what the run did.

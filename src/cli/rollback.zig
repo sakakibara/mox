@@ -29,7 +29,10 @@ const Spec = struct {
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    const lk = (try lock_mod.acquireForCommand(ctx, "rollback")) orelse return 1;
+    const lk = switch (try lock_mod.acquireForCommand(ctx, "rollback", 1)) {
+        .lock => |l| l,
+        .exit => |rc| return rc,
+    };
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .rollback, .writes = true, .locked = true })) orelse return 2;
     return state_cli.finish(ctx, st, .{}, rollbackOpened(ctx, a, st));

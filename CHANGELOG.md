@@ -60,16 +60,24 @@ All notable changes to mox are documented here. The format follows
   such a step began waiting wait behind it, through `readers.gate`, a second
   lock file beside `readers.lock`, so overlapping readers cannot keep it
   waiting. See "The state directory" in commands.md.
+- The state directory says it is mox's: mox writes `<state
+  dir>/.mox-state` when it creates one, and every command that touches the
+  state uses a directory only when it is absent, empty or holds only the
+  private layer and the lock files, or holds that marker. Any other
+  directory is refused with exit 2 before anything in it is read or changed,
+  so a `MOX_STATE_DIR` that names a home or another directory by mistake is
+  left as it is. See the top of commands.md.
 - `mox uninstall` removes only the entries mox makes in the state
   directory, and lists every other entry as kept, "not made by mox",
-  without following it; it used to remove every entry it did not know. A
-  state directory that holds none of mox's entries is refused with exit 2
-  before anything is created or removed in it, so a `MOX_STATE_DIR` that
-  names a home or another directory by mistake is left as it is. `bin/`,
-  `tmp/` and `trash/` are removed only while they hold nothing but what mox
-  puts there (the running `mox`, the package managers' scratch files, trash
-  generations named by run id); one holding anything else is kept and
-  listed with the first entry mox did not make.
+  without following it; it used to remove every entry it did not know.
+  `bin/`, `tmp/`, `trash/` and `v2/` are removed only while they hold
+  nothing but what mox puts there; one holding anything else is kept whole
+  and listed with the first entry mox did not make. The marker goes last,
+  once nothing else of mox's is left.
+- The setup scripts' `<state dir>/bin` is refreshed by replacing only the
+  running `mox` there. When it holds anything else, mox removes nothing,
+  keeps the directory off `PATH` for that run and warns; it used to remove
+  every other entry.
 - `mox snapshot` lists, and a bare `mox rollback` picks, a run that
   displaced only an empty directory, and it counts toward
   `MOX_SNAPSHOT_RETENTION`, so an older snapshot may be pruned one run
@@ -256,9 +264,13 @@ All notable changes to mox are documented here. The format follows
   <path>`. Snapshots taken by 0.12.4 cannot be rolled back to, and a file
   whose source left the tree before the upgrade is not swept; delete it by
   hand.
-- Delete 0.12.4's stores, while no mox runs on this machine: this release
-  never reads them, and their snapshots can hold a secret in clear. On macOS
-  and Linux, with `S` the state directory (`$MOX_STATE_DIR`, default
+- Delete 0.12.4's stores, while no mox runs on this machine. Its snapshots
+  can hold a secret in clear, and this release never reads, moves or deletes
+  them; at the default state path it leaves them in place, and `mox
+  uninstall` lists them as not made by mox. A `MOX_STATE_DIR` 0.12.4 used is
+  refused as not a state directory, since 0.12.4 wrote no marker: delete its
+  stores, then write the marker with the command the refusal prints. On
+  macOS and Linux, with `S` the state directory (`$MOX_STATE_DIR`, default
   `$XDG_STATE_HOME/mox`, `~/.local/state/mox` when that is unset):
 
   ```sh

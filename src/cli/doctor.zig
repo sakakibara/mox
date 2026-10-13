@@ -59,7 +59,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     var lk: ?lock_mod.Lock = null;
     if (mutating) {
-        lk = (try lock_mod.acquireForCommand(ctx, "doctor")) orelse return 1;
+        lk = switch (try lock_mod.acquireForCommand(ctx, "doctor", 1)) {
+            .lock => |l| l,
+            .exit => |rc| return rc,
+        };
     }
     defer if (lk) |l| l.release();
     const opened = (try state_cli.openWithReport(ctx, .{ .run_kind = .doctor, .writes = mutating, .locked = mutating, .repair = fix, .records_secrets = rebuild_prov })) orelse return 2;

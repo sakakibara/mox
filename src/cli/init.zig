@@ -232,6 +232,13 @@ const OnPath = struct {
 
 fn initFresh(ctx: *app.Ctx) !u8 {
     const context = ctx.context.?;
+    switch (try mox.state.marker.acceptForWrite(ctx.alloc, ctx.io, context.paths.state_dir)) {
+        .refused => |why| {
+            try ctx.err.writeAll(why);
+            return 2;
+        },
+        .accepted => {},
+    }
     const dirs = [_][]const u8{
         context.paths.repo_dir,
         try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" }),

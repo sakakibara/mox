@@ -201,7 +201,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // The git phase holds the lock; apply takes its own, so the scope ends
     // before it runs rather than deadlocking against the same process.
     {
-        const lk = (try lock_mod.acquireForCommand(ctx, "update")) orelse return 2;
+        const lk = switch (try lock_mod.acquireForCommand(ctx, "update", 2)) {
+            .lock => |l| l,
+            .exit => |rc| return rc,
+        };
         defer lk.release();
 
         var env_map = try context.env.createMap(ctx.alloc);
