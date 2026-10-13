@@ -97,6 +97,32 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
     };
 }
 
+/// `p` with a relative state directory made absolute against `cwd`, and the
+/// paths under it with it, so every message, sibling and printed command
+/// names one place whatever directory a later step runs in.
+pub fn absoluteState(arena: std.mem.Allocator, p: Paths, cwd: []const u8) !Paths {
+    if (std.fs.path.isAbsolute(p.state_dir)) return p;
+    var out = p;
+    out.state_dir = try std.fs.path.resolve(arena, &.{ cwd, p.state_dir });
+    out.private_dir = try std.fs.path.join(arena, &.{ out.state_dir, "private" });
+    out.triggers_path = try std.fs.path.join(arena, &.{ out.state_dir, trigger_state.state_basename });
+    return out;
+}
+
+test "absoluteState: a relative state directory, and every path under it, resolve against the cwd" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m = std.process.Environ.Map.init(a);
+    try m.put("HOME", "/home/alice");
+    try m.put("MOX_STATE_DIR", ".");
+    const p = try absoluteState(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), if (builtin.os.tag == .windows) "C:\\w\\st" else "/w/st");
+    const root = if (builtin.os.tag == .windows) "C:\\w\\st" else "/w/st";
+    try std.testing.expectEqualStrings(root, p.state_dir);
+    try expectJoined(a, &.{ root, "private" }, p.private_dir);
+    try expectJoined(a, &.{ root, trigger_state.state_basename }, p.triggers_path);
+}
+
 test "resolve with Env{ .process = std.testing.environ }" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

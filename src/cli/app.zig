@@ -275,13 +275,14 @@ pub const PackageBackends = struct {
 /// carries a message and the error propagates.
 pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) anyerror!Context {
     const env: Env = environ_override orelse Env.current();
-    const paths = paths_mod.resolve(alloc, env) catch |err| {
+    const resolved = paths_mod.resolve(alloc, env) catch |err| {
         diag.message = std.fmt.allocPrint(alloc, "failed to resolve mox paths: {s}", .{@errorName(err)}) catch "";
         return err;
     };
     // An unreadable cwd is not a startup failure: only a relative path
     // argument needs one, and every command that takes none runs regardless.
     const cwd: ?[]const u8 = cwd_override orelse (std.process.currentPathAlloc(io, alloc) catch null);
+    const paths = if (cwd) |c| try paths_mod.absoluteState(alloc, resolved, c) else resolved;
     if (mox.state.id.takes_test_clock) {
         mox.state.id.test_clock = if (env.get(alloc, "MOX_TEST_CLOCK")) |v| std.fmt.parseInt(u64, v, 10) catch null else null;
     }
