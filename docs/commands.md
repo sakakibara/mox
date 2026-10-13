@@ -1370,7 +1370,14 @@ are removed (its stores, `bin/`, `coupling/`, `commit-recovery/`,
 `mox-path`, `triggers.txt`, the package managers' `tmp/` and `zypper.txt`, a
 check hook's leftover `check-*`, and `private/` with `--purge-private`); any
 other entry is listed as kept, "not made by mox", and never followed or
-removed. A state directory that exists but holds none of mox's entries is
+removed. `bin/`, `tmp/` and `trash/` are names a home directory holds too,
+so each is mox's only while it is a directory holding nothing but what mox
+puts there: in `bin/` the link to (on Windows, the copy of) the running
+`mox`, in `tmp/` the package managers' per-process scratch files, and in
+`trash/` the directories named by run id. One holding anything else is kept
+and listed with the first entry mox did not make, and does not count as
+mox's when uninstall decides whether the directory is a state directory at
+all. A state directory that exists but holds none of mox's entries is
 refused, exit 2, before anything is created, followed or removed in it, so a
 `MOX_STATE_DIR` naming a home or another directory by mistake is left as it
 is. The user's source repo is never touched.

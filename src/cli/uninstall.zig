@@ -5,9 +5,10 @@
 //! deletes `v2/`. The private layer is PRESERVED unless `--purge-private`;
 //! trash is preserved unless `--purge-trash` or confirmed. The user's source
 //! repo is NEVER touched, and nothing outside the state directory is deleted.
-//! Inside it, only entries mox makes are removed; every other entry is listed
-//! as kept, and a directory holding none of mox's entries is refused. Under
-//! the lock.
+//! Inside it, only entries mox makes are removed, and `bin/`, `tmp/` and
+//! `trash/`, names a home directory holds too, only while all they hold is
+//! what mox puts there; every other entry is listed as kept, and a directory
+//! holding none of mox's entries is refused. Under the lock.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -49,7 +50,7 @@ pub fn actionFor(name: []const u8, purge_private: bool) Action {
 /// scratch directory and zypper's ledger, and a check hook's staging.
 fn madeByMox(name: []const u8) bool {
     const fixed = [_][]const u8{
-        "bin",
+        mox.apply.run_scripts.bin_dir_name,
         "coupling",
         "commit-recovery",
         "mox-path",
@@ -59,6 +60,42 @@ fn madeByMox(name: []const u8) bool {
     };
     for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
     return isCheckStaging(name);
+}
+
+/// Why the entry `e` of the state directory is not mox's although its name
+/// is, or null when it is mox's. `bin/`, `tmp/` and `trash/` are names a
+/// home directory holds too, so each is mox's only while it is a directory
+/// holding nothing but what mox puts there: the running mox, the package
+/// managers' per-process scratch files, and trash generations named by
+/// run id.
+fn notMoxs(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent.Entry) !?[]const u8 {
+    const Shape = enum { bin, tmp, trash };
+    const shape: Shape = if (std.mem.eql(u8, e.name, mox.apply.run_scripts.bin_dir_name))
+        .bin
+    else if (std.mem.eql(u8, e.name, mox.packages.exec.tmp_subdir))
+        .tmp
+    else if (std.mem.eql(u8, e.name, "trash"))
+        .trash
+    else
+        return null;
+    if (e.kind != .directory) return "not made by mox";
+    const path = try std.fs.path.join(arena, &.{ state_dir, e.name });
+    const held = dirent.sortedPath(arena, io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err|
+        return try std.fmt.allocPrint(arena, "could not be read: {s}", .{@errorName(err)});
+    var first: ?[]const u8 = null;
+    var others: usize = 0;
+    for (held) |h| {
+        const ours = switch (shape) {
+            .bin => std.mem.eql(u8, h.name, mox.apply.run_scripts.bin_entry_name) and h.kind == mox.apply.run_scripts.bin_entry_kind,
+            .tmp => h.kind == .file and mox.packages.exec.isScratchName(h.name),
+            .trash => h.kind == .directory and mox.state.id.isId(h.name),
+        };
+        if (ours) continue;
+        if (first == null) first = h.name else others += 1;
+    }
+    const name = first orelse return null;
+    if (others == 0) return try std.fmt.allocPrint(arena, "holds {s}, which mox did not make", .{name});
+    return try std.fmt.allocPrint(arena, "holds {s} and {d} more entr(ies) mox did not make", .{ name, others });
 }
 
 /// `check-<16 hex>`, a check hook's candidate, or its `.out` capture.
@@ -98,7 +135,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
             return 0;
         }
         for (found) |e| {
-            if (actionFor(e.name, purge_private) != .foreign) break;
+            if (actionFor(e.name, purge_private) != .foreign and try notMoxs(ctx.alloc, ctx.io, context.paths.state_dir, e) == null) break;
         } else {
             try ctx.err.print("mox uninstall: {s} holds nothing mox made, so it is not a mox state directory; nothing was removed (check MOX_STATE_DIR)\n", .{context.paths.state_dir});
             return 2;
@@ -139,7 +176,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     var trash_seen = false;
     for (entries) |e| {
         const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, e.name });
-        switch (actionFor(e.name, purge_private)) {
+        const action = actionFor(e.name, purge_private);
+        if (action == .remove or action == .prompt) if (try notMoxs(ctx.alloc, ctx.io, context.paths.state_dir, e)) |why| {
+            try ctx.out.print("  kept {f} ({s})\n", .{ display.of(path, ctx.context.?.paths.home), why });
+            continue;
+        };
+        switch (action) {
             .preserve => try ctx.out.print("  kept {f}\n", .{display.of(path, ctx.context.?.paths.home)}),
             .foreign => try ctx.out.print("  kept {f} (not made by mox)\n", .{display.of(path, ctx.context.?.paths.home)}),
             .history => {},
@@ -253,7 +295,7 @@ pub const command = app.command(Spec, .{
     .name = "uninstall",
     .usage = "mox uninstall [--flags]",
     .summary = "Remove mox state",
-    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. Only entries mox makes in the state directory are removed; any other is listed as kept, and a directory holding none of them is refused. The source repo is never touched.",
+    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. Only entries mox makes in the state directory are removed, and bin/, tmp/ and trash/ only while they hold nothing but what mox puts there; any other is listed as kept, and a directory holding none of them is refused. The source repo is never touched.",
     .group = .general,
     .needs_context = true,
 }, run);

@@ -65,7 +65,11 @@ All notable changes to mox are documented here. The format follows
   without following it; it used to remove every entry it did not know. A
   state directory that holds none of mox's entries is refused with exit 2
   before anything is created or removed in it, so a `MOX_STATE_DIR` that
-  names a home or another directory by mistake is left as it is.
+  names a home or another directory by mistake is left as it is. `bin/`,
+  `tmp/` and `trash/` are removed only while they hold nothing but what mox
+  puts there (the running `mox`, the package managers' scratch files, trash
+  generations named by run id); one holding anything else is kept and
+  listed with the first entry mox did not make.
 - `mox snapshot` lists, and a bare `mox rollback` picks, a run that
   displaced only an empty directory, and it counts toward
   `MOX_SNAPSHOT_RETENTION`, so an older snapshot may be pruned one run

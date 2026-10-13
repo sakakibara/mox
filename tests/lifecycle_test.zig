@@ -1772,7 +1772,7 @@ test "uninstall: removes state, preserves private and trash and the source repo"
     _ = try h.run(&.{ "mox", "apply" });
     // Seed a private-layer file and a trash generation.
     try writeRepo(io, &tmp, "state/private/.gitconfig.d/machine=x", "secret\n");
-    try writeRepo(io, &tmp, "state/trash/gen1/src/.old", "recoverable\n");
+    try writeRepo(io, &tmp, "state/trash/20260101T000000Z/src/.old", "recoverable\n");
 
     const r = try h.run(&.{ "mox", "uninstall" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -1798,7 +1798,7 @@ test "uninstall --purge-private --purge-trash removes both" {
     try writeRepo(io, &tmp, "repo/src/.zshrc", "content\n");
     _ = try h.run(&.{ "mox", "apply" });
     try writeRepo(io, &tmp, "state/private/keep", "secret\n");
-    try writeRepo(io, &tmp, "state/trash/gen1/x", "old\n");
+    try writeRepo(io, &tmp, "state/trash/20260101T000000Z/x", "old\n");
 
     const r = try h.run(&.{ "mox", "uninstall", "--purge-private", "--purge-trash" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -7246,7 +7246,7 @@ test "uninstall: at a terminal, a state it cannot open is refused before it asks
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "content\n");
-    try writeRepo(io, &tmp, "state/trash/gen1/src/.old", "recoverable\n");
+    try writeRepo(io, &tmp, "state/trash/20260101T000000Z/src/.old", "recoverable\n");
     try writeRepo(io, &tmp, "state/v2/current", "20260101T000000Z\n");
     try writeRepo(io, &tmp, "state/v2/gen/20260101T000000Z.json", "{\"v\":3}");
     var env = try gitEnv(h);

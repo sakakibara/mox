@@ -1766,6 +1766,56 @@ test "uninstall: an entry of the state directory mox did not make is kept and li
     try std.testing.expect(!exists(io, try statePath(h, &.{"coupling"})));
 }
 
+test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept and listed, and mox's own are removed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+
+    // A home directory named as the state directory, with a lock file a
+    // run left in it.
+    try writeRepo(io, &tmp, "homelike/mox.lock", "");
+    try writeRepo(io, &tmp, "homelike/bin/user-script", "#!/bin/sh\n");
+    try writeRepo(io, &tmp, "homelike/tmp/notes", "mine\n");
+    try writeRepo(io, &tmp, "homelike/trash/old-photos/a.jpg", "jpg\n");
+    const home_like = try std.fs.path.join(a, &.{ h.root, "homelike" });
+    const foreign = try withState(h, home_like);
+    const r = try foreign.run(&.{ "mox", "uninstall", "--purge-trash" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("#!/bin/sh\n", try read(io, a, try statePath(foreign, &.{ "bin", "user-script" })));
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try statePath(foreign, &.{ "tmp", "notes" })));
+    try std.testing.expectEqualStrings("jpg\n", try read(io, a, try statePath(foreign, &.{ "trash", "old-photos", "a.jpg" })));
+    try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds user-script, which mox did not make)", .{try statePath(foreign, &.{"bin"})})));
+    try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds notes, which mox did not make)", .{try statePath(foreign, &.{"tmp"})})));
+    try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds old-photos, which mox did not make)", .{try statePath(foreign, &.{"trash"})})));
+
+    // Without the lock file, a bin/ and tmp/ of the user's are not mox's.
+    try Io.Dir.cwd().deleteFile(io, try statePath(foreign, &.{"mox.lock"}));
+    for ([_][]const u8{ "readers.lock", "readers.gate" }) |n| Io.Dir.cwd().deleteFile(io, try statePath(foreign, &.{n})) catch {};
+    const refused = try foreign.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 2), refused.rc);
+    try std.testing.expect(contains(refused.err, "nothing mox made"));
+
+    // A real state: the scripts' bin/ apply made, the package managers'
+    // scratch files and a trash generation are mox's, and go.
+    h = try withState(h, try std.fs.path.join(a, &.{ h.root, "state" }));
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try writeRepo(io, &tmp, "repo/scripts/pre/00-noop.sh", "#!/bin/sh\nexit 0\n");
+    try chmodPath(a, try std.fs.path.join(a, &.{ h.repo, "scripts", "pre", "00-noop.sh" }), 0o755);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try statePath(h, &.{ "bin", "mox" })));
+    try writeRepo(io, &tmp, "state/tmp/stdin-99999.txt", "in\n");
+    try writeRepo(io, &tmp, "state/tmp/brew-installer-99999.sh", "#!/bin/sh\n");
+    try writeRepo(io, &tmp, "state/trash/20260101T000000Z-2/src/.old", "old\n");
+    const ok = try h.run(&.{ "mox", "uninstall", "--purge-trash" });
+    try std.testing.expectEqual(@as(u8, 0), ok.rc);
+    for ([_][]const u8{ "bin", "tmp", "trash" }) |n| try std.testing.expect(!exists(io, try statePath(h, &.{n})));
+}
+
 /// Readers that overlap one another, each its own holder as a separate mox
 /// would be: a new one every 100 ms holds the readers lock shared for
 /// 400 ms, taking it through the gate as mox's readers do, until `stop`.

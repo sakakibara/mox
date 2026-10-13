@@ -132,6 +132,11 @@ fn scratchStale(pid: u32, self_pid: u32, age_ms: i64, age_decides: bool) bool {
     return !processAlive(pid);
 }
 
+/// Whether `name` is one a call stages under `<scratch_dir>/tmp`.
+pub fn isScratchName(name: []const u8) bool {
+    return scratchPidOf(name) != null;
+}
+
 /// The pid a scratch file is named for, or null for any other file.
 fn scratchPidOf(name: []const u8) ?u32 {
     const digits = for ([_][2][]const u8{

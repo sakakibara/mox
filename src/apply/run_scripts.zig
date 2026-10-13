@@ -393,6 +393,13 @@ pub fn verdictForScript(arena: std.mem.Allocator, record: ?dimensions.ScriptReco
     return .{};
 }
 
+pub const bin_dir_name = "bin";
+
+/// What `moxBinDir` keeps in its directory: the running mox, copied in on
+/// Windows and linked elsewhere.
+pub const bin_entry_name = if (builtin.os.tag == .windows) "mox.exe" else "mox";
+pub const bin_entry_kind: Io.File.Kind = if (builtin.os.tag == .windows) .file else .sym_link;
+
 /// A directory under the state dir holding only the running mox, refreshed
 /// on every call, for scripts and check hooks to find `mox` on PATH. Every
 /// setup script calls `mox` (a `mox trigger` staleness gate is the idiom),
@@ -410,12 +417,12 @@ pub fn moxBinDir(arena: std.mem.Allocator, io: Io, state_dir: []const u8, why: *
         why.* = "mox could not locate its own executable";
         return null;
     };
-    const dir = try std.fs.path.join(arena, &.{ state_dir, "bin" });
+    const dir = try std.fs.path.join(arena, &.{ state_dir, bin_dir_name });
     Io.Dir.cwd().createDirPath(io, dir) catch |e| {
         why.* = try std.fmt.allocPrint(arena, "{s} could not be created: {s}", .{ dir, @errorName(e) });
         return null;
     };
-    const keep: []const u8 = if (builtin.os.tag == .windows) "mox.exe" else "mox";
+    const keep: []const u8 = bin_entry_name;
     var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| {
         why.* = try std.fmt.allocPrint(arena, "{s} could not be opened: {s}", .{ dir, @errorName(e) });
         return null;
