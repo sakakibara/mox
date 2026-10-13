@@ -971,7 +971,7 @@ test "findMalformedProvenance: a blob that does not parse, and one that is missi
     try st.record("/h/a", "a\n", null);
     try st.persistProvenanceBlob("/h/a", try st.putBlob("{ not valid json"));
     try st.persistProvenanceBlob("/h/gone", mox.apply.applied.contentHashHex("never stored"));
-    try st.persistProvenance("/h/ok", &.{});
+    try st.persistProvenance("/h/ok", "", &.{});
     const bad = try findMalformedProvenance(a, st);
     try testing.expectEqual(@as(usize, 2), bad.len);
 }

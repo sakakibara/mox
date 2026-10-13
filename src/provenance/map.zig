@@ -59,7 +59,87 @@ pub const Segment = struct {
 pub const Map = struct {
     live_path: []const u8,
     segments: []const Segment,
+    /// The digests of the lines a secret segment covered, when the map was
+    /// written with them.
+    secret_lines: ?SecretLines = null,
+
+    /// The digests of every line a secret segment covered, or null when the
+    /// map has secret segments but was written without them.
+    pub fn secretLines(m: Map) ?SecretLines {
+        if (m.secret_lines) |l| return l;
+        if (!hasSecret(m.segments)) return .{ .key_id = null, .digests = &.{} };
+        return null;
+    }
 };
+
+pub const key_len = 32;
+pub const Digest = [2 * std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8;
+
+/// Keyed digests of the output lines a secret segment covered, so a line
+/// can be recognized wherever it moved without the value being kept.
+pub const SecretLines = struct {
+    /// Which key made them; null when there are none.
+    key_id: ?Digest,
+    /// Sorted, without repeats.
+    digests: []const Digest,
+
+    pub fn has(l: SecretLines, d: Digest) bool {
+        var lo: usize = 0;
+        var hi: usize = l.digests.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, &l.digests[mid], &d)) {
+                .eq => return true,
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+            }
+        }
+        return false;
+    }
+};
+
+/// HMAC-SHA256 of `line` under `key`, as hex.
+pub fn lineDigest(key: *const [key_len]u8, line: []const u8) Digest {
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, line, key);
+    return std.fmt.bytesToHex(mac, .lower);
+}
+
+/// The name of `key` that digests record, which says nothing of the key.
+pub fn keyId(key: *const [key_len]u8) Digest {
+    return lineDigest(key, "mox secret-lines key");
+}
+
+/// The digests of every line of `content` that a secret segment of
+/// `segments` covers, lines split as diff splits them.
+pub fn secretLinesOf(arena: std.mem.Allocator, key: *const [key_len]u8, content: []const u8, segments: []const Segment) !SecretLines {
+    var lines: std.ArrayList([]const u8) = .empty;
+    if (content.len > 0) {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |line| {
+            if (it.peek() == null and line.len == 0) break;
+            try lines.append(arena, line);
+        }
+    }
+    var out: std.ArrayList(Digest) = .empty;
+    for (segments) |s| {
+        if (s.origin != .secret) continue;
+        var i: u32 = s.out_start;
+        while (i < s.out_start + s.out_len and i < lines.items.len) : (i += 1) try out.append(arena, lineDigest(key, lines.items[i]));
+    }
+    std.mem.sort(Digest, out.items, {}, struct {
+        fn lt(_: void, x: Digest, y: Digest) bool {
+            return std.mem.order(u8, &x, &y) == .lt;
+        }
+    }.lt);
+    var n: usize = 0;
+    for (out.items) |d| {
+        if (n > 0 and std.mem.eql(u8, &out.items[n - 1], &d)) continue;
+        out.items[n] = d;
+        n += 1;
+    }
+    return .{ .key_id = if (n > 0) keyId(key) else null, .digests = out.items[0..n] };
+}
 
 /// Return the single segment fully containing the output-line range
 /// `[a_start, a_start + a_len)`. A zero-length range (pure insertion) is
@@ -191,7 +271,8 @@ pub fn redactSecretLines(arena: std.mem.Allocator, content: []const u8, segments
 const version: i128 = 1;
 
 /// Serialize a provenance map to versioned JSON bytes (arena-owned).
-pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []const Segment) ![]u8 {
+/// `secret_lines` is written only when a segment is a secret.
+pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []const Segment, secret_lines: ?SecretLines) ![]u8 {
     const seg_values = try arena.alloc(json.Value, segments.len);
     for (segments, 0..) |seg, i| seg_values[i] = try segmentToJson(arena, seg);
 
@@ -199,6 +280,14 @@ pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []co
     try root.put(arena, "v", .{ .integer = version });
     try root.put(arena, "live_path", .{ .string = live_path });
     try root.put(arena, "segments", .{ .array = seg_values });
+    if (secret_lines) |l| if (hasSecret(segments)) {
+        const digests = try arena.alloc(json.Value, l.digests.len);
+        for (l.digests, 0..) |*d, i| digests[i] = .{ .string = d };
+        var obj: json.ObjectMap = .empty;
+        try obj.put(arena, "key", if (l.key_id) |*k| .{ .string = k } else .null);
+        try obj.put(arena, "digests", .{ .array = digests });
+        try root.put(arena, "secret_lines", .{ .object = obj });
+    };
 
     var aw: Io.Writer.Allocating = .init(arena);
     try json.encode(&aw.writer, .{ .object = root }, .{ .indent = 2 });
@@ -259,7 +348,28 @@ pub fn deserialize(arena: std.mem.Allocator, bytes: []const u8) ParseError!Map {
 
     var out = try arena.alloc(Segment, segs_v.array.len);
     for (segs_v.array, 0..) |sv, i| out[i] = try segmentFromJson(arena, sv);
-    return .{ .live_path = try arena.dupe(u8, live), .segments = out };
+    return .{ .live_path = try arena.dupe(u8, live), .segments = out, .secret_lines = try secretLinesFromJson(arena, v.get("secret_lines")) };
+}
+
+fn secretLinesFromJson(arena: std.mem.Allocator, v: ?json.Value) ParseError!?SecretLines {
+    const val = v orelse return null;
+    if (val != .object) return error.InvalidProvenance;
+    const key: ?Digest = if (val.get("key")) |k| switch (k) {
+        .null => null,
+        .string => |str| try digestOf(str),
+        else => return error.InvalidProvenance,
+    } else return error.InvalidProvenance;
+    const ds = val.get("digests") orelse return error.InvalidProvenance;
+    if (ds != .array) return error.InvalidProvenance;
+    const digests = try arena.alloc(Digest, ds.array.len);
+    for (ds.array, digests) |d, *out| out.* = try digestOf(stringOf(d) orelse return error.InvalidProvenance);
+    return .{ .key_id = key, .digests = digests };
+}
+
+fn digestOf(s: []const u8) ParseError!Digest {
+    if (s.len != @sizeOf(Digest)) return error.InvalidProvenance;
+    for (s) |c| if (!std.ascii.isHex(c)) return error.InvalidProvenance;
+    return s[0..@sizeOf(Digest)].*;
 }
 
 fn segmentFromJson(arena: std.mem.Allocator, sv: json.Value) ParseError!Segment {
@@ -419,7 +529,7 @@ test "serialize/deserialize round-trip preserves every origin kind" {
         .{ .out_start = 6, .out_len = 1, .origin = .{ .interpolated = .{ .origin_line = 9 } } },
         .{ .out_start = 7, .out_len = 1, .origin = .{ .private = .{ .path = "/priv/frag", .line = 3 } } },
     };
-    const bytes = try serialize(a, "/home/me/.zshrc", &segs);
+    const bytes = try serialize(a, "/home/me/.zshrc", &segs, null);
     const parsed = try deserialize(a, bytes);
     try testing.expectEqualStrings("/home/me/.zshrc", parsed.live_path);
     try testing.expectEqual(segs.len, parsed.segments.len);
@@ -428,4 +538,27 @@ test "serialize/deserialize round-trip preserves every origin kind" {
     try testing.expectEqualStrings("abbr <entry.key>", parsed.segments[3].origin.loop.template);
     try testing.expect(parsed.segments[4].origin == .secret);
     try testing.expect(parsed.segments[6].origin == .private);
+}
+
+test "secretLinesOf: a line a secret segment covers is found wherever it moves, under the key that made it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const key: [key_len]u8 = @splat(7);
+    const segs = [_]Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 1, .origin = .secret },
+    };
+    const l = try secretLinesOf(a, &key, "a\ntoken=v\n", &segs);
+    try testing.expectEqual(@as(usize, 1), l.digests.len);
+    try testing.expect(l.has(lineDigest(&key, "token=v")));
+    try testing.expect(!l.has(lineDigest(&key, "a")));
+    const other: [key_len]u8 = @splat(8);
+    try testing.expect(!l.has(lineDigest(&other, "token=v")));
+    const back = try deserialize(a, try serialize(a, "/h/f", &segs, l));
+    try testing.expect(back.secretLines().?.has(lineDigest(&key, "token=v")));
+    try testing.expectEqual(keyId(&key), back.secretLines().?.key_id.?);
+    // Written without them: unknown, unless no segment is a secret.
+    try testing.expect((try deserialize(a, try serialize(a, "/h/f", &segs, null))).secretLines() == null);
+    try testing.expectEqual(@as(usize, 0), (try deserialize(a, try serialize(a, "/h/f", segs[0..1], null))).secretLines().?.digests.len);
 }

@@ -159,6 +159,8 @@ test "state: an apply that fails after finding the private layer still records t
     try std.testing.expect(d.expects_private[0]);
 }
 
+var raced_state: []const u8 = "";
+
 test "ids: a run that trashed but changed no state keeps its id from the next run" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1248,6 +1250,64 @@ test "state: an owned record naming no canonical blob says so, doctor lists it, 
     try std.testing.expect(contains(fixed.out, "canonical text (no canonical blob recorded) was missing; writing the owned keys"));
     try std.testing.expect(contains(try read(io, a, live), "k = 2"));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "diff: a secret line the last apply wrote is masked wherever it moved, and the lines around it are shown" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "tok-4c1d" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntoken=<secret:env:MOX_TEST_TOKEN>\nz\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\nz\n");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "n1\nn2\nn3\na\ntoken=tok-4c1d\nz\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "tok-4c1d"));
+    try std.testing.expect(contains(d.out, "-n1\n-n2\n-n3\n"));
+    try std.testing.expect(contains(d.out, mox.provenance.map.secret_redaction));
+
+    if (builtin.os.tag != .windows) {
+        const key = try statePath(h, &.{ "v2", "secret-lines.key" });
+        const st = try Io.Dir.cwd().statFile(io, key, .{});
+        try std.testing.expectEqual(@as(u64, 32), st.size);
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    }
+}
+
+test "diff: a file whose provenance records no secret lines, as a damaged store holds it, is not shown while it may hold a secret" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "tok-4c1d" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntoken=<secret:env:MOX_TEST_TOKEN>\nz\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try editCurrent(h, struct {
+        fn unrecorded(arena_: std.mem.Allocator, g: *mox.state.generation.Generation, p: []const u8) !void {
+            const segments = [_]mox.provenance.map.Segment{
+                .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+                .{ .out_start = 1, .out_len = 1, .origin = .secret },
+                .{ .out_start = 2, .out_len = 1, .origin = .{ .base = .{ .line = 3 } } },
+            };
+            const bytes = try mox.provenance.map.serialize(arena_, p, &segments, null);
+            const store = try mox.state.Store.init(arena_, raced_state);
+            g.paths.getPtr(p).?.file.?.provenance_blob = try mox.state.blob.put(arena_, std.testing.io, store.blobs, bytes);
+        }
+    }.unrecorded, blk: {
+        raced_state = h.state;
+        break :blk try h.liveOf(".cfg");
+    });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "n1\na\ntoken=tok-4c1d\nz\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(!contains(d.out, "tok-4c1d"));
+    try std.testing.expect(contains(d.err, "not shown"));
+    try std.testing.expect(contains(d.err, "run `mox apply` to record what diff needs"));
 }
 
 test "diff: a live file whose secret mask is gone is not shown, and no resolved secret reaches stdout" {

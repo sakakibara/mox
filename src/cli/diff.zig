@@ -510,19 +510,47 @@ fn diffOne(
     if (stat_mode) {
         try ctx.out.print(" {f} | +{d} -{d}\n", .{ display.of(live_path, ctx.context.?.paths.home), s.added, s.removed });
     } else {
-        // Composed-side secrets come from this compose's provenance; live-side
-        // secrets from the last-applied provenance mox persisted for the path
-        // (its resolved values may still sit on disk).
+        // Composed-side secrets come from this compose's provenance. A live
+        // line is masked when it is one the last apply wrote from a secret,
+        // wherever it now sits.
         const b_secret = try secretMask(ctx.alloc, b_lines.len, prov_segments);
         const prior = try st.provenance(live_path);
-        if (prior == null and live.len > 0 and (hasSecret(prov_segments) or secretRecord(st, live_path))) {
-            try ctx.err.print("mox diff: {f}: not shown: the live file may hold a resolved secret, and the provenance that masks it is missing (`mox doctor --rebuild-provenance` records it again)\n", .{display.of(live_path, ctx.context.?.paths.home)});
+        const shown = display.of(live_path, ctx.context.?.paths.home);
+        const may_hold = live.len > 0 and (hasSecret(prov_segments) or secretRecord(st, live_path) or (prior != null and hasSecret(prior.?.segments)));
+        const known = if (prior) |m| knownSecretLines(st, m) else null;
+        if (may_hold and prior == null) {
+            try ctx.err.print("mox diff: {f}: not shown: the live file may hold a resolved secret, and the provenance that masks it is missing (`mox doctor --rebuild-provenance` records it again); run `mox apply` to record what diff needs\n", .{shown});
             return;
         }
-        const a_secret = if (prior) |m| try secretMask(ctx.alloc, a_lines.len, m.segments) else &.{};
+        if (may_hold and known == null) {
+            try ctx.err.print("mox diff: {f}: not shown: the live file may hold a resolved secret, and its provenance does not say which lines; run `mox apply` to record what diff needs\n", .{shown});
+            return;
+        }
+        const a_secret = if (known) |k| try liveSecretMask(ctx.alloc, st, a_lines, k) else &.{};
         const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
         try ctx.out.writeAll(rendered);
     }
+}
+
+/// The secret lines the last apply recorded for a file, when they can be
+/// matched: written with digests, by the key this state holds.
+fn knownSecretLines(st: *State, m: mox.provenance.map.Map) ?mox.provenance.map.SecretLines {
+    const l = m.secretLines() orelse return null;
+    if (l.digests.len == 0) return l;
+    const key = st.secretKey() orelse return null;
+    const id = l.key_id orelse return null;
+    if (!std.mem.eql(u8, &id, &mox.provenance.map.keyId(&key))) return null;
+    return l;
+}
+
+/// Which live lines are ones the last apply wrote from a secret.
+fn liveSecretMask(arena: std.mem.Allocator, st: *State, lines: []const []const u8, known: mox.provenance.map.SecretLines) ![]const bool {
+    const mask = try arena.alloc(bool, lines.len);
+    @memset(mask, false);
+    if (known.digests.len == 0) return mask;
+    const key = st.secretKey().?;
+    for (lines, mask) |line, *m| m.* = known.has(mox.provenance.map.lineDigest(&key, line));
+    return mask;
 }
 
 fn hasSecret(segments: []const mox.provenance.map.Segment) bool {

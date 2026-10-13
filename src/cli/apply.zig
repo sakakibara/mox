@@ -2291,7 +2291,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
                 if (!contains_secret) {
                     try st.recordContent(in.live_path, in.bytes);
                 }
-                try st.persistProvenance(in.live_path, in.prov_items);
+                try st.persistProvenance(in.live_path, in.bytes, in.prov_items);
             }
             try ctx.out.print("  unchanged {s}\n", .{shown});
             return;
@@ -2335,7 +2335,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
         if (!contains_secret) {
             try st.recordContent(in.live_path, in.bytes);
         }
-        try st.persistProvenance(in.live_path, in.prov_items);
+        try st.persistProvenance(in.live_path, in.bytes, in.prov_items);
     }
     counts.ok += 1;
     try ctx.out.print("  {s} {s}\n", .{ if (in.create_once) "seeded" else "wrote", shown });

@@ -25,6 +25,17 @@ const PathEntry = generation.PathEntry;
 /// The directory under the state directory that holds the store.
 pub const store_dir_name = "v2";
 
+/// The key secret-line digests are made with: 32 random bytes, 0600,
+/// created by the first run that records a secret line.
+pub const secret_key_name = "secret-lines.key";
+
+/// The key at `store`, when there is one of the right length.
+pub fn readSecretKey(arena: std.mem.Allocator, io: Io, store: Store) ?[prov_map.key_len]u8 {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, store.secret_key, arena, .limited(prov_map.key_len + 1)) catch return null;
+    if (bytes.len != prov_map.key_len) return null;
+    return bytes[0..prov_map.key_len].*;
+}
+
 pub const Store = struct {
     state_dir: []const u8,
     v2: []const u8,
@@ -35,6 +46,7 @@ pub const Store = struct {
     trash: []const u8,
     current: []const u8,
     readers: []const u8,
+    secret_key: []const u8,
 
     pub fn init(arena: std.mem.Allocator, state_dir: []const u8) !Store {
         const v2 = try std.fs.path.join(arena, &.{ state_dir, store_dir_name });
@@ -48,6 +60,7 @@ pub const Store = struct {
             .trash = try std.fs.path.join(arena, &.{ state_dir, "trash" }),
             .current = try std.fs.path.join(arena, &.{ v2, "current" }),
             .readers = try std.fs.path.join(arena, &.{ v2, lock.readers_name }),
+            .secret_key = try std.fs.path.join(arena, &.{ v2, secret_key_name }),
         };
     }
 
@@ -109,6 +122,8 @@ pub const Draft = struct {
     run_id: ?[]const u8 = null,
     changed: bool = false,
     committed: bool = false,
+    /// The secret-line key, once read or made.
+    secret_key: ?[prov_map.key_len]u8 = null,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
     /// What a step that waits for the readers says first.
@@ -366,10 +381,37 @@ pub const Draft = struct {
         try d.setPath(live, e);
     }
 
-    /// Keep `segments` as where each line of `live` came from.
-    pub fn persistProvenance(d: *Draft, live: []const u8, segments: []const prov_map.Segment) !void {
-        const h = try blob.put(d.arena, d.io, d.store.blobs, try prov_map.serialize(d.arena, live, segments));
+    /// Keep `segments` as where each line of `content`, the bytes written to
+    /// `live`, came from, with the digests of its secret lines.
+    pub fn persistProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) !void {
+        const h = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, content, segments));
         try d.persistProvenanceBlob(live, h);
+    }
+
+    fn serializeProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) ![]u8 {
+        if (!prov_map.hasSecret(segments)) return prov_map.serialize(d.arena, live, segments, null);
+        const key = try d.makeSecretKey();
+        return prov_map.serialize(d.arena, live, segments, try prov_map.secretLinesOf(d.arena, &key, content, segments));
+    }
+
+    /// The secret-line key, made when there is none.
+    fn makeSecretKey(d: *Draft) ![prov_map.key_len]u8 {
+        if (d.secret_key) |k| return k;
+        if (readSecretKey(d.arena, d.io, d.store)) |k| {
+            d.secret_key = k;
+            return k;
+        }
+        var k: [prov_map.key_len]u8 = undefined;
+        try d.io.randomSecure(&k);
+        try durable.writeFile(d.io, d.store.secret_key, &k);
+        d.secret_key = k;
+        return k;
+    }
+
+    /// The secret-line key, when there is one.
+    pub fn secretKey(d: *Draft) ?[prov_map.key_len]u8 {
+        if (d.secret_key == null) d.secret_key = readSecretKey(d.arena, d.io, d.store);
+        return d.secret_key;
     }
 
     pub fn persistProvenanceBlob(d: *Draft, live: []const u8, h: Hex) !void {
@@ -390,7 +432,7 @@ pub const Draft = struct {
         var e = d.entry(live) orelse return;
         if (e.kind != .file) return;
         e.file.?.cache_blob = if (secret) null else try blob.put(d.arena, d.io, d.store.blobs, content);
-        e.file.?.provenance_blob = try blob.put(d.arena, d.io, d.store.blobs, try prov_map.serialize(d.arena, live, segments));
+        e.file.?.provenance_blob = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, content, segments));
         try d.setPath(live, e);
         try d.clearResidue(live);
     }
