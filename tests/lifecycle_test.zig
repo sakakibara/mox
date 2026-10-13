@@ -6810,6 +6810,8 @@ test "private layer: once it held sources, every composing command refuses while
     try writeRepo(io, &tmp, "state/private/data/ids.toml", "[[ids]]\nslug = \"public\"\n[[ids]]\nslug = \"secrethost\"\n");
     try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".tok\"]\nmode = \"0600\"\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // A first reader creates the lock files every later reader opens.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
     const priv = try std.fs.path.join(a, &.{ h.state, "private" });
 
     // Only junk left: a .DS_Store and an evicted iCloud placeholder.

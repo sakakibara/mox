@@ -197,15 +197,28 @@ fn unlockFile(io: Io, file: Io.File) void {
 /// holds exclusive. It is never unlinked, moved or renamed.
 pub const readers_name = "readers.lock";
 
+/// The file next to `readers.lock` that orders the readers behind a step
+/// waiting for them: a reader takes it shared until it holds the readers
+/// lock, and the waiting step holds it exclusive while it waits and works,
+/// so readers that keep overlapping cannot keep the readers lock from it.
+/// It is never unlinked, moved or renamed.
+pub const gate_name = "readers.gate";
+
 pub const Readers = struct {
     io: Io,
     file: Io.File,
     /// A shared hold this process counts.
     counted: bool,
+    /// The gate a waiting step holds with it.
+    gate: ?Io.File = null,
 
     pub fn release(self: Readers) void {
         unlockFile(self.io, self.file);
         self.file.close(self.io);
+        if (self.gate) |g| {
+            unlockFile(self.io, g);
+            g.close(self.io);
+        }
         if (self.counted) shared_holds -= 1;
     }
 };
@@ -244,21 +257,62 @@ fn exists(io: Io, path: []const u8) bool {
     return true;
 }
 
-/// The lock file at `path`, opened for reading, created 0600 when missing:
-/// `no_store` when the store at `store` or the lock's directory is missing,
-/// `unavailable` when the directory will not take it.
+/// The lock file at `path`, opened for reading only, created 0600 first
+/// when missing: `no_store` when the store at `store` or the lock's
+/// directory is missing, `unavailable` when the directory will not take it.
 fn openReaders(io: Io, path: []const u8, store: ?[]const u8) union(enum) { file: Io.File, no_store, unavailable, failed: anyerror } {
     if (store) |s| if (!exists(io, s)) return .no_store;
     if (Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false })) |f| return .{ .file = f } else |e| switch (e) {
         error.FileNotFound => {},
         else => return .{ .failed = e },
     }
-    const f = Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = @import("durable.zig").privateFile() }) catch |e| return switch (e) {
+    const made = Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .permissions = @import("durable.zig").privateFile() }) catch |e| return switch (e) {
         error.FileNotFound => .no_store,
         error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .unavailable,
         else => .{ .failed = e },
     };
-    return .{ .file = f };
+    made.close(io);
+    if (Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false })) |f| return .{ .file = f } else |e| return .{ .failed = e };
+}
+
+/// The gate beside the readers lock at `path`.
+fn gatePath(buf: *[std.fs.max_path_bytes]u8, path: []const u8) ![]const u8 {
+    const dir = std.fs.path.dirname(path) orelse ".";
+    return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ dir, std.fs.path.sep, gate_name });
+}
+
+/// The gate beside the readers lock at `path` held as `exclusive` asks,
+/// waiting; null when it is missing and cannot be created, as the readers
+/// lock is then read without.
+fn takeGate(io: Io, path: []const u8, store: ?[]const u8, exclusive: bool, wait: ?Wait, noticed: *bool) union(enum) { held: ?Io.File, no_store, failed: anyerror } {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const gate = gatePath(&buf, path) catch |e| return .{ .failed = e };
+    const file = switch (openReaders(io, gate, store)) {
+        .file => |f| f,
+        .no_store => return .no_store,
+        .unavailable => return .{ .held = null },
+        .failed => |e| return .{ .failed = e },
+    };
+    if (exclusive) {
+        const got = lockReaders(io, file, true, false) catch |e| {
+            file.close(io);
+            return .{ .failed = e };
+        };
+        if (got) return .{ .held = file };
+        if (wait) |w| w.notice(w.ctx, path);
+        noticed.* = true;
+    }
+    _ = lockReaders(io, file, exclusive, true) catch |e| {
+        file.close(io);
+        return .{ .failed = e };
+    };
+    return .{ .held = file };
+}
+
+fn dropGate(io: Io, gate: ?Io.File) void {
+    const g = gate orelse return;
+    unlockFile(io, g);
+    g.close(io);
 }
 
 fn lockReaders(io: Io, file: Io.File, exclusive: bool, wait: bool) Io.File.LockError!bool {
@@ -284,6 +338,15 @@ fn lockReaders(io: Io, file: Io.File, exclusive: bool, wait: bool) Io.File.LockE
 /// while a step that deletes holds it exclusive. A store that step removed
 /// is `no_store`.
 pub fn holdReaders(io: Io, path: []const u8, store: []const u8) Shared {
+    // A process already holding the readers lock shared passes no gate: a
+    // step waiting at it waits for that very hold.
+    var noticed = false;
+    const gate: ?Io.File = if (shared_holds > 0) null else switch (takeGate(io, path, store, false, null, &noticed)) {
+        .held => |g| g,
+        .no_store => return .no_store,
+        .failed => |e| return .{ .failed = e },
+    };
+    defer dropGate(io, gate);
     const file = switch (openReaders(io, path, store)) {
         .file => |f| f,
         .no_store => return .no_store,
@@ -311,35 +374,59 @@ pub const Mode = union(enum) {
 };
 
 /// The readers lock at `path` held exclusive for the store at `store`. A
-/// process holding it shared must release that first.
+/// step that waits takes the gate exclusive first, and holds it until it
+/// releases the lock, so no reader that comes after it gets ahead. A try
+/// passes no gate. A process holding the lock shared must release that
+/// first.
 pub fn excludeReaders(io: Io, path: []const u8, store: []const u8, mode: Mode) error{HoldingShared}!Exclusive {
     if (shared_holds > 0) return error.HoldingShared;
+    const wait: ?Wait = switch (mode) {
+        .try_once => null,
+        .wait => |w| w,
+    };
+    var noticed = false;
+    const gate: ?Io.File = switch (mode) {
+        .try_once => null,
+        .wait => switch (takeGate(io, path, store, true, wait, &noticed)) {
+            .held => |g| g,
+            .no_store => return .no_store,
+            .failed => |e| return .{ .failed = e },
+        },
+    };
     const file = switch (openReaders(io, path, store)) {
         .file => |f| f,
-        .no_store => return .no_store,
-        .unavailable => return .{ .failed = error.AccessDenied },
-        .failed => |e| return .{ .failed = e },
+        .no_store => {
+            dropGate(io, gate);
+            return .no_store;
+        },
+        .unavailable => {
+            dropGate(io, gate);
+            return .{ .failed = error.AccessDenied };
+        },
+        .failed => |e| {
+            dropGate(io, gate);
+            return .{ .failed = e };
+        },
     };
     const got = (if (builtin.is_test and forced_exclusive_failure != null) forced_exclusive_failure.? else lockReaders(io, file, true, false)) catch |e| {
         file.close(io);
+        dropGate(io, gate);
         return .{ .failed = e };
     };
     if (!got) {
-        const wait = switch (mode) {
-            .try_once => {
-                file.close(io);
-                return .busy;
-            },
-            .wait => |w| w,
-        };
-        if (wait) |w| w.notice(w.ctx, path);
+        if (mode == .try_once) {
+            file.close(io);
+            return .busy;
+        }
+        if (!noticed) if (wait) |w| w.notice(w.ctx, path);
         if (builtin.is_test) if (before_readers_wait) |f| f(io, path);
         _ = lockReaders(io, file, true, true) catch |e| {
             file.close(io);
+            dropGate(io, gate);
             return .{ .failed = e };
         };
     }
-    return .{ .held = .{ .io = io, .file = file, .counted = false } };
+    return .{ .held = .{ .io = io, .file = file, .counted = false, .gate = gate } };
 }
 
 pub const Failure = struct { path: []const u8, err: anyerror };

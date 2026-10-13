@@ -143,7 +143,7 @@ pub fn isHistory(name: []const u8) bool {
 /// module makes: the store and the lock files.
 pub fn isStateEntry(name: []const u8) bool {
     if (isHistory(name)) return true;
-    for ([_][]const u8{ lock.lock_name, lock.readers_name }) |n| if (std.mem.eql(u8, name, n)) return true;
+    for ([_][]const u8{ lock.lock_name, lock.readers_name, lock.gate_name }) |n| if (std.mem.eql(u8, name, n)) return true;
     return false;
 }
 

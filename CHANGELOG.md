@@ -52,11 +52,13 @@ All notable changes to mox are documented here. The format follows
   holder dies, `mox private retire` takes it, `mox.lock` stays after a run,
   empty, and a filesystem that cannot lock a file fails closed. A command
   that reads the state without writing it holds `readers.lock`, next to
-  `mox.lock`, shared while it runs (uninstall keeps both lock files); a run
+  `mox.lock`, shared while it runs (uninstall keeps the lock files); a run
   that commits meanwhile deletes no old snapshot and no unused content, a
   later one does, and `mox doctor` shows what waits for it. uninstall and
-  `doctor --fix` wait for such a reader instead, saying so. See "The state
-  directory" in commands.md.
+  `doctor --fix` wait for such a reader instead, saying so, and readers that
+  start after such a step began waiting wait behind it, through
+  `readers.gate`, a second lock file beside `readers.lock`, so overlapping
+  readers cannot keep it waiting. See "The state directory" in commands.md.
 - `mox uninstall` removes only the entries mox makes in the state
   directory, and lists every other entry as kept, "not made by mox",
   without following it; it used to remove every entry it did not know. A

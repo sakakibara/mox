@@ -23,6 +23,7 @@ const Io = std.Io;
 
 const lock_name = mox.state.lock.lock_name;
 const readers_name = mox.state.lock.readers_name;
+const gate_name = mox.state.lock.gate_name;
 const max_prompt_attempts = 100;
 
 pub const Action = enum { remove, preserve, prompt, history, foreign };
@@ -34,7 +35,7 @@ pub const Action = enum { remove, preserve, prompt, history, foreign };
 /// release; every other entry mox makes is removed, and one it does not
 /// make is foreign and kept.
 pub fn actionFor(name: []const u8, purge_private: bool) Action {
-    if (std.mem.eql(u8, name, lock_name) or std.mem.eql(u8, name, readers_name)) return .preserve;
+    if (std.mem.eql(u8, name, lock_name) or std.mem.eql(u8, name, readers_name) or std.mem.eql(u8, name, gate_name)) return .preserve;
     if (std.mem.eql(u8, name, "trash")) return .prompt;
     if (mox.state.isHistory(name)) return .history;
     if (std.mem.eql(u8, name, "private")) return if (purge_private) .remove else .preserve;
@@ -256,6 +257,7 @@ test "actionFor: private preserved by default, removed on purge; trash and the h
     try testing.expectEqual(Action.prompt, actionFor("trash", false));
     try testing.expectEqual(Action.preserve, actionFor(lock_name, false));
     try testing.expectEqual(Action.preserve, actionFor(readers_name, true));
+    try testing.expectEqual(Action.preserve, actionFor(gate_name, true));
     try testing.expectEqual(Action.remove, actionFor("coupling", false));
     for ([_][]const u8{ "applied", "snapshots" }) |n| try testing.expectEqual(Action.foreign, actionFor(n, false));
     try testing.expectEqual(Action.remove, actionFor("check-0123456789abcdef.out", false));

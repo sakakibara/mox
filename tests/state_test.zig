@@ -1740,3 +1740,70 @@ test "uninstall: an entry of the state directory mox did not make is kept and li
     try std.testing.expect(contains(r.out, "elsewhere (not made by mox)"));
     try std.testing.expect(!exists(io, try statePath(h, &.{"coupling"})));
 }
+
+/// Readers that overlap one another, each its own holder as a separate mox
+/// would be: a new one every 100 ms holds the readers lock shared for
+/// 400 ms, taking it through the gate as mox's readers do, until `stop`.
+const Relay = struct {
+    io: Io,
+    readers: []const u8,
+    gate: []const u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(usize) = .init(0),
+
+    fn openLock(io: Io, path: []const u8) !Io.File {
+        return Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+    }
+
+    fn one(r: *Relay) void {
+        const gate = openLock(r.io, r.gate) catch return;
+        defer gate.close(r.io);
+        gate.lock(r.io, .shared) catch return;
+        const f = openLock(r.io, r.readers) catch return;
+        defer f.close(r.io);
+        f.lock(r.io, .shared) catch return;
+        gate.unlock(r.io);
+        _ = r.started.fetchAdd(1, .seq_cst);
+        r.io.sleep(.fromMilliseconds(400), .awake) catch {};
+        f.unlock(r.io);
+    }
+
+    fn run(r: *Relay) void {
+        var threads: [400]?std.Thread = @splat(null);
+        for (&threads) |*t| {
+            if (r.stop.load(.seq_cst)) break;
+            t.* = std.Thread.spawn(.{}, one, .{r}) catch null;
+            r.io.sleep(.fromMilliseconds(100), .awake) catch {};
+        }
+        for (threads) |t| if (t) |th| th.join();
+    }
+};
+
+test "readers: a relay of overlapping readers does not keep uninstall waiting" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    var relay: Relay = .{ .io = io, .readers = try statePath(h, &.{"readers.lock"}), .gate = try statePath(h, &.{"readers.gate"}) };
+    const spawner = try std.Thread.spawn(.{}, Relay.run, .{&relay});
+    defer spawner.join();
+    defer relay.stop.store(true, .seq_cst);
+    while (relay.started.load(.seq_cst) < 2) try io.sleep(.fromMilliseconds(20), .awake);
+
+    const t0 = Io.Clock.awake.now(io);
+    const r = try h.run(&.{ "mox", "uninstall" });
+    const took = t0.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    relay.stop.store(true, .seq_cst);
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(contains(r.err, "waiting for a running mox command that reads the state"));
+    // The relay runs for 40 s; uninstall waits only for the readers that
+    // held the lock when it asked.
+    try std.testing.expect(took < 10_000);
+}
