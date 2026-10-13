@@ -112,7 +112,7 @@ pub const PlannedLeaf = struct { path: []const u8, verdict: removable.Verdict };
 
 /// One orphaned generator: released by a tombstone (its records forgotten,
 /// its files kept), or its files as the sweep would judge them.
-pub const OrphanManifest = struct {
+pub const OrphanGenerator = struct {
     /// The key the generator is kept under.
     key: []const u8,
     released: bool,
@@ -133,7 +133,7 @@ pub fn judgeLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []c
 /// Every orphaned generator and what the sweep would do with it: one of this
 /// run's part that `scan` does not know. Another part's generator, or one
 /// listing a file outside this run's HOME, is never an orphan here.
-pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *const OrphanScan) ![]const OrphanManifest {
+pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *const OrphanScan) ![]const OrphanGenerator {
     var opts = opts_in;
     var kept: std.ArrayList([]const u8) = .empty;
     var kit = scan.keep.keyIterator();
@@ -142,7 +142,7 @@ pub fn planOrphans(arena: std.mem.Allocator, io: Io, opts_in: Options, scan: *co
     inodes.* = try stale.inodesOf(arena, io, kept.items);
     opts.kept_inodes = inodes;
     opts.keep = &scan.keep;
-    var out: std.ArrayList(OrphanManifest) = .empty;
+    var out: std.ArrayList(OrphanGenerator) = .empty;
     const keys = try sorted(arena, opts.st.gen.generators.keys());
     outer: for (keys) |key| {
         const g = opts.st.gen.generators.get(key).?;
@@ -180,7 +180,7 @@ pub fn sweepOrphans(
     arena: std.mem.Allocator,
     io: Io,
     opts: Options,
-    plan: []const OrphanManifest,
+    plan: []const OrphanGenerator,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) !Result {
@@ -207,13 +207,13 @@ pub fn sweepOrphans(
 /// The key of the generator of this run's part no longer in the tree
 /// (`tree_live` holds every managed live path) that lists `leaf`. Null when
 /// none does.
-pub fn orphanManifestOf(arena: std.mem.Allocator, st: *const state.Draft, tree_live: *const std.StringHashMap(void), leaf: []const u8) !?[]const u8 {
-    const all = try orphanManifestsOf(arena, st, tree_live, leaf);
+pub fn orphanGeneratorOf(arena: std.mem.Allocator, st: *const state.Draft, tree_live: *const std.StringHashMap(void), leaf: []const u8) !?[]const u8 {
+    const all = try orphanGeneratorsOf(arena, st, tree_live, leaf);
     return if (all.len > 0) all[0] else null;
 }
 
-/// Every generator `orphanManifestOf` would consider that lists `leaf`.
-pub fn orphanManifestsOf(arena: std.mem.Allocator, st: *const state.Draft, tree_live: *const std.StringHashMap(void), leaf: []const u8) ![]const []const u8 {
+/// Every generator `orphanGeneratorOf` would consider that lists `leaf`.
+pub fn orphanGeneratorsOf(arena: std.mem.Allocator, st: *const state.Draft, tree_live: *const std.StringHashMap(void), leaf: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     const keys = try sorted(arena, st.gen.generators.keys());
     for (keys) |key| {

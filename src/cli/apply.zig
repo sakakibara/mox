@@ -405,7 +405,7 @@ fn applyPass(
     // A named path whose source left the tree is judged by the stale sweep
     // alone; every other named path must be managed.
     var stale_named: std.StringHashMap(void) = .init(ctx.alloc);
-    // A named file of a generator that left the tree, with its manifest.
+    // A named file of a generator that left the tree, with that generator.
     var orphan_named: std.StringHashMap([]const u8) = .init(ctx.alloc);
     if (scoped) {
         const cands = try mox.apply.stale.candidatesOf(ctx.alloc, st, home, tree);
@@ -424,7 +424,7 @@ fn applyPass(
                 return 2;
             } else if (mox.apply.stale.at(cands, live) != null) {
                 try stale_named.put(live, {});
-            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, st, &tree_live, live)) |m| {
+            } else if (try mox.apply.generated.orphanGeneratorOf(ctx.alloc, st, &tree_live, live)) |m| {
                 try orphan_named.put(live, m);
             } else try managed_paths.append(ctx.alloc, p);
         }
@@ -461,8 +461,8 @@ fn applyPass(
     // Regular managed targets, for the generator collision check.
     var regular_live: std.StringHashMap(void) = .init(ctx.alloc);
     for (files) |f| try regular_live.put(f.live_path, {});
-    // Every generator seen this run (succeeded or failed), so pruning and manifest
-    // recording happen AFTER all generators have composed. This makes the keep set
+    // Every generator seen this run (succeeded or failed), so pruning and
+    // recording produced sets happen AFTER all generators have composed. This makes the keep set
     // global and order-independent instead of "producers seen so far".
     var gen_states: std.ArrayList(GenState) = .empty;
     var compose_failed: std.ArrayList([]const u8) = .empty;
@@ -499,7 +499,7 @@ fn applyPass(
 
         // A GENERATOR (`for ... into`) fans out to N files instead of writing
         // its own path. Each output flows through the SAME per-file write path
-        // as a normal file. Pruning the prior set and recording the manifest are
+        // as a normal file. Pruning the prior set and recording the produced set are
         // deferred to a second pass against the global keep set below.
         if (try applyGenerator(ctx, st, file, &bindings, &m_state, secrets, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home)) continue;
 
@@ -542,7 +542,7 @@ fn applyPass(
             counts.fail += 1;
             // A file that fails to compose is undecided this run: it may be a
             // generator with a transient syntax slip, and the orphan sweep
-            // must not treat its manifest as abandoned.
+            // must not treat its produced set as abandoned.
             try compose_failed.append(ctx.alloc, file.live_path);
             continue;
         };
@@ -659,7 +659,7 @@ fn applyPass(
     // generator output, every regular managed target, and every FAILED
     // generator's PRIOR leaves. A transient compose failure must delete nothing
     // -- its old files stay both on disk (protected here from the exact sweep)
-    // and tracked (its manifest is left intact below). A leaf handed from one
+    // and tracked (its produced set is left intact below). A leaf handed from one
     // generator to another is owned by whichever produces it this run, so the
     // generator that dropped it never prunes it.
     var keep_set: std.StringHashMap(void) = .init(ctx.alloc);
@@ -674,9 +674,9 @@ fn applyPass(
         }
     }
 
-    // Every path a generator manifest lists, before this run rewrites or
+    // Every path a generator's produced set lists, before this run rewrites or
     // drops any: the stale-record sweep below never touches one.
-    const manifest_leaves = try st.allLeaves();
+    const produced_leaves = try st.allLeaves();
     const tree_links = try mox.apply.stale.managedLinks(ctx.alloc, tree.files);
     var kept_list: std.ArrayList([]const u8) = .empty;
     var kept_it = keep_set.keyIterator();
@@ -685,7 +685,7 @@ fn applyPass(
 
     // Second pass: prune each SUCCEEDED generator's dropped leaves against the
     // global keep, then record its current set. A failed generator prunes
-    // nothing and keeps its old manifest. `mute_drift_message` suppresses the
+    // nothing and keeps its old produced set. `mute_drift_message` suppresses the
     // per-leaf DRIFT line: a refused, still-in-tree generator folds into the
     // ONE `generated_set` unit below instead of a per-leaf row.
     for (gen_states.items) |g| {
@@ -724,7 +724,7 @@ fn applyPass(
     };
     const released_live = try mox.apply.stale.releasedSet(ctx.alloc, tree.released);
 
-    // Third pass: sweep manifests whose generator left the tree (source
+    // Third pass: sweep the generators that left the tree (source
     // deleted outside `mox remove`, or the file no longer parses as a
     // generator). Known = every walked generator this run, succeeded or
     // failed, plus any file with a head error (its nature is undecided this
@@ -770,7 +770,7 @@ fn applyPass(
     if (sweep_ok or (stale_named.count() > 0 and counts.fail == 0)) {
         var tree_keep: std.StringHashMap(void) = .init(ctx.alloc);
         for (tree.files) |f| try tree_keep.put(f.live_path, {});
-        for (manifest_leaves) |leaf| try tree_keep.put(leaf, {});
+        for (produced_leaves) |leaf| try tree_keep.put(leaf, {});
         var pit = produced.keyIterator();
         while (pit.next()) |p| try tree_keep.put(p.*, {});
         try sweepStale(ctx, st, .{
@@ -1779,9 +1779,9 @@ fn warnBadWholeFileGateAxis(ctx: *app.Ctx, file: mox.source.tree.ManagedFile) !v
 }
 
 /// One generator's state carried from the compose+write pass to the deferred
-/// prune/manifest pass. `current` is the set produced this run (empty when the
-/// generator failed); `prior` is its recorded manifest. A failed generator is
-/// pruned against nothing and its manifest is left intact.
+/// prune and record pass. `current` is the set produced this run (empty when
+/// the generator failed); `prior` is its recorded produced set. A failed
+/// generator is pruned against nothing and its produced set is left intact.
 const GenState = struct {
     live_path: []const u8,
     source_key: []const u8,
@@ -2206,8 +2206,8 @@ const RegularInput = struct {
 };
 
 /// Write one composed regular file through the drift guard, pre-overwrite
-/// snapshot, TOCTOU re-check, atomic write, and last-applied/provenance
-/// records. Shared by the normal apply loop and every generator output, so the
+/// snapshot, TOCTOU re-check, atomic write, and its record and provenance.
+/// Shared by the normal apply loop and every generator output, so the
 /// 1:1 write/snapshot/state machinery is not duplicated.
 fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts, snapshotted: *bool) !void {
     const context = ctx.context.?;
@@ -2223,8 +2223,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
         },
     }
     // A file whose composition inlined a resolved secret must NOT have its
-    // cleartext cached: the applied-content drift cache and snapshots are
-    // secret-aware. The hash record is still stored (preimage-resistant).
+    // cleartext cached: the content cache and snapshots are secret-aware. The hash record is still stored (preimage-resistant).
     const contains_secret = mox.provenance.map.hasSecret(in.prov_items);
     // A dedicated-manager (op://|pass://) secret auto-restricts the file to
     // 0600 when it has no explicit mode. An explicit attribute mode overrides.
@@ -2753,7 +2752,7 @@ fn writeOwnedRecord(
 /// is a normal managed file (the caller composes it the usual way). Returns
 /// true after fanning out: each produced output is written through
 /// `applyRegularFile` and the generator's state is recorded in `gen_states` for
-/// the deferred prune/manifest pass. An output whose rendered path matches an
+/// the deferred prune and record pass. An output whose rendered path matches an
 /// ignore rule is skipped individually (not written, not kept) while its
 /// siblings still materialize. A rendered path colliding with a regular
 /// managed target or another generator's output, escaping the target dir via a
@@ -2795,7 +2794,8 @@ fn applyGenerator(
         counts.fail += 1;
         // It IS a generator (compose recognized and then failed): consume it so
         // the caller does not also try to compose it as a normal file. Record it
-        // as failed so its prior leaves are protected and its manifest is kept.
+        // as failed so its prior leaves are protected and its produced set is
+        // kept.
         try recordFailedGenerator(st, file, gen_states);
         return true;
     };
@@ -2832,7 +2832,7 @@ fn applyGenerator(
         }
     }
 
-    // Current produced set for the manifest + global keep-set.
+    // Current produced set, to record and for the global keep-set.
     var current: std.ArrayList([]const u8) = .empty;
     for (outputs) |o| {
         // A generated output whose rendered path matches an ignore rule (itself

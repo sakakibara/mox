@@ -2116,7 +2116,7 @@ test "apply: a resolved secret value is never persisted anywhere in the state di
     // The secret is inlined into the live file (intended).
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), secret_value) != null);
 
-    // It must appear nowhere in mox's own state tree (applied-content, snapshots, ...).
+    // It must appear nowhere in mox's own state tree (content cache, snapshots, ...).
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
     try std.testing.expect(!try treeContainsBytes(io, a, state, secret_value));
 }
@@ -2152,7 +2152,7 @@ test "apply: an inline <secret:URI> value is inlined mid-line but never persiste
     // The secret is spliced mid-line into the live file (intended).
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "TOKEN=" ++ secret_value ++ "-suffix") != null);
 
-    // And appears nowhere in mox's own state tree (applied-content cache, snapshots).
+    // And appears nowhere in mox's own state tree (content cache, snapshots).
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
     try std.testing.expect(!try treeContainsBytes(io, a, state, secret_value));
 }
@@ -2160,7 +2160,7 @@ test "apply: an inline <secret:URI> value is inlined mid-line but never persiste
 test "apply: a secret in a Cat A gitconfig directive region is inlined live but never cached" {
     // A single-layer `.gitconfig` is Cat A, but a `# mox:` directive routes it
     // through Cat B. The resolved secret must inherit `.secret` provenance so
-    // its cleartext is kept out of the applied-content cache and snapshots --
+    // its cleartext is kept out of the content cache and snapshots --
     // the Cat A route must not discard the fact that a secret was resolved.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2227,7 +2227,7 @@ test "apply: a secret picked by a Cat B `from` region is inlined live but never 
 test "apply: a directiveless Cat A file resolves an inline secret and keeps it out of the cache" {
     // A pure structural `.toml` (no `# mox:` directive) must still resolve an
     // inline `<secret:URI>` AND mark itself secret-bearing so the resolved value
-    // is excluded from the applied-content cache.
+    // is excluded from the content cache.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3569,7 +3569,7 @@ test "apply generator: an inline secret in a produced leaf is inlined live but n
     // The secret is inlined into each produced leaf (intended).
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath(".config/id-a.inc")), secret_value) != null);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath(".config/id-b.inc")), secret_value) != null);
-    // But nowhere in mox's own state tree (applied-content cache, provenance).
+    // But nowhere in mox's own state tree (content cache, provenance).
     try std.testing.expect(!try treeContainsBytes(io, a, c.state, secret_value));
 
     // Drop row b and re-apply: b's leaf is pruned (snapshot-first). The pre-delete

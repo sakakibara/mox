@@ -134,7 +134,7 @@ fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool)
 
 /// What the orphan sweep would do, judged exactly as apply judges it:
 /// `scan` is what this run learned of the tree's generators.
-pub fn orphanPlan(ctx: *app.Ctx, st: *State, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan) ![]const mox.apply.generated.OrphanManifest {
+pub fn orphanPlan(ctx: *app.Ctx, st: *State, tree: mox.source.tree.ManagedTree, ruleset: *const mox.source.ignore.match.RuleSet, scan: *mox.apply.generated.OrphanScan) ![]const mox.apply.generated.OrphanGenerator {
     for (tree.files) |f| try scan.kept(f.live_path);
     const opts = try apply_cmd.orphanOptions(ctx, st, tree, ruleset, false, true);
     return mox.apply.generated.planOrphans(ctx.alloc, ctx.io, opts, scan);

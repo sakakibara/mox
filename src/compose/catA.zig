@@ -57,7 +57,7 @@ const max_layer_bytes: usize = 4 * 1024 * 1024;
 /// `.secret` for a resolved secret) flow straight into `prov`. Every other
 /// route (structural merge, verbatim pass-through) is one whole-file segment,
 /// `.secret` when interpolation resolved an inline `<secret:URI>` so its
-/// cleartext is kept out of the applied-content cache and snapshots. `diag`, if
+/// cleartext is kept out of the content cache and snapshots. `diag`, if
 /// set, names the failing capture on a resolution error.
 pub fn compose(
     arena: std.mem.Allocator,
@@ -576,8 +576,7 @@ pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile
 /// Cat A composed output and record the file's whole-file provenance segment.
 /// No machine state means no interp: the bytes pass through unchanged, still
 /// attributed a whole-file segment. A resolved inline secret makes the segment
-/// `.secret` so its cleartext stays out of the applied-content cache and
-/// snapshots.
+/// `.secret` so its cleartext stays out of the content cache and snapshots.
 fn interpolate(
     arena: std.mem.Allocator,
     io: Io,

@@ -965,7 +965,7 @@ test "compose catB: inline <secret:URI> resolves mid-line and marks the line .se
     try std.testing.expect(std.mem.indexOf(u8, out.?, "export TOKEN=hunter2-x") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "<SECRET:") == null);
     // The provenance must carry a `.secret` segment so apply/commit keep the
-    // cleartext out of the applied-content cache.
+    // cleartext out of the content cache.
     try std.testing.expect(mox.provenance.map.hasSecret(prov.items));
 }
 
@@ -4058,7 +4058,7 @@ test "generator: an inline secret in a produced file redacts only its own line a
     // A generated file whose body resolves an inline `<secret:...>` on ONE line.
     // Only that line may be `.secret`; the row's other lines survive redaction,
     // and the produced file reports `contains_secret` so apply keeps the
-    // cleartext out of the applied-content cache and snapshots.
+    // cleartext out of the content cache and snapshots.
     try writeFile(io, tmp.dir, "src/.config/x.gen",
         \\# mox: for id in "data/ids.toml" into "id-<id.slug>.inc"
         \\email = <id.email>

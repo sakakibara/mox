@@ -349,7 +349,7 @@ pub fn expand(
 /// when a null `ctx.secrets` turned it into a placeholder), and whether one was
 /// left as its placeholder. Callers that record provenance mark a span `.secret`
 /// when either is set: a resolved secret's cleartext is kept out of the
-/// applied-content cache and snapshots, and a placeholder compose attributes
+/// content cache and snapshots, and a placeholder compose attributes
 /// lines as a resolving one does.
 pub const Expansion = struct {
     bytes: []u8,

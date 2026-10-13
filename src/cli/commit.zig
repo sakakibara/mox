@@ -1268,8 +1268,8 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
     // Named paths whose source left the tree: each keeps its live edit, and
     // this machine forgets it once the run commits.
     var stale_named: []const []const u8 = &.{};
-    // Those of them that a gone generator produced, with their manifests.
-    var orphan_manifests: std.StringHashMap([]const []const u8) = .init(ctx.alloc);
+    // Those of them that a gone generator produced, with those generators.
+    var orphan_generators: std.StringHashMap([]const []const u8) = .init(ctx.alloc);
     var only_stale = false;
     if (paths.len > 0) {
         var direct: std.ArrayList([]const u8) = .empty;
@@ -1294,13 +1294,13 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
                     continue;
                 }
                 try stale_live.append(ctx.alloc, live);
-            } else if (try mox.apply.generated.orphanManifestOf(ctx.alloc, st, &tree_live, live) != null) {
+            } else if (try mox.apply.generated.orphanGeneratorOf(ctx.alloc, st, &tree_live, live) != null) {
                 if (try ignoredStale(ctx, &axis_resolver, &m_state, live)) {
                     left_alone += 1;
                     continue;
                 }
                 try stale_live.append(ctx.alloc, live);
-                try orphan_manifests.put(live, try mox.apply.generated.orphanManifestsOf(ctx.alloc, st, &tree_live, live));
+                try orphan_generators.put(live, try mox.apply.generated.orphanGeneratorsOf(ctx.alloc, st, &tree_live, live));
             } else {
                 try leaf_targets.append(ctx.alloc, live);
             }
@@ -1355,7 +1355,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         try ctx.out.print("  would release {f} on this machine (its source left the tree; the file is kept)\n", .{display.of(lp, m_state.home)});
     if (only_stale) {
         if (report_mode) return 1;
-        try releaseStale(ctx, st, stale_named, m_state.home, &orphan_manifests);
+        try releaseStale(ctx, st, stale_named, m_state.home, &orphan_generators);
         return 0;
     }
     // `--yes` takes every default without reading input.
@@ -2455,7 +2455,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         try ctx.err.print("mox commit: coupling graph not updated: {s}\n", .{@errorName(e)});
     };
 
-    if (!report_mode) try releaseStale(ctx, st, stale_named, m_state.home, &orphan_manifests);
+    if (!report_mode) try releaseStale(ctx, st, stale_named, m_state.home, &orphan_generators);
 
     // The counts are what SURVIVED settling, never what was attempted: an
     // accepted coupled update whose path was restored was not committed.
@@ -4708,7 +4708,7 @@ const FallbackKind = union(enum) {
 
 /// Route a live file that has NO stored baseline at all: recompose the
 /// source fresh (resolving secrets, matching overlays) to build one, instead
-/// of reading the applied-content cache the stored-baseline path uses. This
+/// of reading the content cache the stored-baseline path uses. This
 /// is a FALLBACK, used only here -- the stored `last_content` path above
 /// (and its `sourceStillHolds` guard, which refuses a hunk whose source moved
 /// on since the last apply) is untouched and still the one every edited

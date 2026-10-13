@@ -70,7 +70,7 @@ fn lessStr(_: void, x: []const u8, y: []const u8) bool {
 pub const command = app.command(Spec, .{
     .name = "snapshot",
     .usage = "mox snapshot [<id>]",
-    .summary = "List apply snapshots (taken before every overwrite), or what one holds",
+    .summary = "List snapshots (taken before every overwrite, removal or rollback), or what one holds",
     .group = .general,
     .needs_context = true,
 }, list);

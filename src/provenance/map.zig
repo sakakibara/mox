@@ -139,7 +139,7 @@ pub fn lineCount(bytes: []const u8) u32 {
 }
 
 /// True when any segment attributes output to a resolved secret. Used by apply
-/// to keep the resolved plaintext out of the drift/content cache and snapshots.
+/// to keep the resolved plaintext out of the content cache and snapshots.
 pub fn hasSecret(segments: []const Segment) bool {
     for (segments) |s| {
         if (s.origin == .secret) return true;
