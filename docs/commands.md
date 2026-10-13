@@ -733,7 +733,12 @@ packages entirely.
 Show a unified diff of the composed output against each live file
 (`--stat` for a per-file added/removed summary). A partially owned
 file diffs its canonical owned content only, with secret-bearing keys
-masked on both sides. A file whose source left the tree, which apply
+masked on both sides. A resolved secret is never printed: a hunk touching
+a secret line on either side is masked, and a live file whose source
+resolves a secret, or whose record was written for one, while the
+provenance that masks its live side is missing, is not shown; stderr says
+so, and `mox doctor --rebuild-provenance` records the provenance again. A
+file whose source left the tree, which apply
 would remove, shows its live content on the removed side, and such a
 symlink the line `symlink -> <target>`, as does an unedited file of a
 generator that left the tree; a file that

@@ -334,14 +334,14 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   secret never reaches disk or the terminal: its value is kept out of the
   content mox keeps of what it applied and of what it displaced, and `mox
   diff` redacts any hunk touching a secret line. (Redaction of a secret you
-  have since removed relies on that file's stored provenance.) A live file
-  that resolves an `op://` or `pass://` secret is applied at mode 0600
-  automatically (dedicated secret managers hold only secrets, so this is
-  never a false positive), unless `.mox/attributes.toml` sets an explicit
-  mode. The ambiguous schemes (`env:`, `file://`, `cmd:` -- the last often a
-  non-secret value like a computed theme name) are left at their composed
-  mode; mark one `mode = "0600"` in `.mox/attributes.toml` when it is
-  sensitive.
+  have since removed relies on that file's stored provenance; when it is
+  missing, diff does not show that file's live content at all.)
+  A live file that resolves an `op://` or `pass://` secret is applied at mode
+  0600 automatically (dedicated secret managers hold only secrets, so this is
+  never a false positive), unless `.mox/attributes.toml` sets an explicit mode.
+  The ambiguous schemes (`env:`, `file://`, `cmd:` -- the last often a non-secret
+  value like a computed theme name) are left at their composed mode; mark one
+  `mode = "0600"` in `.mox/attributes.toml` when it is sensitive.
 
 Captures must not be adjacent (`<a><b>`) and a name must not repeat within one
 template; both are compose-time errors. A malformed `data.` capture (`<data.x>`

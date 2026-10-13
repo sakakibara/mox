@@ -515,10 +515,26 @@ fn diffOne(
         // (its resolved values may still sit on disk).
         const b_secret = try secretMask(ctx.alloc, b_lines.len, prov_segments);
         const prior = try st.provenance(live_path);
+        if (prior == null and live.len > 0 and (hasSecret(prov_segments) or secretRecord(st, live_path))) {
+            try ctx.err.print("mox diff: {f}: not shown: the live file may hold a resolved secret, and the provenance that masks it is missing (`mox doctor --rebuild-provenance` records it again)\n", .{display.of(live_path, ctx.context.?.paths.home)});
+            return;
+        }
         const a_secret = if (prior) |m| try secretMask(ctx.alloc, a_lines.len, m.segments) else &.{};
         const rendered = try renderFile(ctx.alloc, live_path, a_lines, b_lines, hunks, a_secret, b_secret, sty);
         try ctx.out.writeAll(rendered);
     }
+}
+
+fn hasSecret(segments: []const mox.provenance.map.Segment) bool {
+    for (segments) |seg| if (seg.origin == .secret) return true;
+    return false;
+}
+
+/// The whole-file record of `live_path` was written for a composition that
+/// resolved a secret: such a record keeps no content cache.
+fn secretRecord(st: *State, live_path: []const u8) bool {
+    const f = st.fileRecord(live_path) orelse return false;
+    return f.cache_blob == null;
 }
 
 /// Diff one partial file's owned subtree: canonical composed-owned vs

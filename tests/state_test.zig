@@ -975,3 +975,36 @@ test "state: an owned record naming no canonical blob says so, doctor lists it, 
     try std.testing.expect(contains(try read(io, a, live), "k = 2"));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
+
+test "diff: a live file whose secret mask is gone is not shown, and no resolved secret reaches stdout" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "tok-4c1d" }});
+    const filler = "export A=1\n# 1\n# 2\n# 3\n# 4\n# 5\n# 6\n# 7\n# 8\n";
+    try writeRepo(io, &tmp, "repo/src/.envrc", filler ++ "export T=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    // The secret line moves to the top: the live side's copy of it is a
+    // hunk of its own, far from the composed one.
+    try writeRepo(io, &tmp, "repo/src/.envrc", "export T=<secret:env:MOX_TEST_TOKEN>\n" ++ filler);
+    const masked = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(!contains(masked.out, "tok-4c1d"));
+    try std.testing.expect(contains(masked.out, "@@"));
+
+    const live = try h.liveOf(".envrc");
+    const store = try mox.state.Store.init(a, h.state);
+    const g = (try mox.state.recovery.readGeneration(a, io, store, try currentId(h), null)).?;
+    try Io.Dir.cwd().deleteFile(io, try statePath(h, &.{ "v2", "blobs", &g.paths.get(live).?.file.?.provenance_blob.? }));
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(!contains(d.out, "tok-4c1d"));
+    try std.testing.expect(contains(d.err, "not shown"));
+    // A source that no longer resolves it: the record says it was written
+    // with one.
+    try writeRepo(io, &tmp, "repo/src/.envrc", filler);
+    const gone = try h.run(&.{ "mox", "diff" });
+    try std.testing.expect(!contains(gone.out, "tok-4c1d"));
+    try std.testing.expect(contains(gone.err, "not shown"));
+}
