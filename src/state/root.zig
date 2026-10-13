@@ -139,6 +139,14 @@ pub fn isHistory(name: []const u8) bool {
     return std.mem.eql(u8, name, draft.store_dir_name);
 }
 
+/// True when `name`, a top-level entry of a state directory, is one this
+/// module makes: the store and the lock files.
+pub fn isStateEntry(name: []const u8) bool {
+    if (isHistory(name)) return true;
+    for ([_][]const u8{ lock.lock_name, lock.readers_name }) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
 pub const Deleted = struct { path: []const u8, err: ?anyerror = null };
 
 /// Claim an id for a run that trashes without a journal, as a journal's id

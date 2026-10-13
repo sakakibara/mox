@@ -141,6 +141,20 @@ test "lock: a daemon a setup script leaves running does not keep the lock" {
     after.drop();
 }
 
+/// Every file under `dir`, by relative path, with its bytes.
+fn treeOf(a: std.mem.Allocator, io: Io, dir: []const u8) !std.StringArrayHashMapUnmanaged([]const u8) {
+    var out: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return out;
+    defer d.close(io);
+    var w = try d.walk(a);
+    defer w.deinit();
+    while (try w.next(io)) |e| {
+        if (e.kind != .file) continue;
+        try out.put(a, try a.dupe(u8, e.path), try d.readFileAlloc(io, e.path, a, .limited(1 << 22)));
+    }
+    return out;
+}
+
 test "state: an apply that fails after finding the private layer still records that this part expects one" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
@@ -1646,4 +1660,83 @@ test "diff: a secret-line key that cannot be read is an error naming it, and no 
     try std.testing.expect(contains(ap.err, key));
     try chmodPath(a, key, 0o600);
     try std.testing.expectEqualStrings(before, try read(io, a, key));
+}
+
+test "uninstall: a state directory holding nothing mox made is refused, and nothing in it is followed, created or removed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "homelike/Documents/thesis.txt", "precious\n");
+    try writeRepo(io, &tmp, "homelike/.bashrc", "alias l=ls\n");
+    const target = try std.fs.path.join(a, &.{ h.root, "homelike" });
+    try tmp.dir.symLink(io, target, "statelink", .{ .is_directory = true });
+    h = try withState(h, try std.fs.path.join(a, &.{ h.root, "statelink" }));
+    const before = try treeOf(a, io, target);
+    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots", "--purge-trash", "--purge-private" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(contains(r.err, "nothing mox made"));
+    const after = try treeOf(a, io, target);
+    try std.testing.expectEqual(before.count(), after.count());
+    for (before.keys(), before.values()) |k, v| try std.testing.expectEqualStrings(v, after.get(k).?);
+}
+
+test "uninstall: with MOX_STATE_DIR=. in a home directory, it removes only what mox made there" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+    h = try withState(h, ".");
+    try writeRepo(io, &tmp, "home/Documents/thesis.txt", "precious\n");
+    try writeRepo(io, &tmp, "home/.bashrc", "alias l=ls\n");
+    const docs = try std.fs.path.join(a, &.{ h.home, "Documents", "thesis.txt" });
+    const bashrc = try std.fs.path.join(a, &.{ h.home, ".bashrc" });
+    const first = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 2), first.rc);
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.home, "mox.lock" })));
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.home, "v2" })));
+    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("precious\n", try read(io, a, docs));
+    try std.testing.expectEqualStrings("alias l=ls\n", try read(io, a, bashrc));
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ h.home, "v2" })));
+    try std.testing.expect(contains(r.out, "kept ~/Documents (not made by mox)"));
+    try std.testing.expect(contains(r.out, "kept ~/.bashrc (not made by mox)"));
+}
+
+test "uninstall: an entry of the state directory mox did not make is kept and listed, and a link in it is not followed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "state/notes.txt", "mine\n");
+    try writeRepo(io, &tmp, "outside/precious", "keep\n");
+    try tmp.dir.symLink(io, try std.fs.path.join(a, &.{ h.root, "outside" }), "state/elsewhere", .{ .is_directory = true });
+    try writeRepo(io, &tmp, "state/coupling/graph.json", "{}\n");
+    const r = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try statePath(h, &.{"notes.txt"})));
+    try std.testing.expectEqualStrings("keep\n", try read(io, a, try std.fs.path.join(a, &.{ h.root, "outside", "precious" })));
+    try std.testing.expect(exists(io, try statePath(h, &.{"elsewhere"})));
+    try std.testing.expect(contains(r.out, "notes.txt (not made by mox)"));
+    try std.testing.expect(contains(r.out, "elsewhere (not made by mox)"));
+    try std.testing.expect(!exists(io, try statePath(h, &.{"coupling"})));
 }

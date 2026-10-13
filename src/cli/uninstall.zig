@@ -5,7 +5,9 @@
 //! deletes `v2/`. The private layer is PRESERVED unless `--purge-private`;
 //! trash is preserved unless `--purge-trash` or confirmed. The user's source
 //! repo is NEVER touched, and nothing outside the state directory is deleted.
-//! Under the lock.
+//! Inside it, only entries mox makes are removed; every other entry is listed
+//! as kept, and a directory holding none of mox's entries is refused. Under
+//! the lock.
 
 const std = @import("std");
 const cli = @import("cli");
@@ -23,19 +25,49 @@ const lock_name = mox.state.lock.lock_name;
 const readers_name = mox.state.lock.readers_name;
 const max_prompt_attempts = 100;
 
-pub const Action = enum { remove, preserve, prompt, history };
+pub const Action = enum { remove, preserve, prompt, history, foreign };
 
 /// Decide what to do with a top-level entry of the state dir. The private
 /// layer is preserved unless `--purge-private`; trash and the history
 /// (`v2/`) are asked about, since they hold the user's recoverable
 /// originals; the lock files are left to the locks' own
-/// release; everything else is removed.
+/// release; every other entry mox makes is removed, and one it does not
+/// make is foreign and kept.
 pub fn actionFor(name: []const u8, purge_private: bool) Action {
     if (std.mem.eql(u8, name, lock_name) or std.mem.eql(u8, name, readers_name)) return .preserve;
     if (std.mem.eql(u8, name, "trash")) return .prompt;
     if (mox.state.isHistory(name)) return .history;
     if (std.mem.eql(u8, name, "private")) return if (purge_private) .remove else .preserve;
-    return .remove;
+    if (mox.state.isStateEntry(name) or madeByMox(name)) return .remove;
+    return .foreign;
+}
+
+/// The entries of a state directory, beside the state module's own, that
+/// mox makes: the scripts' bin directory and PATH note, the coupling graph,
+/// commit's recovery copies, the trigger state, the package managers'
+/// scratch directory and zypper's ledger, and a check hook's staging.
+fn madeByMox(name: []const u8) bool {
+    const fixed = [_][]const u8{
+        "bin",
+        "coupling",
+        "commit-recovery",
+        "mox-path",
+        mox.trigger.state.state_basename,
+        mox.packages.exec.tmp_subdir,
+        "zypper.txt",
+    };
+    for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
+    return isCheckStaging(name);
+}
+
+/// `check-<16 hex>`, a check hook's candidate, or its `.out` capture.
+fn isCheckStaging(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "check-")) return false;
+    const rest = name["check-".len..];
+    const hex = if (std.mem.endsWith(u8, rest, ".out")) rest[0 .. rest.len - ".out".len] else rest;
+    if (hex.len != 16) return false;
+    for (hex) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
 }
 
 const Spec = struct {
@@ -48,17 +80,32 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const context = ctx.context.?;
     const purge_private = a.purge_private;
 
-    const lk = (try lock_mod.acquireForCommand(ctx, "uninstall")) orelse return 1;
-    defer lk.release();
-
-    var dir = Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound => {
+    // Before the lock, which creates its file there: a directory holding
+    // nothing mox made is not its state, whatever MOX_STATE_DIR says.
+    {
+        var dir = Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => {
+                try ctx.out.writeAll("mox uninstall: no state to remove\n");
+                return 0;
+            },
+            else => return e,
+        };
+        const found = try dirent.sorted(ctx.alloc, ctx.io, dir);
+        dir.close(ctx.io);
+        if (found.len == 0) {
             try ctx.out.writeAll("mox uninstall: no state to remove\n");
             return 0;
-        },
-        else => return e,
-    };
-    dir.close(ctx.io);
+        }
+        for (found) |e| {
+            if (actionFor(e.name, purge_private) != .foreign) break;
+        } else {
+            try ctx.err.print("mox uninstall: {s} holds nothing mox made, so it is not a mox state directory; nothing was removed (check MOX_STATE_DIR)\n", .{context.paths.state_dir});
+            return 2;
+        }
+    }
+
+    const lk = (try lock_mod.acquireForCommand(ctx, "uninstall")) orelse return 1;
+    defer lk.release();
 
     // A state this version refuses is refused before any question.
     // Deleting the history needs nothing more; keeping it needs a readable
@@ -74,7 +121,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     // Sorted so kept/removed lines print in the same order on every machine.
-    dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true });
+    var dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true });
     const entries = try dirent.sorted(ctx.alloc, ctx.io, dir);
     dir.close(ctx.io);
 
@@ -84,6 +131,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, e.name });
         switch (actionFor(e.name, purge_private)) {
             .preserve => try ctx.out.print("  kept {f}\n", .{display.of(path, ctx.context.?.paths.home)}),
+            .foreign => try ctx.out.print("  kept {f} (not made by mox)\n", .{display.of(path, ctx.context.?.paths.home)}),
             .history => {},
             .prompt => trash_seen = true,
             .remove => try removeEntry(ctx, path, &removed),
@@ -195,20 +243,25 @@ pub const command = app.command(Spec, .{
     .name = "uninstall",
     .usage = "mox uninstall [--flags]",
     .summary = "Remove mox state",
-    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. The source repo is never touched.",
+    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. Only entries mox makes in the state directory are removed; any other is listed as kept, and a directory holding none of them is refused. The source repo is never touched.",
     .group = .general,
     .needs_context = true,
 }, run);
 
 const testing = std.testing;
 
-test "actionFor: private preserved by default, removed on purge; trash and the history prompt" {
+test "actionFor: private preserved by default, removed on purge; trash and the history prompt; only what mox makes is removed" {
     try testing.expectEqual(Action.preserve, actionFor("private", false));
     try testing.expectEqual(Action.remove, actionFor("private", true));
     try testing.expectEqual(Action.prompt, actionFor("trash", false));
     try testing.expectEqual(Action.preserve, actionFor(lock_name, false));
     try testing.expectEqual(Action.preserve, actionFor(readers_name, true));
     try testing.expectEqual(Action.remove, actionFor("coupling", false));
+    for ([_][]const u8{ "applied", "snapshots" }) |n| try testing.expectEqual(Action.foreign, actionFor(n, false));
+    try testing.expectEqual(Action.remove, actionFor("check-0123456789abcdef.out", false));
+    try testing.expectEqual(Action.foreign, actionFor("check-list.txt", false));
+    try testing.expectEqual(Action.foreign, actionFor("Documents", true));
+    try testing.expectEqual(Action.foreign, actionFor(".bashrc", true));
     // The history holds the pre-mox originals: asked about, never silently
     // removed.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

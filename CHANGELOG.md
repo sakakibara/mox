@@ -57,6 +57,12 @@ All notable changes to mox are documented here. The format follows
   later one does, and `mox doctor` shows what waits for it. uninstall and
   `doctor --fix` wait for such a reader instead, saying so. See "The state
   directory" in commands.md.
+- `mox uninstall` removes only the entries mox makes in the state
+  directory, and lists every other entry as kept, "not made by mox",
+  without following it; it used to remove every entry it did not know. A
+  state directory that holds none of mox's entries is refused with exit 2
+  before anything is created or removed in it, so a `MOX_STATE_DIR` that
+  names a home or another directory by mistake is left as it is.
 - `mox diff` masks a live line that holds a secret value wherever the line
   now sits and however it was edited around the value: apply records keyed
   digests of short windows of each secret value it resolved, under a key

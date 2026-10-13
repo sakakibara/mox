@@ -1350,7 +1350,15 @@ Deleting it needs no readable generation, so `--purge-snapshots` works on a
 state every other write refuses; keeping it needs one, to forget the records
 in. Either way it waits, saying so, while another mox reads the state.
 `mox.lock` and `readers.lock`, the lock files, are kept and listed as kept,
-whatever the flags. The user's source repo is never touched.
+whatever the flags. Only the entries mox makes in the state directory are
+removed (its stores, `bin/`, `coupling/`, `commit-recovery/`, `mox-path`,
+`triggers.txt`, the package managers' `tmp/` and `zypper.txt`, a check
+hook's leftover `check-*`, and `private/` with `--purge-private`); any other
+entry is listed as kept, "not made by mox", and never followed or removed. A
+state directory that exists but holds none of mox's entries is refused, exit
+2, before anything is created, followed or removed in it, so a
+`MOX_STATE_DIR` naming a home or another directory by mistake is left as it
+is. The user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |
