@@ -1304,9 +1304,12 @@ notes are forgotten. The private layer is preserved unless
 every file mox overwrote) and trash (the sources `remove` and `mv`
 displaced) are preserved unless `--purge-snapshots` / `--purge-trash` or
 confirmed on a terminal, and `mox rollback <id>` still works from a kept
-history. Deleting it needs no readable generation, so `--purge-snapshots`
-works on a state every other write refuses; keeping it needs one, to forget
-the records in. The user's source repo is never touched.
+history. The question about the history is asked only after the check every
+command that touches state makes, so a state this version refuses is refused
+before any question. Deleting it needs no readable generation, so
+`--purge-snapshots` works on a state every other write refuses; keeping it
+needs one, to forget the records in. The user's source repo is never
+touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |

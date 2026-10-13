@@ -59,11 +59,18 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     };
     dir.close(ctx.io);
 
-    // The history is asked about first, since deleting it needs no readable
-    // generation and keeping it needs one to forget the records in.
+    // A state this version refuses is refused before any question.
+    // Deleting the history needs nothing more; keeping it needs a readable
+    // generation to forget the records in.
+    _ = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = false, .locked = true })) orelse return 2;
     const history = try mox.state.history(ctx.alloc, ctx.io, context.paths.state_dir);
     const purge_history = history.present and (a.purge_snapshots or (tty.isInteractive(0) and try confirmHistory(ctx, history)));
-    const st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = !purge_history, .locked = true })) orelse return 2;
+    var st: ?*mox.state.Draft = null;
+    if (!purge_history) {
+        // Its own commit collects the blobs the records named.
+        mox.state.releaseReaders();
+        st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = true, .locked = true })) orelse return 2;
+    }
 
     // Sorted so kept/removed lines print in the same order on every machine.
     dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true, .follow_symlinks = false });
@@ -102,7 +109,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     } else if (history.present) {
         try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-snapshots)\n", .{display.of(history.path, ctx.context.?.paths.home)});
-        if (!try forgetRecords(ctx, st)) return 2;
+        if (!try forgetRecords(ctx, st.?)) return 2;
     }
 
     try ctx.out.print("mox uninstall: removed {d} state entr(ies); source repo untouched\n", .{removed});

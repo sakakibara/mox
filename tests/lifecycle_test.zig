@@ -7225,3 +7225,32 @@ test "apply: a run killed in its file phase leaves a journal the next run folds,
     const doc = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(std.mem.indexOf(u8, doc.out, "recovered ") != null);
 }
+
+test "uninstall: at a terminal, a state it cannot open is refused before it asks anything" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "content\n");
+    try writeRepo(io, &tmp, "state/trash/gen1/src/.old", "recoverable\n");
+    try writeRepo(io, &tmp, "state/v2/current", "20260101T000000Z\n");
+    try writeRepo(io, &tmp, "state/v2/gen/20260101T000000Z.json", "{\"v\":3}");
+    var env = try gitEnv(h);
+    try env.put("MOX_REPO", h.repo);
+    try env.put("MOX_STATE_DIR", h.state);
+    const exe = try builtMox(h);
+    // `script` gives the command a terminal; stdin at EOF answers no.
+    const argv: []const []const u8 = if (builtin.os.tag == .macos)
+        &.{ "/usr/bin/script", "-q", "/dev/null", exe, "uninstall" }
+    else
+        &.{ "script", "-qec", try std.fmt.allocPrint(a, "'{s}' uninstall", .{exe}), "/dev/null" };
+    const r = std.process.run(a, io, .{ .argv = argv, .cwd = .{ .path = h.home }, .environ_map = &env }) catch return error.SkipZigTest;
+    const said = try std.mem.concat(a, u8, &.{ r.stdout, r.stderr });
+    try std.testing.expect(std.mem.indexOf(u8, said, "state written by a newer mox (v3)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "? [y/N]") == null);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ h.state, "trash" })));
+}
