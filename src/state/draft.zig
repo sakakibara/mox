@@ -66,6 +66,8 @@ pub const Store = struct {
     current: []const u8,
     readers: []const u8,
     secret_key: []const u8,
+    /// What a commit's cleanup a reader kept from running would have done.
+    deferred: []const u8,
 
     pub fn init(arena: std.mem.Allocator, state_dir: []const u8) !Store {
         const v2 = try std.fs.path.join(arena, &.{ state_dir, store_dir_name });
@@ -80,6 +82,7 @@ pub const Store = struct {
             .current = try std.fs.path.join(arena, &.{ v2, "current" }),
             .readers = try std.fs.path.join(arena, &.{ state_dir, lock.readers_name }),
             .secret_key = try std.fs.path.join(arena, &.{ v2, secret_key_name }),
+            .deferred = try std.fs.path.join(arena, &.{ v2, "cleanup-deferred" }),
         };
     }
 
@@ -729,8 +732,8 @@ pub const Draft = struct {
     }
 
     /// What a commit's cleanup would delete now, pruning past `keep`.
-    pub fn leftover(d: *const Draft, keep: usize) !@import("retention.zig").Leftover {
-        return @import("retention.zig").leftover(d.arena, d.io, d.store, keep);
+    pub fn leftover(d: *const Draft) !@import("retention.zig").Leftover {
+        return @import("retention.zig").leftover(d.arena, d.io, d.store);
     }
 
     /// Every file in quarantine, oldest name first, with what a quarantined

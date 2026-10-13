@@ -70,25 +70,64 @@ fn isRollback(g: Generation) bool {
 }
 
 /// Prune, drop empty generations, and collect unreferenced blobs, unless a
-/// reader holds the readers lock: then nothing is deleted, and the next
-/// commit catches up. Returns a warning when the readers lock could not be
+/// reader holds the readers lock: then nothing is deleted, what this
+/// cleanup would have done is noted, and the next commit that can clean up
+/// does that too. Returns a warning when the readers lock could not be
 /// taken for another reason.
 pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?usize, gc: bool) !?[]const u8 {
     const excl = switch (lock.excludeReaders(io, store.readers, store.v2, .try_once) catch |e| return try notPruned(arena, store, e)) {
         .held => |r| r,
-        .busy, .no_store => return null,
+        .busy => {
+            try noteDeferred(arena, io, store, .{ .keep = prune_keep, .gc = gc });
+            return null;
+        },
+        .no_store => return null,
         .failed => |e| return try notPruned(arena, store, e),
     };
     defer excl.release();
+    const owed = readDeferred(arena, io, store);
+    const keep = prune_keep orelse if (owed) |o| o.keep else null;
     var inv = try inventory(arena, io, store);
-    const gone = try doomedGenerations(arena, io, store, inv.gens, prune_keep);
+    const gone = try doomedGenerations(arena, io, store, inv.gens, keep);
     var it = gone.keyIterator();
     while (it.next()) |id| Io.Dir.cwd().deleteFile(io, try store.genPath(arena, id.*)) catch {};
-    if (!gc or inv.unreadable.len > 0) return null;
+    if (owed != null) Io.Dir.cwd().deleteFile(io, store.deferred) catch {};
+    if (!(gc or (owed != null and owed.?.gc)) or inv.unreadable.len > 0) return null;
     inv = try inventory(arena, io, store);
     if (inv.unreadable.len > 0) return null;
     try collect(arena, io, store);
     return null;
+}
+
+/// What a commit's cleanup does: the retention count it prunes to, if it
+/// prunes, and whether it collects unreferenced blobs.
+pub const Cleanup = struct { keep: ?usize, gc: bool };
+
+/// Note, in `store.deferred`, a cleanup a reader kept from running, merged
+/// with one noted before: the latest retention count, and a collection if
+/// either asked for one.
+fn noteDeferred(arena: std.mem.Allocator, io: Io, store: Store, c: Cleanup) !void {
+    const before = readDeferred(arena, io, store);
+    const keep = c.keep orelse if (before) |b| b.keep else null;
+    const gc = c.gc or (before != null and before.?.gc);
+    const text = if (keep) |k|
+        try std.fmt.allocPrint(arena, "keep {d}\ngc {d}\n", .{ k, @intFromBool(gc) })
+    else
+        try std.fmt.allocPrint(arena, "keep -\ngc {d}\n", .{@intFromBool(gc)});
+    try @import("durable.zig").writeFile(io, store.deferred, text);
+}
+
+/// The cleanup a reader kept from running, if one was noted.
+fn readDeferred(arena: std.mem.Allocator, io: Io, store: Store) ?Cleanup {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, store.deferred, arena, .limited(256)) catch return null;
+    var c: Cleanup = .{ .keep = null, .gc = false };
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "keep ")) {
+            c.keep = std.fmt.parseInt(usize, line["keep ".len..], 10) catch null;
+        } else if (std.mem.eql(u8, line, "gc 1")) c.gc = true;
+    }
+    return c;
 }
 
 /// The generations a commit's cleanup deletes: those pruned past
@@ -110,18 +149,25 @@ fn doomedGenerations(arena: std.mem.Allocator, io: Io, store: Store, gens: []con
     return gone;
 }
 
-pub const Leftover = struct { generations: usize, blobs: usize };
+pub const Leftover = struct {
+    generations: usize,
+    blobs: usize,
+    /// The retention count the cleanup prunes to, when it prunes.
+    keep: ?usize = null,
+};
 
-/// What a commit's cleanup would delete now, pruning past `prune_keep`: what
-/// one left while a reader held the readers lock.
-pub fn leftover(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: usize) !Leftover {
+/// What the cleanup a reader kept a commit from running would delete now,
+/// judged by the planner and inputs that commit used; nothing when no
+/// reader kept one from running.
+pub fn leftover(arena: std.mem.Allocator, io: Io, store: Store) !Leftover {
+    const owed = readDeferred(arena, io, store) orelse return .{ .generations = 0, .blobs = 0 };
     const inv = try inventory(arena, io, store);
-    const gone = try doomedGenerations(arena, io, store, inv.gens, prune_keep);
-    if (inv.unreadable.len > 0) return .{ .generations = gone.count(), .blobs = 0 };
+    const gone = try doomedGenerations(arena, io, store, inv.gens, owed.keep);
+    if (!owed.gc or inv.unreadable.len > 0) return .{ .generations = gone.count(), .blobs = 0, .keep = owed.keep };
     var skip = std.StringHashMap(void).init(arena);
     var it = gone.keyIterator();
     while (it.next()) |id| try skip.put(try std.fmt.allocPrint(arena, "{s}.json", .{id.*}), {});
-    return .{ .generations = gone.count(), .blobs = (try unreferenced(arena, io, store, &skip)).len };
+    return .{ .generations = gone.count(), .blobs = (try unreferenced(arena, io, store, &skip)).len, .keep = owed.keep };
 }
 
 fn notPruned(arena: std.mem.Allocator, store: Store, e: anyerror) ![]const u8 {

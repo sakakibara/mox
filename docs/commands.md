@@ -1100,9 +1100,11 @@ follows the readable one, so `current` names one that reads; it has no file
 to move when the generation's file is gone), a run recovered from its
 journal, an owned record whose canonical text is gone, and every file in
 `v2/quarantine/`, a quarantined journal's displaced entries listed with it,
-and `left for a reader: N generation(s) and M blob(s)`, what a commit kept
-because another mox was reading the state and a later commit deletes; that
-row is information and changes no exit code. On a state with no readable
+and `left for a reader: N generation(s) and M blob(s)`, what a commit's
+cleanup did not delete because another mox was reading the state, judged
+by the retention that commit pruned to (`(pruning to K)`), which a later
+commit deletes; the row is shown only when a reader kept a cleanup from
+running, is information, and changes no exit code. On a state with no readable
 generation, `--fix` moves every unreadable
 generation and `current` to `v2/quarantine/`, reports each, and starts over
 from an empty state; the retained generations' displaced content stays
@@ -1174,8 +1176,9 @@ never pruned, so a clock that moved backwards loses nothing, and the state
 that was current before the run is kept through it, as the one a `current`
 that cannot be read falls back to; the next pruning run counts it like any
 other. Pruning waits for no reader: while another mox reads the state, the
-run prunes nothing and the next one catches up; `mox doctor` shows what
-waits. A value that is not an
+run prunes nothing and the next commit that finds no reader prunes as
+it would have, even one that would not prune itself; `mox doctor` shows
+what waits. A value that is not an
 integer warns and the default stands.
 
 ## The state directory

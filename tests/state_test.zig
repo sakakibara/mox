@@ -1173,6 +1173,7 @@ test "readers: doctor says what a commit left for a reader, and stops once a com
     held.release();
     const left = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(contains(left.out, "left for a reader"));
+    try std.testing.expect(contains(left.out, "(pruning to 1)"));
     const left_rc = left.rc;
 
     try writeRepo(io, &tmp, "repo/src/.zshrc", "v5\n");
@@ -1879,4 +1880,29 @@ test "paths: a relative MOX_STATE_DIR resolves as the kernel does, through a sym
     try std.testing.expectEqual(@as(u8, 0), (try rel.runIn(cwd, &.{ "mox", "apply" })).rc);
     try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ real, "v2", "current" })));
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ cwd, "st" })));
+}
+
+test "readers: doctor shows nothing left for a reader when no reader kept a commit from cleaning up" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    for ([_][]const u8{ "v1\nx\n", "v2\nx\n", "v3\nx\n", "v4\nx\n", "v5\nx\n" }) |v| {
+        try writeRepo(io, &tmp, "repo/src/.f", v);
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    }
+    // Doctor run under a retention the commits did not prune to finds no
+    // cleanup a reader kept from running.
+    const m = try h.a.create(std.process.Environ.Map);
+    m.* = try h.env.createMap(h.a);
+    try m.put("MOX_SNAPSHOT_RETENTION", "1");
+    var one = h;
+    one.env = .{ .map = m };
+    for ([_]Harness{ h, one }) |hh| {
+        const d = try hh.run(&.{ "mox", "doctor" });
+        try std.testing.expect(!contains(d.out, "left for a reader"));
+    }
 }
