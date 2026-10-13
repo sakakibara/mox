@@ -298,9 +298,35 @@ pub fn serialize(arena: std.mem.Allocator, g: Generation) ![]const u8 {
     try root.put(arena, "displaced", .{ .object = try displacedValue(arena, g.displaced) });
 
     var aw: std.Io.Writer.Allocating = .init(arena);
-    try json.encode(&aw.writer, .{ .object = root }, .{ .sort_keys = true });
+    var v: json.Value = .{ .object = root };
+    try encodeSorted(&aw.writer, &v);
     try aw.writer.writeByte('\n');
     return aw.written();
+}
+
+/// Encode `v` with every object's members in ascending key order, as
+/// `sort_keys` does, sorting each object in place first: the encoder's own
+/// `sort_keys` is quadratic in an object's member count.
+pub fn encodeSorted(w: *std.Io.Writer, v: *json.Value) !void {
+    sortMembers(v);
+    try json.encode(w, v.*, .{});
+}
+
+fn sortMembers(v: *json.Value) void {
+    switch (v.*) {
+        .object => |*o| {
+            const ByKey = struct {
+                keys: []const []const u8,
+                pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+                    return std.mem.lessThan(u8, c.keys[a], c.keys[b]);
+                }
+            };
+            o.sortUnstable(ByKey{ .keys = o.keys() });
+            for (o.values()) |*x| sortMembers(x);
+        },
+        .array => |arr| for (arr) |*x| sortMembers(x),
+        else => {},
+    }
 }
 
 pub fn flagsValue(arena: std.mem.Allocator, f: Flags) !json.Value {

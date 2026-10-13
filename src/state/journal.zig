@@ -61,9 +61,10 @@ pub fn opLine(arena: std.mem.Allocator, op: Op) ![]const u8 {
     return line(arena, .{ .object = o });
 }
 
-fn line(arena: std.mem.Allocator, v: json.Value) ![]const u8 {
+fn line(arena: std.mem.Allocator, v_in: json.Value) ![]const u8 {
     var aw: Io.Writer.Allocating = .init(arena);
-    try json.encode(&aw.writer, v, .{ .sort_keys = true });
+    var v = v_in;
+    try generation.encodeSorted(&aw.writer, &v);
     try aw.writer.writeByte('\n');
     return aw.written();
 }
