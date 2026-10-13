@@ -197,9 +197,11 @@ test "state: an apply that wrote some files and failed others commits what it wr
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expectEqualStrings("g\n", try read(io, a, try h.liveOf(".good")));
+    // Committed, not left to recovery: `current` names a generation that
+    // records it, read without folding any journal, and none is pending.
+    try std.testing.expect(exists(io, try statePath(h, &.{ "v2", "current" })));
     try std.testing.expect(try testutil.hasRecord(h, try h.liveOf(".good"), .file));
-    // Committed, not left to recovery: no journal is pending.
-    var pending = Io.Dir.cwd().openDir(io, try statePath(h, &.{ "v2", "pending" }), .{ .iterate = true }) catch return;
+    var pending = try Io.Dir.cwd().openDir(io, try statePath(h, &.{ "v2", "pending" }), .{ .iterate = true });
     defer pending.close(io);
     var it = pending.iterate();
     try std.testing.expect((try it.next(io)) == null);

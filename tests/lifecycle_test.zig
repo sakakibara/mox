@@ -7190,7 +7190,7 @@ test "snapshot ids: MOX_TEST_CLOCK sets them in a -Dtest-clock build and nowhere
     try std.testing.expectEqual(mox.state.id.takes_test_clock, std.mem.startsWith(u8, ids[0], "20260710T081500Z"));
 }
 
-test "apply: a run killed in its file phase leaves a journal the next run folds, its writes recorded" {
+test "apply: a run killed in its file phase leaves a journal the next run folds, what it displaced and wrote recorded" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -7200,30 +7200,38 @@ test "apply: a run killed in its file phase leaves a journal the next run folds,
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
     // The check hook of the last file kills mox, once, after the first file
-    // is written.
+    // replaced what was there.
     const marker = try std.fs.path.join(a, &.{ h.root, "killed" });
+    try writeRepo(io, &tmp, "home/.a", "before mox\n");
     try writeRepo(io, &tmp, "repo/src/.a", "a\n");
     try writeRepo(io, &tmp, "repo/src/zz.toml", "# mox: own k\n# mox: check \"scripts/check/kill.sh\"\n[k]\nv = 1\n");
     try writeExecScript(io, &tmp, "repo/scripts/check/kill.sh", try std.fmt.allocPrint(a, "#!/bin/sh\n[ -f '{s}' ] && exit 0\ntouch '{s}'\nkill -9 $PPID\nexit 1\n", .{ marker, marker }), try std.fs.path.join(a, &.{ h.repo, "scripts", "check", "kill.sh" }));
 
     var env = try h.env.createMap(a);
-    const killed = try runExeEnv(h, &env, &.{"apply"});
+    const killed = try runExeEnv(h, &env, &.{ "apply", "--overwrite" });
     try std.testing.expect(killed.term == .signal);
     try std.testing.expectEqualStrings("a\n", try read(io, a, try h.liveOf(".a")));
     try std.testing.expect(exists(io, marker));
 
-    // The dead run left its journal, which the next apply folds.
-    var pending = try Io.Dir.cwd().openDir(io, try std.fs.path.join(a, &.{ h.state, "v2", "pending" }), .{ .iterate = true });
-    defer pending.close(io);
-    var pit = pending.iterate();
-    try std.testing.expect((try pit.next(io)) != null);
+    // Nothing was committed, yet a reader sees the dead run's journal folded:
+    // the snapshot of what it replaced.
+    try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".a")) == null);
+    const listed = try h.run(&.{ "mox", "snapshot" });
+    const id = std.mem.trim(u8, listed.out, " \n");
+    try std.testing.expect(mox.state.id.isId(id));
+    const held = try h.run(&.{ "mox", "snapshot", id });
+    try std.testing.expect(std.mem.indexOf(u8, held.out, ".a file ") != null);
+
+    // The next apply finds .a as it would have written it, so only the fold
+    // records what it replaced.
     const again = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), again.rc);
     try std.testing.expect(try testutil.hasRecord(h, try h.liveOf(".a"), .file));
     try std.testing.expect(try testutil.hasRecord(h, try h.liveOf("zz.toml"), .owned));
+    try std.testing.expect(try testutil.snapshotHolds(h, id, ".a", "before mox\n"));
     try testutil.gitTracked(io, a, h.repo);
     const doc = try h.run(&.{ "mox", "doctor" });
-    try std.testing.expect(std.mem.indexOf(u8, doc.out, "recovered ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc.out, try std.fmt.allocPrint(a, "recovered {s}", .{id})) != null);
 }
 
 test "uninstall: at a terminal, a state it cannot open is refused before it asks anything" {
