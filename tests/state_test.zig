@@ -1136,6 +1136,7 @@ test "readers: every command that reads the state without writing it reads curre
         &.{ "mox", "commit", "--dry-run" },
         &.{ "mox", "private", "retire", "--dry-run" },
         &.{ "mox", "mv", ".zshrc", ".zshrc2" },
+        &.{ "mox", "uninstall" },
     };
     var bad: usize = 0;
     for (runs) |argv| {

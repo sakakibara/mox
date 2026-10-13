@@ -1026,5 +1026,7 @@ The lock does not cover third-party writers: an external edit made to a live
 file between mox reading it and writing it in the same run is not captured in
 that run's snapshot, so a later `mox rollback` restores the pre-run content, not
 the intervening edit. Do not edit a managed file while mox is applying.
-Commands that only read the state (`status`, `diff`, `mox snapshot`) take no
-lock and see the state from before a live run until it finishes.
+Commands that only read the state (`status`, `diff`, `mox snapshot` and the
+others commands.md lists) take no writer lock: they hold the readers lock,
+`<state dir>/readers.lock`, shared while they read, and see the state from
+before a live run until it finishes.
