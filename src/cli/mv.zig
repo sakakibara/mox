@@ -201,8 +201,9 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
 pub const command = app.command(Spec, .{
     .name = "mv",
-    .summary = "Rename a managed file's source; snapshot first",
+    .summary = "Rename a managed file's source; the old source goes to trash first",
     .usage = "mox mv <old> <new>",
+    .details = "The base file and its .d/ overlay dir are renamed, the old source copied into the timestamped trash first, and its .mox/attributes.toml entry carried to the new name; a move whose entry holds a key the new name cannot hold, or of a file the private layer still varies, is refused before anything moves. mv moves no state: every machine's next apply writes the new path, removes the unedited old live file snapshot-first, reports an edited one as drift, and leaves an old partially owned file in place, no longer managed.",
     .group = .general,
     .needs_context = true,
 }, run);
