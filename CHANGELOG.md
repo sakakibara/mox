@@ -66,6 +66,21 @@ All notable changes to mox are documented here. The format follows
   state directory that holds none of mox's entries is refused with exit 2
   before anything is created or removed in it, so a `MOX_STATE_DIR` that
   names a home or another directory by mistake is left as it is.
+- `mox snapshot` lists, and a bare `mox rollback` picks, a run that
+  displaced only an empty directory, and it counts toward
+  `MOX_SNAPSHOT_RETENTION`, so an older snapshot may be pruned one run
+  sooner. The snapshot that was current before a pruning run is kept
+  through it, so the listing can hold one more than
+  `MOX_SNAPSHOT_RETENTION` until the next pruning run, and the snapshot a
+  run makes under a clock that moved backwards is kept.
+- A run refused for the lock says `lock held by <pid> (<command>); wait`:
+  removing the file frees nothing, since the lock is the kernel's.
+- A state a newer mox wrote is refused by every command that touches the
+  state: `mox: state written by a newer mox (v<n>); upgrade mox to use
+  <dir>`.
+- A command that only reads the state (`status`, `diff`, `mox snapshot`,
+  `export`, `doctor`) can now be refused, with exit 2, when `readers.lock`
+  cannot be opened, naming the file and what to do.
 - `mox diff` masks a live line that holds a secret value wherever the line
   now sits and however it was edited around the value: apply records keyed
   digests of short windows of each secret value it resolved, under a key
