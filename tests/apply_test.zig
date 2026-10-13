@@ -3438,7 +3438,8 @@ test "apply generator: mox remove --purge does not delete a leaf another generat
     defer arena.deinit();
     const a = arena.allocator();
 
-    // genB produces shared.inc through a normal apply; its manifest records it.
+    // genB produces shared.inc through a normal apply; its produced set
+    // records it.
     try tmp.dir.createDirPath(io, "repo/src/.config");
     try tmp.dir.writeFile(io, .{
         .sub_path = "repo/src/.config/genB.inc",
@@ -3626,7 +3627,7 @@ test "export generator: renders every row into the export tree statelessly" {
 
     const out_dir = try std.fs.path.join(a, &.{ c.root, "export" });
     // Export WITHOUT a prior apply: it must render both rows from the current
-    // data alone -- no manifest, no applied records, no deletion.
+    // data alone -- no produced set, no records, no deletion.
     const r = try c.run(&.{ "mox", "export", out_dir });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 
@@ -3635,7 +3636,7 @@ test "export generator: renders every row into the export tree statelessly" {
     // The generator's own path never lands in the export tree.
     try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ out_dir, ".config", "gen.inc" })));
 
-    // Stateless: export recorded no manifest and wrote nothing into HOME.
+    // Stateless: export recorded no produced set and wrote nothing into HOME.
     const gen_live = try c.homePath(".config/gen.inc");
     try std.testing.expect((try testutil.dumpOf(c)).generator(gen_live) == null);
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
@@ -3745,7 +3746,7 @@ test "apply generator: a top-level for..into sharing the file with another direc
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
 }
 
-test "apply generator: mox mv re-keys the manifest so the old leaves are pruned, not orphaned" {
+test "apply generator: mox mv re-keys the generator's produced set so the old leaves are pruned, not orphaned" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6062,7 +6063,7 @@ test "rollback disown: a suffix run of disowned members re-patches through the s
     _ = try json_mod.parse(a, after, .{});
 }
 
-test "apply generator sweep: deleting the generator source prunes its set and manifest" {
+test "apply generator sweep: deleting the generator source prunes its set and forgets the generator" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6082,7 +6083,7 @@ test "apply generator sweep: deleting the generator source prunes its set and ma
     try std.testing.expect(!exists(io, try c.homePath(".config/id-a.inc")));
     try std.testing.expect(!exists(io, try c.homePath(".config/id-b.inc")));
 
-    // The manifest is gone with it: a third apply removes nothing.
+    // The generator is forgotten with it: a third apply removes nothing.
     const again = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), again.rc);
     try std.testing.expect(std.mem.indexOf(u8, again.out, "0 removed") != null);

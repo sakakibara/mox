@@ -2619,7 +2619,7 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
         counts.unchanged += 1;
         if (in.dry_run or record_current) {
             // An unchanged file writes nothing, so a current record that
-            // does not yet name this run's part is tagged in place.
+            // does not yet name this run's part is given it in place.
             if (!in.dry_run and record_current and !std.mem.eql(u8, &st.entry(live_path).?.part, &st.part)) {
                 try st.recordOwned(live_path, record.?, in.source_key);
             }
