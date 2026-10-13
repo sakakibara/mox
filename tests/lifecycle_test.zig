@@ -5943,7 +5943,7 @@ test "stale: a directory the tree now plants as a symlink into the repo loses no
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
     try std.testing.expect(lineWith(rb.err, "~/.config/nvim/init.lua", "not restored: a parent directory is a symlink; the snapshot copy is at"));
-    try std.testing.expect(lineWith(rb.err, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory", "; the snapshot copy is at "));
+    try std.testing.expect(lineWith(rb.err, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory", " keeps it under key .config/nvim)"));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
 }
 

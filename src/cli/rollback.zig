@@ -146,12 +146,12 @@ fn rollbackOpened(ctx: *app.Ctx, a: cli.Args(Spec), st: *mox.state.Draft) anyerr
     for (restored.refused) |r| {
         const shown = display.of(r.live_path, context.paths.home);
         switch (r.why) {
-            .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; the snapshot copy is at {s})\n", .{ shown, r.copy }),
-            .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; the snapshot copy is at {s})\n", .{ shown, r.copy }),
+            .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; {f})\n", .{ shown, r.copy }),
+            .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; {f})\n", .{ shown, r.copy }),
             .redacted => try ctx.err.print("  ERROR   {f} (not restored: it holds a secret mox does not store; run mox apply to resolve it again)\n", .{shown}),
-            .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; the snapshot copy is at {s})\n", .{ shown, r.reason, r.copy }),
-            .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; the snapshot copy is at {s})\n", .{ shown, r.copy }),
-            .missing => try ctx.err.print("  ERROR   {f} (not restored: the snapshot copy at {s} is missing or damaged)\n", .{ shown, r.copy }),
+            .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; {f})\n", .{ shown, r.reason, r.copy }),
+            .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; {f})\n", .{ shown, r.copy }),
+            .missing => try ctx.err.print("  ERROR   {f} (not restored: the snapshot copy at {s} is missing or damaged)\n", .{ shown, r.copy.blob }),
         }
         failed += 1;
     }

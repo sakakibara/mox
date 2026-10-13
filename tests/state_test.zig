@@ -488,6 +488,27 @@ test "snapshot: mox snapshot <id> lists every entry, and a refused restore names
     try std.testing.expect(contains(rb.err, try std.fmt.allocPrint(a, "the snapshot copy is at {s}", .{blob_path})));
 }
 
+test "snapshot: a refused link restore names the target the link held, not a copy" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try tmp.dir.symLink(io, "/tmp/mox-held-target", "home/.lnk", .{});
+    try writeRepo(io, &tmp, "repo/src/.lnk", "/tmp/mox-new-target\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".lnk\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.liveOf(".lnk"));
+    try Io.Dir.cwd().symLink(io, "/tmp/mox-user-target", try h.liveOf(".lnk"), .{});
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(contains(rb.err, "the link it held points to /tmp/mox-held-target"));
+    try std.testing.expect(!contains(rb.err, "snapshot copy is at /tmp/mox-held-target"));
+}
+
 test "snapshot: a missing displaced blob refuses that restore, naming the path" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

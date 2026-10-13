@@ -103,11 +103,26 @@ pub const Restored = struct {
     refused: []const Refused = &.{},
 };
 
+/// Where a refused entry's content is: a file's kept copy, the target a
+/// link held, or the generation and key a directory is kept under.
+pub const Copy = union(enum) {
+    blob: []const u8,
+    target: []const u8,
+    entry: struct { gen: []const u8, key: []const u8 },
+
+    pub fn format(c: Copy, w: *Io.Writer) Io.Writer.Error!void {
+        switch (c) {
+            .blob => |p| try w.print("the snapshot copy is at {s}", .{p}),
+            .target => |t| try w.print("the link it held points to {s}", .{t}),
+            .entry => |e| try w.print("generation {s} keeps it under key {s}", .{ e.gen, e.key }),
+        }
+    }
+};
+
 pub const Refused = struct {
     live_path: []const u8,
-    /// Where the content is: the blob path of a file, the target of a link,
-    /// or `<generation id>:<key>` for a directory.
-    copy: []const u8,
+    /// Where what it held is.
+    copy: Copy,
     why: Why,
     /// For `failed`: what went wrong.
     reason: []const u8 = "",
@@ -217,13 +232,13 @@ pub fn restoreExcept(
         switch (d.type) {
             .dir => {
                 if (refusal(io, home, live)) |why| {
-                    try refused.append(arena, .{ .live_path = live, .copy = try std.fmt.allocPrint(arena, "{s}:{s}", .{ src.id, key }), .why = if (why == .is_link) .dir_over_link else why });
+                    try refused.append(arena, .{ .live_path = live, .copy = .{ .entry = .{ .gen = src.id, .key = key } }, .why = if (why == .is_link) .dir_over_link else why });
                     continue;
                 }
                 try dirs.append(arena, .{ .live = live, .mode = d.mode orelse 0o755 });
             },
             .file => {
-                const copy = try st.blobPath(d.blob orelse continue);
+                const copy: Copy = .{ .blob = try st.blobPath(d.blob orelse continue) };
                 restoreFile(arena, io, st, d, live, home, skip, skipped, &result, &refused) catch |e| switch (e) {
                     error.OutOfMemory => return e,
                     else => try refused.append(arena, .{ .live_path = live, .copy = copy, .why = .failed, .reason = @errorName(e) }),
@@ -231,7 +246,7 @@ pub fn restoreExcept(
             },
             .link => restoreLink(arena, io, st, d, live, home, &planted, &result, &refused) catch |e| switch (e) {
                 error.OutOfMemory => return e,
-                else => try refused.append(arena, .{ .live_path = live, .copy = d.target orelse "", .why = .failed, .reason = @errorName(e) }),
+                else => try refused.append(arena, .{ .live_path = live, .copy = .{ .target = d.target orelse "" }, .why = .failed, .reason = @errorName(e) }),
             },
         }
     }
@@ -279,7 +294,7 @@ fn restoreFile(
     result: *Restored,
     refused: *std.ArrayList(Refused),
 ) !void {
-    const copy = try st.blobPath(d.blob.?);
+    const copy: Copy = .{ .blob = try st.blobPath(d.blob.?) };
     // A withheld partial target is re-patched by the caller, through a link
     // the user made; only a symlinked parent stops it here.
     const withheld = skip != null and skip.?.contains(live);
@@ -327,7 +342,7 @@ fn restoreLink(
         else => {},
     }
     if (entryRefusal(io, st, home, live)) |why| {
-        try refused.append(arena, .{ .live_path = live, .copy = target, .why = why });
+        try refused.append(arena, .{ .live_path = live, .copy = .{ .target = target }, .why = why });
         return;
     }
     if (std.fs.path.dirname(live)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
