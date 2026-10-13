@@ -1069,12 +1069,18 @@ or a check could not run (a source tree outside git skips the tracked-source
 check), so it can gate CI.
 
 The state rows: a generation that cannot be read (doctor names it, and
-`--fix` moves it to `v2/quarantine/`), a run recovered from its journal,
-and every file in `v2/quarantine/`, a quarantined journal's displaced
-entries listed with it. On a state with no readable generation, `--fix`
-moves every unreadable generation, `current` and any dead journal to
+`--fix` moves it to `v2/quarantine/`), a current generation that cannot be
+read and the one read in its place (`--fix` makes `current` name the
+readable one), a run recovered from its journal, an owned record whose
+canonical text is gone, and every file in `v2/quarantine/`, a quarantined
+journal's displaced entries listed with it. On a state with no readable
+generation, `--fix` moves every unreadable generation and `current` to
 `v2/quarantine/`, reports each, and starts over from an empty state; the
-retained generations' displaced content stays listed and restorable.
+retained generations' displaced content stays listed and restorable. A
+dead journal made against the `current` that was there goes to
+`v2/quarantine/` too, reported; one made when there was no `current` (an
+empty base) has nothing to differ from and is folded as any dead journal
+is.
 
 The run ends on exactly one summary line: `mox doctor: N problem(s) found`,
 or `N advisory item(s) need attention` when there are no problems, or
