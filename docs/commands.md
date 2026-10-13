@@ -12,7 +12,11 @@ day-to-day tasks.
 The source repo lives at `$MOX_REPO`, default `$XDG_DATA_HOME/mox/dotfiles`;
 `mox path` prints it. Machine-local state lives at `$MOX_STATE_DIR`, default
 `$XDG_STATE_HOME/mox`. It belongs to one machine: keep it off a synced or
-network folder.
+network folder. A relative `MOX_REPO` or `MOX_STATE_DIR` is joined to the
+current directory once, at startup, as the system resolves it: a `..` is
+kept, so it steps out of whatever a symlink before it names. On Windows, one
+relative to a drive's current directory (`C:x`) or to the current drive's
+root (`\x`) is refused, asking for an absolute path.
 
 Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
 `rollback`, `uninstall`, `update`, `private retire`, `facts set`, `facts

@@ -1857,3 +1857,26 @@ test "uninstall: a readers lock it cannot take exclusive stops it before it remo
         try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".zshrc")) != null);
     }
 }
+
+test "paths: a relative MOX_STATE_DIR resolves as the kernel does, through a symlink before `..`" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+    const real = try std.fs.path.join(a, &.{ h.root, "other", "st" });
+    const cwd = try std.fs.path.join(a, &.{ h.root, "cwd" });
+    try tmp.dir.createDirPath(io, "other/deep");
+    try tmp.dir.createDirPath(io, "cwd");
+    try tmp.dir.symLink(io, try std.fs.path.join(a, &.{ h.root, "other", "deep" }), "cwd/lnk", .{ .is_directory = true });
+    h = try withState(h, real);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+
+    const rel = try withState(h, "lnk/../st");
+    try std.testing.expectEqual(@as(u8, 0), (try rel.runIn(cwd, &.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, try std.fs.path.join(a, &.{ real, "v2", "current" })));
+    try std.testing.expect(!exists(io, try std.fs.path.join(a, &.{ cwd, "st" })));
+}

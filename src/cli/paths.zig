@@ -100,15 +100,50 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
 /// `p` with a relative repo and a relative state directory made absolute
 /// against `cwd`, and the paths under the state directory with it, so every
 /// message, part, sibling and printed command names one place whatever
-/// directory a later step runs in.
-pub fn absolutePaths(arena: std.mem.Allocator, p: Paths, cwd: []const u8) !Paths {
+/// directory a later step runs in. On Windows, a path relative to a drive's
+/// current directory (`C:x`) or to the current drive's root (`\x`) names
+/// no one place: it is refused, with `why` naming the variable.
+pub fn absolutePaths(arena: std.mem.Allocator, p: Paths, cwd: []const u8, why: *?[]const u8) !Paths {
+    return absolutePathsFor(arena, p, cwd, builtin.os.tag, why);
+}
+
+fn absolutePathsFor(arena: std.mem.Allocator, p: Paths, cwd: []const u8, os_tag: std.Target.Os.Tag, why: *?[]const u8) !Paths {
     var out = p;
-    if (!std.fs.path.isAbsolute(p.repo_dir)) out.repo_dir = try std.fs.path.resolve(arena, &.{ cwd, p.repo_dir });
-    if (std.fs.path.isAbsolute(p.state_dir)) return out;
-    out.state_dir = try std.fs.path.resolve(arena, &.{ cwd, p.state_dir });
+    out.repo_dir = try underCwd(arena, cwd, p.repo_dir, os_tag, "MOX_REPO", why);
+    const state_dir = try underCwd(arena, cwd, p.state_dir, os_tag, "MOX_STATE_DIR", why);
+    if (state_dir.ptr == p.state_dir.ptr) return out;
+    out.state_dir = state_dir;
     out.private_dir = try std.fs.path.join(arena, &.{ out.state_dir, "private" });
     out.triggers_path = try std.fs.path.join(arena, &.{ out.state_dir, trigger_state.state_basename });
     return out;
+}
+
+/// `path` as the kernel resolves it from `cwd`: an absolute path as given,
+/// else `cwd` joined with it, dropping only `.` segments and repeated
+/// separators. A `..` is kept, since it steps out of whatever a symlink
+/// before it names, which a lexical collapse would get wrong.
+fn underCwd(arena: std.mem.Allocator, cwd: []const u8, path: []const u8, os_tag: std.Target.Os.Tag, name: []const u8, why: *?[]const u8) ![]const u8 {
+    const seps: []const u8 = if (os_tag == .windows) "/\\" else "/";
+    if (os_tag == .windows) switch (std.fs.path.getWin32PathType(u8, path)) {
+        .relative => {},
+        .drive_relative, .rooted => {
+            why.* = try std.fmt.allocPrint(arena, "{s} is {s}, which names a place relative to a drive's current directory or root; set it to an absolute path, such as C:\\Users\\you\\mox", .{ name, path });
+            return error.PathNotAbsolute;
+        },
+        else => return path,
+    } else if (std.fs.path.isAbsolutePosix(path)) return path;
+    const sep: u8 = if (os_tag == .windows) '\\' else '/';
+    const base = std.mem.trimEnd(u8, cwd, seps);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, base);
+    var it = std.mem.tokenizeAny(u8, path, seps);
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".")) continue;
+        try out.append(arena, sep);
+        try out.appendSlice(arena, seg);
+    }
+    if (out.items.len == base.len) return cwd;
+    return out.items;
 }
 
 test "absolutePaths: a relative state directory, and every path under it, resolve against the cwd" {
@@ -118,7 +153,8 @@ test "absolutePaths: a relative state directory, and every path under it, resolv
     var m = std.process.Environ.Map.init(a);
     try m.put("HOME", "/home/alice");
     try m.put("MOX_STATE_DIR", ".");
-    const p = try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), if (builtin.os.tag == .windows) "C:\\w\\st" else "/w/st");
+    var why: ?[]const u8 = null;
+    const p = try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), if (builtin.os.tag == .windows) "C:\\w\\st" else "/w/st", &why);
     const root = if (builtin.os.tag == .windows) "C:\\w\\st" else "/w/st";
     try std.testing.expectEqualStrings(root, p.state_dir);
     try expectJoined(a, &.{ root, "private" }, p.private_dir);
@@ -135,9 +171,30 @@ test "absolutePaths: a relative repo resolves against the cwd, and an absolute o
     try m.put("HOME", "/home/alice");
     try m.put("MOX_STATE_DIR", elsewhere);
     try m.put("MOX_REPO", "dots");
-    try expectJoined(a, &.{ cwd, "dots" }, (try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), cwd)).repo_dir);
+    var why: ?[]const u8 = null;
+    try expectJoined(a, &.{ cwd, "dots" }, (try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), cwd, &why)).repo_dir);
     try m.put("MOX_REPO", elsewhere);
-    try std.testing.expectEqualStrings(elsewhere, (try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), cwd)).repo_dir);
+    try std.testing.expectEqualStrings(elsewhere, (try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), cwd, &why)).repo_dir);
+}
+
+test "underCwd: joins as the kernel resolves, keeping `..` and dropping only `.` and repeated separators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: ?[]const u8 = null;
+    try std.testing.expectEqualStrings("/w/lnk/../st", try underCwd(a, "/w", "lnk/../st", .linux, "MOX_STATE_DIR", &why));
+    try std.testing.expectEqualStrings("/w/a/b", try underCwd(a, "/w/", "./a//./b/", .linux, "MOX_STATE_DIR", &why));
+    try std.testing.expectEqualStrings("/w", try underCwd(a, "/w", ".", .linux, "MOX_STATE_DIR", &why));
+    try std.testing.expectEqualStrings("/st", try underCwd(a, "/", "st", .macos, "MOX_STATE_DIR", &why));
+    try std.testing.expectEqualStrings("/abs/../x", try underCwd(a, "/w", "/abs/../x", .linux, "MOX_STATE_DIR", &why));
+    try std.testing.expectEqualStrings("C:\\w\\lnk\\..\\st", try underCwd(a, "C:\\w", "lnk/../st", .windows, "MOX_STATE_DIR", &why));
+    try std.testing.expectEqualStrings("D:\\x", try underCwd(a, "C:\\w", "D:\\x", .windows, "MOX_STATE_DIR", &why));
+    for ([_][]const u8{ "C:foo", "\\foo", "/foo" }) |bad| {
+        why = null;
+        try std.testing.expectError(error.PathNotAbsolute, underCwd(a, "C:\\w", bad, .windows, "MOX_REPO", &why));
+        try std.testing.expect(std.mem.indexOf(u8, why.?, "MOX_REPO is ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, why.?, "absolute path") != null);
+    }
 }
 
 test "resolve with Env{ .process = std.testing.environ }" {
