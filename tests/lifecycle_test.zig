@@ -7189,3 +7189,39 @@ test "snapshot ids: MOX_TEST_CLOCK sets them in a -Dtest-clock build and nowhere
     // when the first run took it.
     try std.testing.expectEqual(mox.state.id.takes_test_clock, std.mem.startsWith(u8, ids[0], "20260710T081500Z"));
 }
+
+test "apply: a run killed in its file phase leaves a journal the next run folds, its writes recorded" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp, null);
+    // The check hook of the last file kills mox, once, after the first file
+    // is written.
+    const marker = try std.fs.path.join(a, &.{ h.root, "killed" });
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try writeRepo(io, &tmp, "repo/src/zz.toml", "# mox: own k\n# mox: check \"scripts/check/kill.sh\"\n[k]\nv = 1\n");
+    try writeExecScript(io, &tmp, "repo/scripts/check/kill.sh", try std.fmt.allocPrint(a, "#!/bin/sh\n[ -f '{s}' ] && exit 0\ntouch '{s}'\nkill -9 $PPID\nexit 1\n", .{ marker, marker }), try std.fs.path.join(a, &.{ h.repo, "scripts", "check", "kill.sh" }));
+
+    var env = try h.env.createMap(a);
+    const killed = try runExeEnv(h, &env, &.{"apply"});
+    try std.testing.expect(killed.term == .signal);
+    try std.testing.expectEqualStrings("a\n", try read(io, a, try h.liveOf(".a")));
+    try std.testing.expect(exists(io, marker));
+
+    // The dead run left its journal, which the next apply folds.
+    var pending = try Io.Dir.cwd().openDir(io, try std.fs.path.join(a, &.{ h.state, "v2", "pending" }), .{ .iterate = true });
+    defer pending.close(io);
+    var pit = pending.iterate();
+    try std.testing.expect((try pit.next(io)) != null);
+    const again = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), again.rc);
+    try std.testing.expect(try testutil.hasRecord(h, try h.liveOf(".a"), .file));
+    try std.testing.expect(try testutil.hasRecord(h, try h.liveOf("zz.toml"), .owned));
+    try testutil.gitTracked(io, a, h.repo);
+    const doc = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(std.mem.indexOf(u8, doc.out, "recovered ") != null);
+}

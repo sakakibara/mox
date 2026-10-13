@@ -159,6 +159,52 @@ test "state: an apply that fails after finding the private layer still records t
     try std.testing.expect(d.expects_private[0]);
 }
 
+test "ids: a run that trashed but changed no state keeps its id from the next run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_CLOCK", .value = "1783671300" }});
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try writeRepo(io, &tmp, "repo/src/.b", "b\n");
+    // .a was never applied: removing it trashes its source and records
+    // nothing.
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "remove", ".a" })).rc);
+    try std.testing.expect(exists(io, try statePath(h, &.{ "trash", "20260710T081500Z" })));
+    try std.testing.expect(!exists(io, try statePath(h, &.{ "v2", "current" })));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(!std.mem.eql(u8, "20260710T081500Z", try currentId(h)));
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "state: an apply that wrote some files and failed others commits what it wrote" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.good", "g\n");
+    // A FIFO at a managed live path fails that file.
+    try writeRepo(io, &tmp, "repo/src/.bad", "b\n");
+    const fifo = try a.dupeZ(u8, try h.liveOf(".bad"));
+    _ = mkfifo(fifo.ptr, 0o644);
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expectEqualStrings("g\n", try read(io, a, try h.liveOf(".good")));
+    try std.testing.expect(try testutil.hasRecord(h, try h.liveOf(".good"), .file));
+    // Committed, not left to recovery: no journal is pending.
+    var pending = Io.Dir.cwd().openDir(io, try statePath(h, &.{ "v2", "pending" }), .{ .iterate = true }) catch return;
+    defer pending.close(io);
+    var it = pending.iterate();
+    try std.testing.expect((try it.next(io)) == null);
+}
+
 test "state: a generation a newer mox wrote is refused" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
