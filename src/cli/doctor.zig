@@ -52,7 +52,6 @@ const Spec = struct {
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    const context = ctx.context.?;
     const fix = a.fix;
     const rebuild_prov = fix or a.rebuild_provenance;
     const rebuild_coupling = fix or a.rebuild_coupling;
@@ -65,7 +64,12 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     defer if (lk) |l| l.release();
     const opened = (try state_cli.openWithReport(ctx, .{ .run_kind = .doctor, .writes = mutating, .locked = mutating, .repair = fix })) orelse return 2;
     const st = opened.draft;
-    defer state_cli.commit(ctx, st, .{}) catch {};
+    return state_cli.finish(ctx, st, .{}, doctorOpened(ctx, opened, fix, rebuild_prov, rebuild_coupling));
+}
+
+fn doctorOpened(ctx: *app.Ctx, opened: state_cli.Opened, fix: bool, rebuild_prov: bool, rebuild_coupling: bool) anyerror!u8 {
+    const context = ctx.context.?;
+    const st = opened.draft;
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
 

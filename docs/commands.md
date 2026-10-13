@@ -1156,7 +1156,11 @@ recovers them, and `status`, `diff` and `mox snapshot` read them as
 recovered at once. Recovered runs are listed by `mox doctor`. A journal
 that cannot be recovered, because the state changed under it or its run's
 generation did not match, is moved to `v2/quarantine/` and reported;
-nothing there is deleted.
+nothing there is deleted. A run that finds `current` changed under it when
+it commits -- something other than mox wrote it while the run held the lock
+-- commits nothing: its journal goes to `v2/quarantine/`, and it exits 2
+without going on, so an apply runs no `scripts/post` and uninstall strips
+nothing.
 
 A generation that cannot be read is skipped for the one before it, with a
 warning, and writes go on. When none can be read, every command reads an

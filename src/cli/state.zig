@@ -54,13 +54,26 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
     }
 }
 
-/// Commit what `st` holds, saying so when `current` moved underneath it.
-pub fn commit(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOptions) !void {
+/// Commit what `st` holds: false, after saying so, when `current` moved
+/// underneath it and nothing was committed.
+pub fn commit(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOptions) !bool {
     _ = state.recovery.commit(st, opts) catch |e| switch (e) {
         error.StateChanged => {
             try ctx.err.print("mox: the state changed while this run held its lock; what it recorded was moved to {s} and is not current\n", .{st.store.quarantine});
-            return;
+            return false;
         },
         else => return e,
     };
+    return true;
+}
+
+/// Commit what `st` holds once the command's body has given `rc`, its exit
+/// code, or failed: a commit refused because `current` moved exits 2.
+pub fn finish(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOptions, rc: anyerror!u8) anyerror!u8 {
+    const code = rc catch |e| {
+        _ = commit(ctx, st, opts) catch false;
+        return e;
+    };
+    if (!try commit(ctx, st, opts)) return 2;
+    return code;
 }

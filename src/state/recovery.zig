@@ -308,6 +308,9 @@ pub fn writeGeneration(arena: std.mem.Allocator, io: Io, store: Store, g: Genera
     try durable.writeFile(io, try store.genPath(arena, g.id), try generation.serialize(arena, g));
 }
 
+/// The test seam just before a commit compares `current` with its base.
+pub var before_commit_point: ?*const fn (Io) void = null;
+
 pub const CommitOptions = struct {
     /// Prune displaced history down to this many generations.
     prune_keep: ?usize = null,
@@ -330,6 +333,7 @@ pub fn commit(d: *Draft, opts: CommitOptions) !?[]const u8 {
         Io.Dir.cwd().deleteFile(io, j.path) catch {};
         return null;
     }
+    if (before_commit_point) |f| f(io);
     const now = try readCurrent(arena, io, d.store);
     if (!std.mem.eql(u8, now, d.base)) {
         var report: Report = .{};

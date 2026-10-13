@@ -176,6 +176,61 @@ test "state: a generation a newer mox wrote is refused" {
     try std.testing.expect(!exists(io, try h.liveOf(".zshrc")));
 }
 
+test "state: an apply whose commit finds the state changed exits 2, runs no post script and reports no success" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    const marker = try std.fs.path.join(a, &.{ h.root, "post-ran" });
+    const current = try statePath(h, &.{ "v2", "current" });
+    try writeRepo(io, &tmp, "repo/scripts/pre/00-move.sh", try std.fmt.allocPrint(a, "#!/bin/sh\nprintf '20000101T000000Z\\n' > '{s}'\n", .{current}));
+    try writeRepo(io, &tmp, "repo/scripts/post/00-mark.sh", try std.fmt.allocPrint(a, "#!/bin/sh\ntouch '{s}'\n", .{marker}));
+    for ([_][]const u8{ "pre/00-move.sh", "post/00-mark.sh" }) |rel| {
+        const z = try a.dupeZ(u8, try std.fs.path.join(a, &.{ h.repo, "scripts", rel }));
+        _ = std.c.chmod(z.ptr, 0o755);
+    }
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(contains(r.err, "the state changed while this run held its lock"));
+    try std.testing.expect(!contains(r.out, "Applied:"));
+    try std.testing.expect(!exists(io, marker));
+}
+
+var moved_current: []const u8 = "";
+
+test "state: an uninstall whose commit finds the state changed exits 2 and strips nothing" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const gen = try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{try currentId(h)}) });
+    moved_current = try statePath(h, &.{ "v2", "current" });
+    mox.state.recovery.before_commit_point = struct {
+        fn move(io_: Io) void {
+            mox.state.recovery.before_commit_point = null;
+            Io.Dir.cwd().writeFile(io_, .{ .sub_path = moved_current, .data = "20000101T000000Z\n" }) catch unreachable;
+        }
+    }.move;
+    defer mox.state.recovery.before_commit_point = null;
+    const r = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(contains(r.err, "the state changed while this run held its lock"));
+    try std.testing.expect(contains(try read(io, a, gen), ".zshrc"));
+}
+
 /// The id `current` names.
 const currentId = testutil.currentId;
 

@@ -30,15 +30,17 @@ const Spec = struct {
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox remove")) return 2;
     if (try apply_cmd.privateRefusal(ctx, "mox remove")) return 2;
-    const context = ctx.context.?;
     const name = a.name;
     const purge = a.purge;
 
     const lk = (try lock_mod.acquireForCommand(ctx, "remove")) orelse return 1;
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .remove, .writes = true, .locked = true })) orelse return 2;
-    // Every exit after the first write commits what the run did.
-    defer state_cli.commit(ctx, st, .{}) catch {};
+    return state_cli.finish(ctx, st, .{}, removeOpened(ctx, st, name, purge));
+}
+
+fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bool) anyerror!u8 {
+    const context = ctx.context.?;
 
     const live_path = edit.liveTarget(ctx.alloc, context.paths.home, context.cwd, name) catch |e| switch (e) {
         error.OutOfMemory => return e,

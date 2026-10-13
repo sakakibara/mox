@@ -29,13 +29,14 @@ const Spec = struct {
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
-    const context = ctx.context.?;
-
     const lk = (try lock_mod.acquireForCommand(ctx, "rollback")) orelse return 1;
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .rollback, .writes = true, .locked = true })) orelse return 2;
-    // Every exit after the first write commits what the run did.
-    defer state_cli.commit(ctx, st, .{}) catch {};
+    return state_cli.finish(ctx, st, .{}, rollbackOpened(ctx, a, st));
+}
+
+fn rollbackOpened(ctx: *app.Ctx, a: cli.Args(Spec), st: *mox.state.Draft) anyerror!u8 {
+    const context = ctx.context.?;
 
     // Undoing the apply just run is the case that matters, and making the user
     // read an id back out of `mox snapshot` to reach it is pure friction. The

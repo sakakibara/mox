@@ -103,7 +103,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         }
     }
 
-    if (history_kept) try forgetRecords(ctx, st);
+    if (history_kept and !try forgetRecords(ctx, st)) return 2;
 
     try ctx.out.print("mox uninstall: removed {d} state entr(ies); source repo untouched\n", .{removed});
     return 0;
@@ -112,10 +112,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// Commit a generation that forgets every record and flag, and strip every
 /// retained generation down to its displaced history so the records' blobs
 /// go.
-fn forgetRecords(ctx: *app.Ctx, st: *mox.state.Draft) !void {
+fn forgetRecords(ctx: *app.Ctx, st: *mox.state.Draft) !bool {
     try st.forgetEverything();
-    try state_cli.commit(ctx, st, .{ .skip_gc = true });
+    if (!try state_cli.commit(ctx, st, .{ .skip_gc = true })) return false;
     try mox.state.retention.stripRecords(ctx.alloc, ctx.io, st.store);
+    return true;
 }
 
 /// Remove one state entry, reporting the outcome. A delete FAILURE is reported

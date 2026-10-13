@@ -190,7 +190,7 @@ fn applyPass(
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .apply, .writes = !dry_run, .locked = true })) orelse return 2;
     // Every exit after the first write commits what the run did.
-    defer state_cli.commit(ctx, st, .{}) catch {};
+    defer _ = state_cli.commit(ctx, st, .{}) catch false;
     if (!dry_run and try mox.private.layer.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir)) try st.notePrivate();
 
     // Composing from a work tree stopped mid-merge would write its conflict
@@ -836,7 +836,7 @@ fn applyPass(
         };
     }
     // The commit point: every record is in before the post-stage scripts.
-    try state_cli.commit(ctx, st, .{ .prune_keep = prune_keep });
+    if (!try state_cli.commit(ctx, st, .{ .prune_keep = prune_keep })) return 2;
 
     // Post-stage scripts run after all files are written. Used for
     // service reloads, theme cache rebuilds, fish_update_completions, etc.

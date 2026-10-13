@@ -28,7 +28,10 @@ fn retire(ctx: *app.Ctx, a: cli.Args(RetireSpec)) anyerror!u8 {
     if (!a.dry_run) lk = (try lock_mod.acquireForCommand(ctx, "private retire")) orelse return 1;
     defer if (lk) |l| l.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .private, .writes = !a.dry_run, .locked = !a.dry_run })) orelse return 2;
-    defer state_cli.commit(ctx, st, .{}) catch {};
+    return state_cli.finish(ctx, st, .{}, retireOpened(ctx, a, st, shown));
+}
+
+fn retireOpened(ctx: *app.Ctx, a: cli.Args(RetireSpec), st: *mox.state.Draft, shown: display.Path) anyerror!u8 {
     const expected = if (a.dry_run) st.expectsPrivate() else try st.retirePrivate();
     if (!expected) {
         try ctx.out.print("no private layer at {f} is expected here; nothing to retire\n", .{shown});

@@ -1189,8 +1189,12 @@ fn commitRun(
     const lk = (try lock_mod.acquireForCommand(ctx, "commit")) orelse return 1;
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .commit, .writes = !dry_run, .locked = true })) orelse return 2;
-    // Every exit after the first write commits what the run did.
-    defer state_cli.commit(ctx, st, .{}) catch {};
+    return state_cli.finish(ctx, st, .{}, commitOpened(ctx, st, sty, dry_run, yes, abort_on_prompt, paths, package_rows));
+}
+
+/// `commitRun` on the opened state.
+fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes: bool, abort_on_prompt: bool, paths: []const []const u8, package_rows: *usize) anyerror!u8 {
+    const context = ctx.context.?;
 
     // Routing a live edit back into a source that is itself mid-merge would
     // write over half-resolved content, so the same refusal apply makes.
