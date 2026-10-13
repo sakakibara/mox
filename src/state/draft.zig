@@ -490,7 +490,7 @@ pub const Draft = struct {
     }
 
     /// Note that this part expects a private layer; recorded in the journal's
-    /// header.
+    /// header, which this claims.
     pub fn notePrivate(d: *Draft) !void {
         if (d.expectsPrivate()) return;
         d.note_private = true;
@@ -498,7 +498,7 @@ pub const Draft = struct {
         f.expects_private = true;
         if (d.jnl != null) return d.setFlags(f);
         try d.gen.flags.put(d.arena, try d.arena.dupe(u8, &d.part), f);
-        d.changed = true;
+        _ = try d.claim();
     }
 
     /// Stop expecting a private layer for this part: true when there was an

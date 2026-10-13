@@ -141,6 +141,24 @@ test "lock: a daemon a setup script leaves running does not keep the lock" {
     after.drop();
 }
 
+test "state: an apply that fails after finding the private layer still records that this part expects one" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "state/private/.p", "p\n");
+    try writeRepo(io, &tmp, "repo/src/.a", "a\n");
+    try tmp.dir.symLink(io, "/nonexistent", "repo/src/.link", .{});
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expect(r.rc != 0);
+    const d = try testutil.dumpOf(h);
+    try std.testing.expect(d.expects_private[0]);
+}
+
 test "state: a generation a newer mox wrote is refused" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
