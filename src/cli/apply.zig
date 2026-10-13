@@ -1909,11 +1909,22 @@ const StaleInput = struct {
 };
 
 /// True after saying so when this repo and HOME expect a private layer
-/// that is unavailable: every command that composes then exits 2 before it
-/// writes or removes anything.
+/// that is unavailable, or the state cannot be read to say whether they do:
+/// every command that composes then exits 2 before it writes or removes
+/// anything.
 pub fn privateRefusal(ctx: *app.Ctx, cmd: []const u8) !bool {
     const context = ctx.context orelse return false;
-    if (!try mox.state.expectsPrivate(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.repo_dir, context.paths.home)) return false;
+    switch (try mox.state.expectsPrivate(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.repo_dir, context.paths.home)) {
+        .expects => |e| if (!e) return false,
+        .refused => |why| {
+            try ctx.err.writeAll(why);
+            return true;
+        },
+        .unsupported => |errno| {
+            try lock_mod.printUnsupported(ctx, errno);
+            return true;
+        },
+    }
     if (try mox.private.layer.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir)) return false;
     try ctx.err.print("{s}: private layer {f} is unavailable but held sources before; restore it, or run `mox private retire` to stop expecting it\n", .{ cmd, display.of(context.paths.private_dir, context.paths.home) });
     return true;

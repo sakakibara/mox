@@ -109,6 +109,8 @@ pub const Draft = struct {
     run_id: ?[]const u8 = null,
     changed: bool = false,
     committed: bool = false,
+    /// Why the commit deleted nothing old, when that is not a reader's doing.
+    cleanup_warning: ?[]const u8 = null,
 
     // Reads.
 

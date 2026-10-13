@@ -337,7 +337,7 @@ pub fn commit(d: *Draft, opts: CommitOptions) !?[]const u8 {
     try writeGeneration(arena, io, d.store, g);
     try durable.writeFile(io, d.store.current, try currentLine(arena, g.id, g.parent));
     Io.Dir.cwd().deleteFile(io, j.path) catch {};
-    retention.afterCommit(arena, io, d.store, opts.prune_keep, !opts.skip_gc) catch {};
+    d.cleanup_warning = retention.afterCommit(arena, io, d.store, opts.prune_keep, !opts.skip_gc) catch null;
     return g.id;
 }
 

@@ -16,6 +16,7 @@ pub const id = @import("id.zig");
 pub const lock = @import("lock.zig");
 pub const durable = @import("durable.zig");
 pub const dump = @import("dump.zig");
+const quote = @import("quote.zig");
 
 pub const Draft = draft.Draft;
 pub const Store = draft.Store;
@@ -62,11 +63,7 @@ fn nonEmptyDir(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
 pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
     const store = try Store.init(arena, opts.state_dir);
 
-    if (!opts.writes) holdReaders(io, store) catch |e| switch (e) {
-        error.FileLocksUnsupported => return .{ .unsupported = "ENOTSUP" },
-        error.SystemResources => return .{ .unsupported = "ENOLCK" },
-        else => return e,
-    };
+    if (!opts.writes) if (try holdReaders(arena, io, store)) |why| return why;
     var report: recovery.Report = .{};
     var loaded = try recovery.loadCurrent(arena, io, store, &report);
     if (report.newer) |v| return .{ .refused = try std.fmt.allocPrint(arena, "mox: state written by a newer mox (v{d}); upgrade mox to use {s}\n", .{ v, opts.state_dir }) };
@@ -157,11 +154,29 @@ pub fn quarantineUnreadable(arena: std.mem.Allocator, io: Io, store: Store, repo
 var held_readers: ?lock.Readers = null;
 
 /// Hold the readers lock until `releaseReaders`, so no generation or blob the
-/// command reads is pruned or collected under it. Nothing to hold before the
-/// store exists.
-fn holdReaders(io: Io, store: Store) !void {
-    if (held_readers != null or !exists(io, store.v2)) return;
-    held_readers = try lock.holdReaders(io, store.readers);
+/// command reads is deleted under it. Nothing to hold before the store
+/// exists, nor when the lock file is missing and cannot be created; any
+/// other failure is why the command cannot run.
+fn holdReaders(arena: std.mem.Allocator, io: Io, store: Store) !?Opened {
+    if (held_readers != null) return null;
+    switch (lock.holdReaders(io, store.readers)) {
+        .held => |r| held_readers = r,
+        .no_store, .unavailable => {},
+        .failed => |e| return try readersFailure(arena, store.readers, e),
+    }
+    return null;
+}
+
+fn readersFailure(arena: std.mem.Allocator, path: []const u8, e: anyerror) !Opened {
+    return switch (e) {
+        error.FileLocksUnsupported => .{ .unsupported = "ENOTSUP" },
+        error.SystemResources => .{ .unsupported = "ENOLCK" },
+        error.AccessDenied, error.PermissionDenied => .{ .refused = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(arena, "mox: cannot open {s}, which a command reading the state holds ({s}); make it readable by you\n", .{ path, @errorName(e) })
+        else
+            try std.fmt.allocPrint(arena, "mox: cannot open {s}, which a command reading the state holds ({s}); make it readable by you: chmod 600 {s}\n", .{ path, @errorName(e), try quote.sh(arena, path) }) },
+        else => .{ .refused = try std.fmt.allocPrint(arena, "mox: cannot lock {s}, which a command reading the state holds ({s}); it must be a file you own, on a local filesystem\n", .{ path, @errorName(e) }) },
+    };
 }
 
 /// Release the readers lock a command's reads took, at the command's end.
@@ -170,20 +185,36 @@ pub fn releaseReaders() void {
     held_readers = null;
 }
 
+pub const Expectation = union(enum) {
+    expects: bool,
+    /// The command must not run; the message says why.
+    refused: []const u8,
+    /// The readers lock cannot be taken: the errno, by name.
+    unsupported: []const u8,
+};
+
 /// Whether this repo and HOME expect a private layer, read without the lock,
 /// a dead run's journal included.
-pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !bool {
+pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !Expectation {
     const store = try Store.init(arena, state_dir);
-    const readers: ?lock.Readers = if (exists(io, store.v2)) try lock.holdReaders(io, store.readers) else null;
+    const readers: ?lock.Readers = switch (lock.holdReaders(io, store.readers)) {
+        .held => |r| r,
+        .no_store, .unavailable => null,
+        .failed => |e| return switch (try readersFailure(arena, store.readers, e)) {
+            .refused => |why| .{ .refused = why },
+            .unsupported => |errno| .{ .unsupported = errno },
+            else => unreachable,
+        },
+    };
     defer if (readers) |r| r.release();
     var report: recovery.Report = .{};
     const loaded = try recovery.loadCurrent(arena, io, store, &report);
-    if (report.newer != null or report.exhausted) return false;
+    if (report.newer != null or report.exhausted) return .{ .expects = false };
     const at = try recovery.recover(arena, io, store, loaded, .{ .writes = false, .unlocked = true }, &report);
-    const g = at.gen orelse return false;
+    const g = at.gen orelse return .{ .expects = false };
     const part = try draft.partOf(arena, io, repo_dir, home);
-    const f = g.flags.get(&part.hex) orelse return false;
-    return f.expects_private;
+    const f = g.flags.get(&part.hex) orelse return .{ .expects = false };
+    return .{ .expects = f.expects_private };
 }
 
 test {
@@ -192,6 +223,7 @@ test {
     _ = journal;
     _ = draft;
     _ = recovery;
+    _ = quote;
     _ = retention;
     _ = id;
     _ = lock;

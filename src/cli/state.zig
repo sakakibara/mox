@@ -62,13 +62,14 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
 /// Commit what `st` holds: false, after saying so, when `current` moved
 /// underneath it and nothing was committed.
 pub fn commit(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOptions) !bool {
-    _ = state.recovery.commit(st, opts) catch |e| switch (e) {
+    const committed = state.recovery.commit(st, opts) catch |e| switch (e) {
         error.StateChanged => {
             try ctx.err.print("mox: the state changed while this run held its lock; what it recorded was moved to {s} and is not current\n", .{st.quarantineDir()});
             return false;
         },
         else => return e,
     };
+    if (committed != null) if (st.cleanup_warning) |w| try ctx.err.print("mox: warning: {s}\n", .{w});
     return true;
 }
 

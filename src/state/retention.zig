@@ -71,9 +71,14 @@ fn isRollback(g: Generation) bool {
 
 /// Prune, drop empty generations, and collect unreferenced blobs, unless a
 /// reader holds the readers lock: then nothing is deleted, and the next
-/// commit catches up.
-pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?usize, gc: bool) !void {
-    const excl = lock.excludeReaders(io, store.readers) orelse return;
+/// commit catches up. Returns a warning when the readers lock could not be
+/// taken for another reason.
+pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?usize, gc: bool) !?[]const u8 {
+    const excl = switch (lock.excludeReaders(io, store.readers, null) catch |e| return try notPruned(arena, store, e)) {
+        .held => |r| r,
+        .busy, .no_store => return null,
+        .failed => |e| return try notPruned(arena, store, e),
+    };
     defer excl.release();
     var inv = try inventory(arena, io, store);
     const cur = recovery.parseCurrent(try recovery.readCurrent(arena, io, store));
@@ -91,10 +96,15 @@ pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?
     }
     var it = gone.keyIterator();
     while (it.next()) |id| Io.Dir.cwd().deleteFile(io, try store.genPath(arena, id.*)) catch {};
-    if (!gc or inv.unreadable.len > 0) return;
+    if (!gc or inv.unreadable.len > 0) return null;
     inv = try inventory(arena, io, store);
-    if (inv.unreadable.len > 0) return;
+    if (inv.unreadable.len > 0) return null;
     try collect(arena, io, store);
+    return null;
+}
+
+fn notPruned(arena: std.mem.Allocator, store: Store, e: anyerror) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} could not be locked ({s}), so this run deleted no old generation and no unused blob", .{ store.readers, @errorName(e) });
 }
 
 /// Strip every generation down to its ids, its displaced history and the
@@ -113,7 +123,10 @@ pub fn stripRecords(arena: std.mem.Allocator, io: Io, store: Store) !void {
         try recovery.writeGeneration(arena, io, store, g);
     }
     if (inv.unreadable.len > 0) return;
-    const excl = lock.excludeReaders(io, store.readers) orelse return;
+    const excl = switch (try lock.excludeReaders(io, store.readers, null)) {
+        .held => |r| r,
+        else => return,
+    };
     defer excl.release();
     try collect(arena, io, store);
 }
@@ -242,11 +255,11 @@ test "collect: nothing is deleted while a generation does not parse, nor any blo
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ store.quarantine, "x.jsonl" }), .data = try std.fmt.allocPrint(a, "{{\"blob\":\"{s}\"}}\n", .{&named}) });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try store.genPath(a, "20260101T000001Z"), .data = "{ torn" });
 
-    try afterCommit(a, io, store, null, true);
+    _ = try afterCommit(a, io, store, null, true);
     for ([_]generation.Hex{ kept, named, loose }) |h| try std.testing.expect(try blob.get(a, io, store.blobs, h) != null);
 
     try Io.Dir.cwd().deleteFile(io, try store.genPath(a, "20260101T000001Z"));
-    try afterCommit(a, io, store, null, true);
+    _ = try afterCommit(a, io, store, null, true);
     try std.testing.expect(try blob.get(a, io, store.blobs, kept) != null);
     try std.testing.expect(try blob.get(a, io, store.blobs, named) != null);
     try std.testing.expect(try blob.get(a, io, store.blobs, loose) == null);
@@ -270,14 +283,14 @@ test "afterCommit: the generation current was before this commit keeps its blobs
     try g2.displaced.put(a, "f", .{ .type = .file, .blob = new });
     try recovery.writeGeneration(a, io, store, g2);
     try @import("durable.zig").writeFile(io, store.current, "20260101T000001Z 20260101T000000Z\n");
-    try afterCommit(a, io, store, 1, true);
+    _ = try afterCommit(a, io, store, 1, true);
     try std.testing.expect(try recovery.readGeneration(a, io, store, g1.id, null) != null);
     try std.testing.expect(try blob.get(a, io, store.blobs, old) != null);
     var g3: Generation = .{ .id = "20260101T000002Z", .parent = g2.id, .kind = .apply, .run_kind = .apply };
     try g3.displaced.put(a, "f", .{ .type = .file, .blob = new });
     try recovery.writeGeneration(a, io, store, g3);
     try @import("durable.zig").writeFile(io, store.current, "20260101T000002Z 20260101T000001Z\n");
-    try afterCommit(a, io, store, 1, true);
+    _ = try afterCommit(a, io, store, 1, true);
     try std.testing.expect(try recovery.readGeneration(a, io, store, g1.id, null) == null);
     try std.testing.expect(try blob.get(a, io, store.blobs, old) == null);
 }
@@ -297,13 +310,13 @@ test "afterCommit: while a reader holds the readers lock nothing is pruned or co
     try recovery.writeGeneration(a, io, store, .{ .id = "20260101T000002Z", .parent = "20260101T000001Z", .kind = .apply, .run_kind = .apply });
     try @import("durable.zig").writeFile(io, store.current, "20260101T000002Z 20260101T000001Z\n");
 
-    const reader = try lock.holdReaders(io, store.readers);
-    try afterCommit(a, io, store, 1, true);
+    const reader = try lock.foreignReader(io, store.readers);
+    _ = try afterCommit(a, io, store, 1, true);
     try std.testing.expect(try recovery.readGeneration(a, io, store, "20260101T000000Z", null) != null);
     try std.testing.expect(try blob.get(a, io, store.blobs, loose) != null);
     reader.release();
 
-    try afterCommit(a, io, store, 1, true);
+    _ = try afterCommit(a, io, store, 1, true);
     try std.testing.expect(try recovery.readGeneration(a, io, store, "20260101T000000Z", null) == null);
     try std.testing.expect(try blob.get(a, io, store.blobs, loose) == null);
 }

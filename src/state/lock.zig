@@ -191,53 +191,165 @@ fn unlockFile(io: Io, file: Io.File) void {
     file.unlock(io);
 }
 
-/// The file under `v2/` that readers hold shared while they read, and that
-/// pruning and GC, the only steps that delete generations or blobs, take
-/// exclusive. Never unlinked.
+/// The file under `v2/` that every command reading the state without
+/// writing it holds shared while it reads, and that every step deleting or
+/// moving generations, blobs or `v2/` itself holds exclusive. Only removing
+/// or moving `v2/` takes it away, under the exclusive lock.
 pub const readers_name = "readers.lock";
 
 pub const Readers = struct {
     io: Io,
     file: Io.File,
+    /// A shared hold this process counts.
+    counted: bool,
 
     pub fn release(self: Readers) void {
         unlockFile(self.io, self.file);
         self.file.close(self.io);
+        if (self.counted) shared_holds -= 1;
     }
 };
 
-fn openReaders(io: Io, path: []const u8) !Io.File {
-    return Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = @import("durable.zig").privateFile() });
+/// The shared holds this process has: it asks for the exclusive lock only
+/// once it has released them all.
+var shared_holds: usize = 0;
+
+pub const Shared = union(enum) {
+    held: Readers,
+    /// There is no `v2/`: nothing to hold.
+    no_store,
+    /// The file is missing and the directory does not let it be created:
+    /// the read goes ahead without it.
+    unavailable,
+    failed: anyerror,
+};
+
+pub const Exclusive = union(enum) {
+    held: Readers,
+    /// A reader holds it.
+    busy,
+    /// There is no `v2/`: no reader can hold it.
+    no_store,
+    failed: anyerror,
+};
+
+/// How a step that must not skip says it waits for the readers, once.
+pub const Wait = struct {
+    ctx: *anyopaque,
+    notice: *const fn (ctx: *anyopaque, path: []const u8) void,
+};
+
+/// The file at `path`, opened for reading, created 0600 when missing:
+/// `no_store` when its directory is missing, `unavailable` when the
+/// directory will not take it.
+fn openReaders(io: Io, path: []const u8) union(enum) { file: Io.File, no_store, unavailable, failed: anyerror } {
+    if (Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false })) |f| return .{ .file = f } else |e| switch (e) {
+        error.FileNotFound => {},
+        else => return .{ .failed = e },
+    }
+    const f = Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = @import("durable.zig").privateFile() }) catch |e| return switch (e) {
+        error.FileNotFound => .no_store,
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .unavailable,
+        else => .{ .failed = e },
+    };
+    return .{ .file = f };
 }
 
-/// Hold the readers lock at `path` shared, waiting while pruning or GC holds
-/// it exclusive.
-pub fn holdReaders(io: Io, path: []const u8) !Readers {
-    const file = try openReaders(io, path);
-    errdefer file.close(io);
+fn lockReaders(io: Io, file: Io.File, exclusive: bool, wait: bool) Io.File.LockError!bool {
     if (is_windows) {
         var ov = winOverlapped();
-        if (!LockFileEx(file.handle, 0, 0, 1, 0, &ov).toBool()) return switch (windows.GetLastError()) {
+        const flags = (if (exclusive) LOCKFILE_EXCLUSIVE_LOCK else 0) | (if (wait) 0 else LOCKFILE_FAIL_IMMEDIATELY);
+        if (LockFileEx(file.handle, flags, 0, 1, 0, &ov).toBool()) return true;
+        return switch (windows.GetLastError()) {
+            .LOCK_VIOLATION, .IO_PENDING => false,
             .NOT_SUPPORTED => error.FileLocksUnsupported,
             else => error.Unexpected,
         };
-    } else try file.lock(io, .shared);
-    return .{ .io = io, .file = file };
+    }
+    const mode: Io.File.Lock = if (exclusive) .exclusive else .shared;
+    if (wait) {
+        try file.lock(io, mode);
+        return true;
+    }
+    return file.tryLock(io, mode);
 }
 
-/// The readers lock at `path` held exclusive, or null while any reader holds
-/// it or it cannot be taken.
-pub fn excludeReaders(io: Io, path: []const u8) ?Readers {
-    const file = openReaders(io, path) catch return null;
-    const got = if (is_windows) blk: {
-        var ov = winOverlapped();
-        break :blk LockFileEx(file.handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov).toBool();
-    } else file.tryLock(io, .exclusive) catch false;
-    if (!got) {
+/// Hold the readers lock at `path` shared, waiting while a step that deletes
+/// holds it exclusive.
+pub fn holdReaders(io: Io, path: []const u8) Shared {
+    const file = switch (openReaders(io, path)) {
+        .file => |f| f,
+        .no_store => return .no_store,
+        .unavailable => return .unavailable,
+        .failed => |e| return .{ .failed = e },
+    };
+    _ = lockReaders(io, file, false, true) catch |e| {
         file.close(io);
-        return null;
+        return .{ .failed = e };
+    };
+    shared_holds += 1;
+    return .{ .held = .{ .io = io, .file = file, .counted = true } };
+}
+
+/// The readers lock at `path` held exclusive. Without `wait`, `busy` while
+/// any reader holds it; with it, the notice is given once and the call waits.
+/// A process holding it shared must release that first.
+pub fn excludeReaders(io: Io, path: []const u8, wait: ?Wait) error{HoldingShared}!Exclusive {
+    if (shared_holds > 0) return error.HoldingShared;
+    const file = switch (openReaders(io, path)) {
+        .file => |f| f,
+        .no_store => return .no_store,
+        .unavailable => return .{ .failed = error.AccessDenied },
+        .failed => |e| return .{ .failed = e },
+    };
+    const got = (if (builtin.is_test and forced_exclusive_failure != null) forced_exclusive_failure.? else lockReaders(io, file, true, false)) catch |e| {
+        file.close(io);
+        return .{ .failed = e };
+    };
+    if (!got) {
+        const w = wait orelse {
+            file.close(io);
+            return .busy;
+        };
+        w.notice(w.ctx, path);
+        if (builtin.is_test) if (before_readers_wait) |f| f(io, path);
+        _ = lockReaders(io, file, true, true) catch |e| {
+            file.close(io);
+            return .{ .failed = e };
+        };
     }
-    return .{ .io = io, .file = file };
+    return .{ .held = .{ .io = io, .file = file, .counted = false } };
+}
+
+/// The test seam for a readers lock that cannot be taken exclusive.
+pub var forced_exclusive_failure: ?Io.File.LockError = null;
+/// The test seam between the notice and the wait for the readers.
+pub var before_readers_wait: ?*const fn (Io, []const u8) void = null;
+
+/// The readers lock held shared as another process holds it: outside this
+/// process's count. Tests only.
+pub fn foreignReader(io: Io, path: []const u8) !Readers {
+    if (!builtin.is_test) @compileError("a test seam");
+    const file = switch (openReaders(io, path)) {
+        .file => |f| f,
+        else => return error.NoReadersLock,
+    };
+    _ = try lockReaders(io, file, false, true);
+    return .{ .io = io, .file = file, .counted = false };
+}
+
+/// Whether any process holds the readers lock at `path`, judged as another
+/// process would. Tests only.
+pub fn readersHeld(io: Io, path: []const u8) bool {
+    if (!builtin.is_test) @compileError("a test seam");
+    const file = switch (openReaders(io, path)) {
+        .file => |f| f,
+        else => return false,
+    };
+    defer file.close(io);
+    const free = lockReaders(io, file, true, false) catch return false;
+    if (free) unlockFile(io, file);
+    return !free;
 }
 
 /// The id of this boot: `/proc/sys/kernel/random/boot_id` on Linux,

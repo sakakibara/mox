@@ -859,7 +859,7 @@ test "readers: a reader holding its lock across commits keeps the generation and
 
     // Another mox reading: its readers lock, and the generation it loaded.
     const store = try mox.state.Store.init(a, h.state);
-    const held = try mox.state.lock.holdReaders(io, store.readers);
+    const held = try mox.state.lock.foreignReader(io, store.readers);
     var released = false;
     defer if (!released) held.release();
     const reader = (try mox.state.open(a, io, .{ .state_dir = h.state, .repo_dir = h.repo, .home = h.home, .writes = false, .locked = false })).ready.draft;
@@ -879,6 +879,79 @@ test "readers: a reader holding its lock across commits keeps the generation and
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(!hasId(try generationIds(h), read_id));
     try std.testing.expect((try reader.readContent(try h.liveOf(".zshrc"))) == null);
+}
+
+fn chmodPath(a: std.mem.Allocator, path: []const u8, mode: u32) !void {
+    const z = try a.dupeZ(u8, path);
+    _ = std.c.chmod(z.ptr, @intCast(mode));
+}
+
+test "readers: a readers.lock that is only readable, and a v2/ where it cannot be created, still let status read" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const readers = try statePath(h, &.{ "v2", "readers.lock" });
+    try std.testing.expect(exists(io, readers));
+
+    try chmodPath(a, readers, 0o400);
+    const ro = try h.run(&.{ "mox", "status" });
+    try chmodPath(a, readers, 0o600);
+    try std.testing.expectEqual(@as(u8, 0), ro.rc);
+    try std.testing.expectEqualStrings("", ro.err);
+
+    try Io.Dir.cwd().deleteFile(io, readers);
+    const v2 = try statePath(h, &.{"v2"});
+    try chmodPath(a, v2, 0o500);
+    const no_file = try h.run(&.{ "mox", "status" });
+    try chmodPath(a, v2, 0o700);
+    try std.testing.expectEqual(@as(u8, 0), no_file.rc);
+    try std.testing.expectEqualStrings("", no_file.err);
+    try std.testing.expect(!exists(io, readers));
+}
+
+test "readers: a readers.lock that cannot be opened names its path and what to do, and a commit that cannot take it warns once" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const readers = try statePath(h, &.{ "v2", "readers.lock" });
+
+    try chmodPath(a, readers, 0o000);
+    const st = try h.run(&.{ "mox", "status" });
+    try chmodPath(a, readers, 0o600);
+    try std.testing.expectEqual(@as(u8, 2), st.rc);
+    try std.testing.expect(contains(st.err, readers));
+    try std.testing.expect(contains(st.err, "chmod 600"));
+    try std.testing.expect(!contains(st.err, "error: AccessDenied"));
+
+    try Io.Dir.cwd().deleteFile(io, readers);
+    try Io.Dir.cwd().createDirPath(io, readers);
+    const dir = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 2), dir.rc);
+    try std.testing.expect(contains(dir.err, readers));
+    try std.testing.expect(contains(dir.err, "a file you own"));
+    try Io.Dir.cwd().deleteTree(io, readers);
+
+    mox.state.lock.forced_exclusive_failure = error.SystemResources;
+    defer mox.state.lock.forced_exclusive_failure = null;
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    const ap = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), ap.rc);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ap.err, "warning:"));
+    try std.testing.expect(contains(ap.err, readers));
 }
 
 fn trashIds(h: Harness) ![]const []const u8 {
