@@ -128,6 +128,26 @@ pub const RecoverOptions = struct {
     /// Judge each journal's holder by pid, start time and boot id; without
     /// the lock, a live run's journal is not read.
     unlocked: bool = false,
+    /// What a run says, once, when its writes wait for the readers.
+    wait: ?lock.Wait = null,
+};
+
+/// The readers lock held exclusive from a recovery's first write to its
+/// end, so no reader sees a journal or `current` change under it.
+const Exclusion = struct {
+    held: ?lock.Readers = null,
+    taken: bool = false,
+
+    fn take(x: *Exclusion, io: Io, store: Store, wait: ?lock.Wait) !void {
+        if (x.taken) return;
+        x.taken = true;
+        x.held = try lock.waitExclusive(io, store.readers, store.v2, wait);
+    }
+
+    fn release(x: *Exclusion) void {
+        if (x.held) |r| r.release();
+        x.held = null;
+    }
 };
 
 /// Fold, adopt, delete or quarantine every dead journal, oldest first, each
@@ -136,6 +156,8 @@ pub const RecoverOptions = struct {
 pub fn recover(arena: std.mem.Allocator, io: Io, store: Store, start: Loaded, opts: RecoverOptions, report: *Report) !Loaded {
     var at = start;
     const names = try journalIds(arena, io, store);
+    var excl: Exclusion = .{};
+    defer excl.release();
     for (names) |jid| {
         const path = try store.journalPath(arena, jid);
         const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024 * 1024)) catch continue;
@@ -144,7 +166,10 @@ pub fn recover(arena: std.mem.Allocator, io: Io, store: Store, start: Loaded, op
             if (parsed) |p| if (lock.stampLive(arena, io, p.header.holder)) continue;
         }
         const j = parsed orelse {
-            if (opts.writes) Io.Dir.cwd().deleteFile(io, path) catch {};
+            if (opts.writes) {
+                try excl.take(io, store, opts.wait);
+                Io.Dir.cwd().deleteFile(io, path) catch {};
+            }
             continue;
         };
         const loaded_id: ?[]const u8 = if (at.gen) |g| g.id else null;
@@ -154,12 +179,16 @@ pub fn recover(arena: std.mem.Allocator, io: Io, store: Store, start: Loaded, op
         if (try readGeneration(arena, io, store, jid, &why)) |g| {
             const cur = parseCurrent(at.base);
             if (cur != null and std.mem.eql(u8, cur.?.id, jid)) {
-                if (opts.writes) Io.Dir.cwd().deleteFile(io, path) catch {};
+                if (opts.writes) {
+                    try excl.take(io, store, opts.wait);
+                    Io.Dir.cwd().deleteFile(io, path) catch {};
+                }
                 continue;
             }
             if (eqlOpt(g.parent, loaded_id)) {
                 const cur_bytes = try currentLine(arena, jid, g.parent);
                 if (opts.writes) {
+                    try excl.take(io, store, opts.wait);
                     try durable.writeFile(io, store.current, cur_bytes);
                     Io.Dir.cwd().deleteFile(io, path) catch {};
                 }
@@ -167,15 +196,24 @@ pub fn recover(arena: std.mem.Allocator, io: Io, store: Store, start: Loaded, op
                 try report.recovered.append(arena, jid);
                 continue;
             }
-            if (opts.writes) try quarantine(arena, io, store, path, report);
+            if (opts.writes) {
+                try excl.take(io, store, opts.wait);
+                try quarantine(arena, io, store, path, report);
+            }
             continue;
         }
         if (gen_there) {
-            if (opts.writes) try quarantine(arena, io, store, path, report);
+            if (opts.writes) {
+                try excl.take(io, store, opts.wait);
+                try quarantine(arena, io, store, path, report);
+            }
             continue;
         }
         if (!std.mem.eql(u8, j.header.base, at.base)) {
-            if (opts.writes) try quarantine(arena, io, store, path, report);
+            if (opts.writes) {
+                try excl.take(io, store, opts.wait);
+                try quarantine(arena, io, store, path, report);
+            }
             continue;
         }
         var folded = if (at.gen) |g| try g.clone(arena) else Generation{ .id = jid, .kind = .recovered, .run_kind = j.header.run_kind };
@@ -191,7 +229,10 @@ pub fn recover(arena: std.mem.Allocator, io: Io, store: Store, start: Loaded, op
             try folded.flags.put(arena, try arena.dupe(u8, &j.header.part), f);
         }
         if (!changed and folded.displaced.count() == 0) {
-            if (opts.writes) Io.Dir.cwd().deleteFile(io, path) catch {};
+            if (opts.writes) {
+                try excl.take(io, store, opts.wait);
+                Io.Dir.cwd().deleteFile(io, path) catch {};
+            }
             continue;
         }
         folded.id = jid;
@@ -202,6 +243,7 @@ pub fn recover(arena: std.mem.Allocator, io: Io, store: Store, start: Loaded, op
         try retention.fixParts(arena, &folded, j.header.part, j.header.part_info);
         const cur_bytes = try currentLine(arena, jid, loaded_id);
         if (opts.writes) {
+            try excl.take(io, store, opts.wait);
             try writeGeneration(arena, io, store, folded);
             try durable.writeFile(io, store.current, cur_bytes);
             Io.Dir.cwd().deleteFile(io, path) catch {};

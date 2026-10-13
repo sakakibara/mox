@@ -1195,26 +1195,27 @@ that finds no `v2/` reads an empty state. Every step that deletes or moves
 generations, blobs or `v2/` holds the lock exclusive throughout. A run that
 commits deletes no old generation and no blob while a reader holds the lock,
 and a later run catches up. uninstall (forgetting the records or deleting
-the history) and `doctor --fix` moving what cannot be read to
-`v2/quarantine/` wait for the readers instead, printing once `mox: waiting
-for a running mox command that reads the state to finish (it holds <path>)`.
-Such a step first takes `<state dir>/readers.gate`, a second lock file
-beside it, which every reader takes shared only until it holds the readers
-lock: a reader that starts after the step began waiting waits behind it, so
-readers that keep overlapping one another cannot keep it waiting. The gate
-is opened and created as the readers lock is, and is never removed, moved or
-renamed either. Apart from these, a reader never holds up a run that writes.
-A run that is interrupted -- killed, Ctrl-C, a crash, a power loss -- leaves
-its changes in a journal under `v2/pending/`; the next command that takes
-the lock recovers them, and `status`, `diff` and `mox snapshot` read them as
-recovered at once. Recovered runs are listed by `mox doctor`. A journal that
-cannot be recovered, because the state changed under it or its run's
-generation did not match, is moved to `v2/quarantine/` and reported; nothing
-there is deleted. A run that finds `current` changed under it when it
-commits -- something other than mox wrote it while the run held the lock --
-commits nothing: its journal goes to `v2/quarantine/`, and it exits 2
-without going on, so an apply runs no `scripts/post` and uninstall strips
-nothing.
+the history), `doctor --fix` moving what cannot be read to `v2/quarantine/`,
+and a command that writes recovering an interrupted run's journal (folding,
+deleting or moving it, or rewriting `v2/current`) wait for the readers
+instead, printing once `mox: waiting for a running mox command that reads
+the state to finish (it holds <path>)`. Such a step first takes `<state
+dir>/readers.gate`, a second lock file beside it, which every reader takes
+shared only until it holds the readers lock: a reader that starts after the
+step began waiting waits behind it, so readers that keep overlapping one
+another cannot keep it waiting. The gate is opened and created as the
+readers lock is, and is never removed, moved or renamed either. Apart from
+these, a reader never holds up a run that writes. A run that is interrupted
+-- killed, Ctrl-C, a crash, a power loss -- leaves its changes in a journal
+under `v2/pending/`; the next command that takes the lock recovers them, and
+`status`, `diff` and `mox snapshot` read them as recovered at once.
+Recovered runs are listed by `mox doctor`. A journal that cannot be
+recovered, because the state changed under it or its run's generation did
+not match, is moved to `v2/quarantine/` and reported; nothing there is
+deleted. A run that finds `current` changed under it when it commits --
+something other than mox wrote it while the run held the lock -- commits
+nothing: its journal goes to `v2/quarantine/`, and it exits 2 without going
+on, so an apply runs no `scripts/post` and uninstall strips nothing.
 
 An owned target whose record has lost its canonical text is an `ERROR` in
 `status`, `diff`, `commit` and `apply`: either its blob under `v2/blobs/`,
@@ -1353,10 +1354,12 @@ history is asked only after the check every command that touches state
 makes, so a state this version refuses is refused before any question.
 Deleting it needs no readable generation, so `--purge-snapshots` works on a
 state every other write refuses; keeping it needs one, to forget the records
-in. Either way it waits, saying so, while another mox reads the state.
-`mox.lock`, `readers.lock` and `readers.gate`, the lock files, are kept and
-listed as kept, whatever the flags. Only the entries mox makes in the state
-directory are removed (its stores, `bin/`, `coupling/`, `commit-recovery/`,
+in. Either way it waits, saying so, while another mox reads the state, and
+it holds the readers off from before it removes anything until it is done,
+so a lock it cannot take stops it with nothing removed. `mox.lock`,
+`readers.lock` and `readers.gate`, the lock files, are kept and listed as
+kept, whatever the flags. Only the entries mox makes in the state directory
+are removed (its stores, `bin/`, `coupling/`, `commit-recovery/`,
 `mox-path`, `triggers.txt`, the package managers' `tmp/` and `zypper.txt`, a
 check hook's leftover `check-*`, and `private/` with `--purge-private`); any
 other entry is listed as kept, "not made by mox", and never followed or

@@ -114,8 +114,17 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     _ = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = false, .locked = true })) orelse return 2;
     const history = try mox.state.history(ctx.alloc, ctx.io, context.paths.state_dir);
     const purge_history = history.present and (a.purge_snapshots or (tty.isInteractive(0) and try confirmHistory(ctx, history)));
-    // What follows deletes or waits for the readers: this one lets go first.
+    // What follows deletes: this one lets go of its shared hold, then holds
+    // the readers off before it removes anything.
     mox.state.releaseReaders();
+    const excl = mox.state.excludeReaders(ctx.alloc, ctx.io, context.paths.state_dir, state_cli.waitFor(ctx)) catch |e| switch (e) {
+        error.ReadersLockFailed => {
+            try state_cli.printReadersFailure(ctx);
+            return 2;
+        },
+        else => return e,
+    };
+    defer if (excl) |x| x.release();
     var st: ?*mox.state.Draft = null;
     if (!purge_history) {
         st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = true, .locked = true })) orelse return 2;

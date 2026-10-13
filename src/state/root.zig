@@ -97,7 +97,7 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
         report.restarted = true;
     }
     if (!no_store and (!report.exhausted or opts.repair)) {
-        loaded = try recovery.recover(arena, io, store, loaded, .{ .writes = opts.writes and opts.locked, .unlocked = !opts.locked }, &report);
+        loaded = try recovery.recover(arena, io, store, loaded, .{ .writes = opts.writes and opts.locked, .unlocked = !opts.locked, .wait = opts.wait }, &report);
     }
     const part = try draft.partOf(arena, io, opts.repo_dir, opts.home);
     const d = try arena.create(Draft);
@@ -153,6 +153,14 @@ pub const Deleted = struct { path: []const u8, err: ?anyerror = null };
 /// is claimed.
 pub fn claimTrashId(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]const u8 {
     return draft.claimId(arena, io, try Store.init(arena, state_dir), .trash);
+}
+
+/// The readers lock held exclusive for the steps that follow, waiting for
+/// the readers; null when there is no store. Steps inside it that wait for
+/// the readers find it held.
+pub fn excludeReaders(arena: std.mem.Allocator, io: Io, state_dir: []const u8, wait: ?lock.Wait) !?lock.Readers {
+    const store = try Store.init(arena, state_dir);
+    return lock.waitExclusive(io, store.readers, store.v2, wait);
 }
 
 /// Delete the history, `v2/`, whatever state it is in: no generation needs

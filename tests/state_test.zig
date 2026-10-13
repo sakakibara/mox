@@ -1807,3 +1807,53 @@ test "readers: a relay of overlapping readers does not keep uninstall waiting" {
     // held the lock when it asked.
     try std.testing.expect(took < 10_000);
 }
+
+test "readers: recovery that writes waits for a running reader before it folds, deletes or moves a journal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const jid = try deadJournal(h, .apply, ".zshrc");
+
+    waits = 0;
+    waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{"readers.lock"}));
+    defer if (waiting_on) |r| r.release();
+    mox.state.lock.before_readers_wait = releaseWaitedOn;
+    defer mox.state.lock.before_readers_wait = null;
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(usize, 1), waits);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.err, "waiting for a running mox command that reads the state"));
+    try std.testing.expect(!exists(io, try statePath(h, &.{ "v2", "pending", try std.fmt.allocPrint(a, "{s}.jsonl", .{jid}) })));
+}
+
+test "uninstall: a readers lock it cannot take exclusive stops it before it removes or forgets anything" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |purge| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try writeRepo(io, &tmp, "state/coupling/graph.json", "{}\n");
+        mox.state.lock.forced_exclusive_failure = error.Unexpected;
+        defer mox.state.lock.forced_exclusive_failure = null;
+        const r = if (purge) try h.run(&.{ "mox", "uninstall", "--purge-snapshots" }) else try h.run(&.{ "mox", "uninstall" });
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        try std.testing.expect(contains(r.err, try statePath(h, &.{"readers.lock"})));
+        mox.state.lock.forced_exclusive_failure = null;
+        try std.testing.expect(exists(io, try statePath(h, &.{ "coupling", "graph.json" })));
+        try std.testing.expect(exists(io, try statePath(h, &.{"v2"})));
+        try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".zshrc")) != null);
+    }
+}

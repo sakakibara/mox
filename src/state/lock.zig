@@ -211,8 +211,15 @@ pub const Readers = struct {
     counted: bool,
     /// The gate a waiting step holds with it.
     gate: ?Io.File = null,
+    /// This process already held the lock exclusive when it asked: the
+    /// outer hold releases it.
+    nested: bool = false,
+    /// Held exclusive.
+    exclusive: bool = false,
 
     pub fn release(self: Readers) void {
+        if (self.nested) return;
+        if (self.exclusive) exclusive_held = false;
         unlockFile(self.io, self.file);
         self.file.close(self.io);
         if (self.gate) |g| {
@@ -226,6 +233,10 @@ pub const Readers = struct {
 /// The shared holds this process has: it asks for the exclusive lock only
 /// once it has released them all.
 var shared_holds: usize = 0;
+
+/// This process holds the lock exclusive: a step inside the one that took
+/// it holds it already.
+var exclusive_held = false;
 
 pub const Shared = union(enum) {
     held: Readers,
@@ -380,6 +391,7 @@ pub const Mode = union(enum) {
 /// first.
 pub fn excludeReaders(io: Io, path: []const u8, store: []const u8, mode: Mode) error{HoldingShared}!Exclusive {
     if (shared_holds > 0) return error.HoldingShared;
+    if (exclusive_held) return .{ .held = .{ .io = io, .file = undefined, .counted = false, .nested = true, .exclusive = true } };
     const wait: ?Wait = switch (mode) {
         .try_once => null,
         .wait => |w| w,
@@ -426,7 +438,8 @@ pub fn excludeReaders(io: Io, path: []const u8, store: []const u8, mode: Mode) e
             return .{ .failed = e };
         };
     }
-    return .{ .held = .{ .io = io, .file = file, .counted = false, .gate = gate } };
+    exclusive_held = true;
+    return .{ .held = .{ .io = io, .file = file, .counted = false, .gate = gate, .exclusive = true } };
 }
 
 pub const Failure = struct { path: []const u8, err: anyerror };
