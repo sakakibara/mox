@@ -517,20 +517,25 @@ pub const Draft = struct {
         var e = entry_in;
         if (d.gen.displaced.get(key)) |old| {
             if (e.planted == null) e.planted = old.planted;
-            // A directory replaced by something else leaves its members on
-            // their own.
-            if (old.type == .dir and old.root == null and e.type != .dir) try d.rerootMembers(key);
+            // A tree's members follow its directory: on their own when it is
+            // replaced by something else, into the enclosing tree when a
+            // later save captures it as a member.
+            if (old.type == .dir and old.root == null) {
+                if (e.type != .dir) {
+                    try d.rerootMembers(key, null);
+                } else if (e.root) |r| try d.rerootMembers(key, r);
+            }
         }
         const v = try generation.flatDisplacedValue(d.arena, e);
         try d.log(.displaced, key, v, true);
         try d.gen.displaced.put(d.arena, key, e);
     }
 
-    fn rerootMembers(d: *Draft, root: []const u8) !void {
+    fn rerootMembers(d: *Draft, from: []const u8, to: ?[]const u8) !void {
         for (d.gen.displaced.keys(), d.gen.displaced.values()) |k, *m| {
             const r = m.root orelse continue;
-            if (!std.mem.eql(u8, r, root)) continue;
-            m.root = null;
+            if (!std.mem.eql(u8, r, from)) continue;
+            m.root = to;
             try d.log(.displaced, k, try generation.flatDisplacedValue(d.arena, m.*), true);
         }
     }
@@ -788,6 +793,42 @@ test "draft: a record write with a composed file sets source_key, and a rolled-b
     try testing.expectEqualStrings("src/l", e.source_key.?);
     try testing.expect(e.link.?.rolled_back and std.mem.eql(u8, &e.part, &other));
     try testing.expect(d.readSymlink("/h/l") == null);
+}
+
+test "draft: a tree saved inside a later tree save keeps every member it holds, written and folded alike" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const d = try testStore(a, io, &tmp);
+    const home = "/h";
+    try d.saveTree(home, "/h/A/B", .{
+        .dirs = &.{.{ .live = "/h/A/B", .mode = 0o755 }},
+        .files = &.{.{ .live = "/h/A/B/x", .content = "x\n", .mode = 0o644 }},
+        .symlinks = &.{},
+    });
+    try d.saveTree(home, "/h/A", .{
+        .dirs = &.{ .{ .live = "/h/A", .mode = 0o700 }, .{ .live = "/h/A/B", .mode = 0o750 } },
+        .files = &.{.{ .live = "/h/A/y", .content = "y\n", .mode = 0o600 }},
+        .symlinks = &.{},
+    });
+    const want = [_][]const u8{ "A", "A/B", "A/B/x", "A/y" };
+    var g = d.gen;
+    g.id = "20260101T000000Z";
+    const back = try generation.parse(a, try generation.serialize(a, g), null);
+    for (want) |k| try testing.expect(back.displaced.contains(k));
+    try testing.expectEqual(want.len, back.displaced.count());
+    try testing.expectEqual(@as(u32, 0o750), back.displaced.get("A/B").?.mode.?);
+
+    const j = try Io.Dir.cwd().readFileAlloc(io, d.jnl.?.path, a, .unlimited);
+    const parsed = (try journal.parse(a, j)).?;
+    var folded: Generation = .{ .id = "20260101T000000Z", .kind = .recovered, .run_kind = .apply };
+    for (parsed.ops) |op| if (op.map == .displaced) try folded.displaced.put(a, op.key, try generation.parseFlatDisplaced(a, op.value.?));
+    const refolded = try generation.parse(a, try generation.serialize(a, folded), null);
+    for (want) |k| try testing.expect(refolded.displaced.contains(k));
+    try testing.expectEqual(want.len, refolded.displaced.count());
 }
 
 test "draft: a change equal to what is held is not a change, and the journal is claimed at the first one" {

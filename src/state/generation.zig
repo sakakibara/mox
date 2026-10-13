@@ -394,7 +394,7 @@ fn displacedValue(arena: std.mem.Allocator, m: Map(Displaced)) !json.ObjectMap {
     var out: json.ObjectMap = .empty;
     var trees = std.StringArrayHashMapUnmanaged(std.ArrayList(json.Value)).empty;
     for (m.keys(), m.values()) |k, d| {
-        const root = d.root orelse continue;
+        const root = treeOf(m, d) orelse continue;
         var fields = try displacedFields(arena, d);
         try fields.put(arena, "rel", .{ .string = try applied.pctEncode(arena, k[root.len + 1 ..]) });
         const gop = try trees.getOrPut(arena, root);
@@ -402,7 +402,7 @@ fn displacedValue(arena: std.mem.Allocator, m: Map(Displaced)) !json.ObjectMap {
         try gop.value_ptr.append(arena, .{ .object = fields });
     }
     for (m.keys(), m.values()) |k, d| {
-        if (d.root != null) continue;
+        if (treeOf(m, d) != null) continue;
         var fields = try displacedFields(arena, d);
         if (trees.getPtr(k)) |members| {
             std.mem.sort(json.Value, members.items, {}, lessRel);
@@ -411,6 +411,15 @@ fn displacedValue(arena: std.mem.Allocator, m: Map(Displaced)) !json.ObjectMap {
         try out.put(arena, try encodeKey(arena, k), .{ .object = fields });
     }
     return out;
+}
+
+/// The tree a member is written under: its root, when that is a directory
+/// of its own; else none, and the member is written as an entry of its own.
+fn treeOf(m: Map(Displaced), d: Displaced) ?[]const u8 {
+    const root = d.root orelse return null;
+    const r = m.get(root) orelse return null;
+    if (r.type != .dir or r.root != null) return null;
+    return root;
 }
 
 fn lessRel(_: void, a: json.Value, b: json.Value) bool {
