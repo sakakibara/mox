@@ -37,6 +37,7 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
         .writes = o.writes,
         .locked = o.locked,
         .repair = o.repair,
+        .wait = waitFor(ctx),
     });
     switch (opened) {
         .refused => |why| {
@@ -57,6 +58,17 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
             return .{ .draft = r.draft, .report = r.report };
         },
     }
+}
+
+/// What a command says, once, before it waits for the readers of the state.
+pub fn waitFor(ctx: *app.Ctx) state.lock.Wait {
+    return .{ .ctx = ctx, .notice = waitNotice };
+}
+
+fn waitNotice(p: *anyopaque, path: []const u8) void {
+    const ctx: *app.Ctx = @ptrCast(@alignCast(p));
+    ctx.err.print("mox: waiting for a running mox command that reads the state to finish (it holds {s})\n", .{path}) catch {};
+    ctx.err.flush() catch {};
 }
 
 /// Commit what `st` holds: false, after saying so, when `current` moved

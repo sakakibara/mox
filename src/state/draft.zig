@@ -111,6 +111,8 @@ pub const Draft = struct {
     committed: bool = false,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
+    /// What a step that waits for the readers says first.
+    wait: ?lock.Wait = null,
 
     // Reads.
 
@@ -653,6 +655,8 @@ pub const Draft = struct {
     pub fn quarantineGeneration(d: *const Draft, gen_id: []const u8) ![]const u8 {
         const recovery = @import("recovery.zig");
         var r: recovery.Report = .{};
+        const excl = try lock.waitExclusive(d.io, d.store.readers, d.wait);
+        defer if (excl) |x| x.release();
         try recovery.quarantine(d.arena, d.io, d.store, try d.store.genPath(d.arena, gen_id), &r);
         return r.quarantined.items[0];
     }
@@ -686,7 +690,7 @@ pub const Draft = struct {
     /// Strip every retained generation down to its displaced history, then
     /// collect the blobs only the records named.
     pub fn stripHistory(d: *const Draft) !void {
-        return @import("retention.zig").stripRecords(d.arena, d.io, d.store);
+        return @import("retention.zig").stripRecords(d.arena, d.io, d.store, d.wait);
     }
 
     pub fn readBlob(d: *const Draft, h: Hex) !?[]const u8 {

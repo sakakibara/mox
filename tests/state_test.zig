@@ -999,6 +999,86 @@ test "readers: a store created between a reader's start checks and its load is r
     }
 }
 
+var waiting_on: ?mox.state.lock.Readers = null;
+var waits: usize = 0;
+
+/// The reader the test holds lets go once a step says it waits for it.
+fn releaseWaitedOn(_: Io, _: []const u8) void {
+    waits += 1;
+    if (waiting_on) |r| r.release();
+    waiting_on = null;
+}
+
+fn blobCount(h: Harness) !usize {
+    var d = Io.Dir.cwd().openDir(h.io, try statePath(h, &.{ "v2", "blobs" }), .{ .iterate = true }) catch return 0;
+    defer d.close(h.io);
+    var n: usize = 0;
+    var it = d.iterate();
+    while (try it.next(h.io)) |e| if (e.kind == .file and e.name.len == 64) {
+        n += 1;
+    };
+    return n;
+}
+
+test "readers: uninstall waits for a running reader, saying so once, then collects the records' blobs" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(try blobCount(h) > 0);
+
+    waits = 0;
+    waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{ "v2", "readers.lock" }));
+    defer if (waiting_on) |r| r.release();
+    mox.state.lock.before_readers_wait = releaseWaitedOn;
+    defer mox.state.lock.before_readers_wait = null;
+    const r = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(usize, 1), waits);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.err, "waiting for a running mox command that reads the state"));
+    try std.testing.expectEqual(@as(usize, 0), try blobCount(h));
+}
+
+test "readers: uninstall --purge-snapshots and doctor --fix wait for a running reader before they delete or move" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |purge| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_CLOCK", .value = "1783671300" }});
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        const torn = try currentId(h);
+        const gen = try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{torn}) });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = gen, .data = "{ torn" });
+        try testutil.gitTracked(io, a, h.repo);
+
+        waits = 0;
+        waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{ "v2", "readers.lock" }));
+        defer if (waiting_on) |r| r.release();
+        mox.state.lock.before_readers_wait = releaseWaitedOn;
+        defer mox.state.lock.before_readers_wait = null;
+        const r = if (purge) try h.run(&.{ "mox", "uninstall", "--purge-snapshots" }) else try h.run(&.{ "mox", "doctor", "--fix" });
+        try std.testing.expectEqual(@as(usize, 1), waits);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.err, "waiting for a running mox command that reads the state"));
+        if (purge) {
+            try std.testing.expectEqual(@as(u8, 0), r.rc);
+            try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
+        } else try std.testing.expect(!exists(io, gen));
+    }
+}
+
 fn trashIds(h: Harness) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var d = Io.Dir.cwd().openDir(h.io, try statePath(h, &.{"trash"}), .{ .iterate = true }) catch return out.items;

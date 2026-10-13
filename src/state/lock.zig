@@ -291,10 +291,16 @@ pub fn holdReaders(io: Io, path: []const u8) Shared {
     return .{ .held = .{ .io = io, .file = file, .counted = true } };
 }
 
-/// The readers lock at `path` held exclusive. Without `wait`, `busy` while
-/// any reader holds it; with it, the notice is given once and the call waits.
-/// A process holding it shared must release that first.
-pub fn excludeReaders(io: Io, path: []const u8, wait: ?Wait) error{HoldingShared}!Exclusive {
+pub const Mode = union(enum) {
+    /// `busy` while any reader holds it.
+    try_once,
+    /// Wait for the readers, giving the notice once when there are any.
+    wait: ?Wait,
+};
+
+/// The readers lock at `path` held exclusive. A process holding it shared
+/// must release that first.
+pub fn excludeReaders(io: Io, path: []const u8, mode: Mode) error{HoldingShared}!Exclusive {
     if (shared_holds > 0) return error.HoldingShared;
     const file = switch (openReaders(io, path)) {
         .file => |f| f,
@@ -307,11 +313,14 @@ pub fn excludeReaders(io: Io, path: []const u8, wait: ?Wait) error{HoldingShared
         return .{ .failed = e };
     };
     if (!got) {
-        const w = wait orelse {
-            file.close(io);
-            return .busy;
+        const wait = switch (mode) {
+            .try_once => {
+                file.close(io);
+                return .busy;
+            },
+            .wait => |w| w,
         };
-        w.notice(w.ctx, path);
+        if (wait) |w| w.notice(w.ctx, path);
         if (builtin.is_test) if (before_readers_wait) |f| f(io, path);
         _ = lockReaders(io, file, true, true) catch |e| {
             file.close(io);
@@ -319,6 +328,17 @@ pub fn excludeReaders(io: Io, path: []const u8, wait: ?Wait) error{HoldingShared
         };
     }
     return .{ .held = .{ .io = io, .file = file, .counted = false } };
+}
+
+/// The readers lock at `path` held exclusive for a step that must not skip,
+/// waiting for the readers; null when there is no store.
+pub fn waitExclusive(io: Io, path: []const u8, wait: ?Wait) !?Readers {
+    return switch (try excludeReaders(io, path, .{ .wait = wait })) {
+        .held => |r| r,
+        .no_store => null,
+        .busy => unreachable,
+        .failed => |e| e,
+    };
 }
 
 /// The test seam for a readers lock that cannot be taken exclusive.
@@ -550,4 +570,22 @@ test "lock: a held kernel lock refuses, whatever its line holds" {
         try testing.expect(got == .held);
         try testing.expectEqual(@as(Pid, 0), got.held.pid);
     }
+}
+
+test "readers: a process asks for the exclusive lock only after releasing its shared one" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = try std.fs.path.join(a, &.{ try tmpState(a, io, &tmp), readers_name });
+    const shared = holdReaders(io, path).held;
+    try testing.expectError(error.HoldingShared, excludeReaders(io, path, .try_once));
+    try testing.expectError(error.HoldingShared, waitExclusive(io, path, null));
+    shared.release();
+    const excl = (try waitExclusive(io, path, null)).?;
+    try testing.expect(readersHeld(io, path));
+    excl.release();
+    try testing.expect(!readersHeld(io, path));
 }

@@ -65,10 +65,10 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     _ = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = false, .locked = true })) orelse return 2;
     const history = try mox.state.history(ctx.alloc, ctx.io, context.paths.state_dir);
     const purge_history = history.present and (a.purge_snapshots or (tty.isInteractive(0) and try confirmHistory(ctx, history)));
+    // What follows deletes or waits for the readers: this one lets go first.
+    mox.state.releaseReaders();
     var st: ?*mox.state.Draft = null;
     if (!purge_history) {
-        // Its own commit collects the blobs the records named.
-        mox.state.releaseReaders();
         st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = true, .locked = true })) orelse return 2;
     }
 
@@ -99,7 +99,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     if (purge_history) {
-        if (try mox.state.purgeHistory(ctx.alloc, ctx.io, context.paths.state_dir)) |r| {
+        if (try mox.state.purgeHistory(ctx.alloc, ctx.io, context.paths.state_dir, state_cli.waitFor(ctx))) |r| {
             if (r.err) |err| {
                 try ctx.err.print("  kept {f} (delete failed: {s})\n", .{ display.of(r.path, context.paths.home), @errorName(err) });
             } else {

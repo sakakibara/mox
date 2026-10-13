@@ -74,7 +74,7 @@ fn isRollback(g: Generation) bool {
 /// commit catches up. Returns a warning when the readers lock could not be
 /// taken for another reason.
 pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?usize, gc: bool) !?[]const u8 {
-    const excl = switch (lock.excludeReaders(io, store.readers, null) catch |e| return try notPruned(arena, store, e)) {
+    const excl = switch (lock.excludeReaders(io, store.readers, .try_once) catch |e| return try notPruned(arena, store, e)) {
         .held => |r| r,
         .busy, .no_store => return null,
         .failed => |e| return try notPruned(arena, store, e),
@@ -109,8 +109,11 @@ fn notPruned(arena: std.mem.Allocator, store: Store, e: anyerror) ![]const u8 {
 
 /// Strip every generation down to its ids, its displaced history and the
 /// parts its planted notes name, each rewritten atomically, then collect the
-/// blobs only the records named.
-pub fn stripRecords(arena: std.mem.Allocator, io: Io, store: Store) !void {
+/// blobs only the records named; under the readers lock, waiting for the
+/// readers.
+pub fn stripRecords(arena: std.mem.Allocator, io: Io, store: Store, wait: ?lock.Wait) !void {
+    const excl = try lock.waitExclusive(io, store.readers, wait);
+    defer if (excl) |r| r.release();
     const inv = try inventory(arena, io, store);
     for (inv.gens) |l| {
         var g = l.gen;
@@ -123,11 +126,6 @@ pub fn stripRecords(arena: std.mem.Allocator, io: Io, store: Store) !void {
         try recovery.writeGeneration(arena, io, store, g);
     }
     if (inv.unreadable.len > 0) return;
-    const excl = switch (try lock.excludeReaders(io, store.readers, null)) {
-        .held => |r| r,
-        else => return,
-    };
-    defer excl.release();
     try collect(arena, io, store);
 }
 

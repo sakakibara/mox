@@ -34,6 +34,8 @@ pub const Options = struct {
     locked: bool,
     /// Writes go ahead on an exhausted chain: `doctor --fix` starts over.
     repair: bool = false,
+    /// What a step that waits for the readers says first.
+    wait: ?lock.Wait = null,
 };
 
 pub const Opened = union(enum) {
@@ -87,6 +89,8 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
     if (report.exhausted and opts.repair and opts.writes and opts.locked) {
         // Starting over: what cannot be read moves aside, and the state is
         // empty, `current` absent.
+        const excl = try lock.waitExclusive(io, store.readers, opts.wait);
+        defer if (excl) |x| x.release();
         try quarantineUnreadable(arena, io, store, &report);
         if (exists(io, store.current)) try recovery.quarantine(arena, io, store, store.current, &report);
         loaded = .{ .gen = null, .base = "" };
@@ -113,6 +117,7 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
         .part_info = part.info,
         .exhausted = report.exhausted and !opts.repair,
         .unwritten = report.unwritten.items,
+        .wait = opts.wait,
     };
     return .{ .ready = .{ .draft = d, .report = report } };
 }
@@ -143,8 +148,10 @@ pub fn claimTrashId(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]
 }
 
 /// Delete the history, `v2/`, whatever state it is in: no generation needs
-/// to be readable.
-pub fn purgeHistory(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !?Deleted {
+/// to be readable. Waits for the readers first.
+pub fn purgeHistory(arena: std.mem.Allocator, io: Io, state_dir: []const u8, wait: ?lock.Wait) !?Deleted {
+    const excl = try lock.waitExclusive(io, (try Store.init(arena, state_dir)).readers, wait);
+    defer if (excl) |x| x.release();
     const h = try history(arena, io, state_dir);
     if (!h.present) return null;
     Io.Dir.cwd().deleteTree(io, h.path) catch |e| return .{ .path = h.path, .err = e };
