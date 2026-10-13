@@ -1329,20 +1329,27 @@ fn releaseAndOpen(io: Io, _: []const u8) void {
 }
 
 /// The latecomer's file is still the one at the lock's path, and its shared
-/// lock is seen there.
+/// lock, which it keeps, is seen there.
 fn expectLatecomerHolds(h: Harness) !void {
     const f = latecomer orelse return error.NoLatecomer;
-    defer f.close(h.io);
-    latecomer = null;
     try std.testing.expect(exists(h.io, latecomer_path));
     const at_path = try Io.Dir.cwd().statFile(h.io, latecomer_path, .{});
     try std.testing.expectEqual(at_path.inode, (try f.stat(h.io)).inode);
     try f.lock(h.io, .shared);
-    defer f.unlock(h.io);
     try std.testing.expect(mox.state.lock.readersHeld(h.io, latecomer_path));
 }
 
-test "readers: the purge leaves the readers lock where it is, so a reader waiting on it still excludes the next step" {
+/// The latecomer lets go once a step says it waits for it.
+fn releaseLatecomer(io: Io, _: []const u8) void {
+    waits += 1;
+    if (latecomer) |f| {
+        f.unlock(io);
+        f.close(io);
+    }
+    latecomer = null;
+}
+
+test "readers: after the purge, a reader that opened the lock while the step waited holds it, and the next step waits for it" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     {
@@ -1365,6 +1372,20 @@ test "readers: the purge leaves the readers lock where it is, so a reader waitin
         try std.testing.expectEqual(@as(u8, 0), r.rc);
         try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
         try expectLatecomerHolds(h);
+        defer if (latecomer) |f| {
+            f.unlock(io);
+            f.close(io);
+            latecomer = null;
+        };
+        // The purge took the store; an apply makes one again, its cleanup
+        // skipped for the latecomer.
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        waits = 0;
+        mox.state.lock.before_readers_wait = releaseLatecomer;
+        const next = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
+        try std.testing.expectEqual(@as(usize, 1), waits);
+        try std.testing.expectEqual(@as(u8, 0), next.rc);
+        try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
     }
 }
 
