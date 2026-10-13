@@ -1169,7 +1169,9 @@ under `v2/blobs/` is missing or damaged -- is an `ERROR` in `status`,
 file alone otherwise and goes on with the rest, and `mox doctor` lists it.
 
 A generation that cannot be read is skipped for the one before it, with a
-warning, and writes go on. When none can be read, every command reads an
+warning, and writes go on. `mox doctor` shows a current generation that
+cannot be read, and `doctor --fix` moves it to `v2/quarantine/` and makes
+`current` name the readable one, which ends the warning. When none can be read, every command reads an
 empty state with a warning and every command that writes refuses: `mox:
 the state at <dir> has no readable generation; run `mox doctor --fix``.
 `v2/` holding generations but no `current` refuses the same way, since it

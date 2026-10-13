@@ -742,6 +742,17 @@ fn stateRows(ctx: *app.Ctx, st: *mox.state.Draft, report: mox.state.recovery.Rep
         try ctx.out.writeAll("  started over: no generation could be read, so the state is empty from here; the displaced history stays listed\n");
         try st.forceCommit();
     }
+    if (report.fallback_id) |parent| {
+        const torn = report.torn_id.?;
+        if (fix) {
+            // A generation on the readable one makes `current` name it.
+            try st.forceCommit();
+            try ctx.out.print("  torn-current {s}: the next generation follows {s}, the one before it\n", .{ torn, parent });
+        } else {
+            problems += 1;
+            try ctx.out.print("  torn-current {s} (cannot be read; reading {s}, the one before it; --fix moves current past it)\n", .{ torn, parent });
+        }
+    }
     const inv = try mox.state.retention.inventory(ctx.alloc, ctx.io, st.store);
     for (inv.gens) |l| if (l.gen.kind == .recovered) try ctx.out.print("  recovered {s} (a run that did not finish, folded from its journal)\n", .{l.id});
     for (inv.unreadable) |gid| {

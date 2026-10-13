@@ -277,7 +277,11 @@ pub const Draft = struct {
         if (!d.writable) return error.ReadOnlyState;
         if (d.exhausted) return error.StateExhausted;
         try durable.makeDir(d.io, d.store.v2);
-        const new_id = try id_mod.claim(d.arena, d.io, d.store.idDirs(), .journal);
+        var dirs = d.store.idDirs();
+        if (@import("recovery.zig").parseCurrent(d.base)) |c| {
+            dirs.taken = if (c.parent) |p| try d.arena.dupe([]const u8, &.{ c.id, p }) else try d.arena.dupe([]const u8, &.{c.id});
+        }
+        const new_id = try id_mod.claim(d.arena, d.io, dirs, .journal);
         const path = try d.store.journalPath(d.arena, new_id);
         d.jnl = try journal.begin(d.arena, d.io, path, .{
             .holder = try lock.holderStamp(d.arena, d.io, lock.selfPid()),

@@ -76,6 +76,8 @@ pub const Dirs = struct {
     pending: []const u8,
     quarantine: []const u8,
     trash: []const u8,
+    /// Ids taken though no file holds them: those `current` names.
+    taken: []const []const u8 = &.{},
 };
 
 /// What claims the id.
@@ -121,6 +123,10 @@ pub fn claimFrom(arena: std.mem.Allocator, io: Io, dirs: Dirs, how: Claim, base:
 /// `base`, the plain id counting as 1; 0 when none has it.
 fn newestOf(io: Io, dirs: Dirs, base: []const u8) !u64 {
     var newest: u64 = 0;
+    for (dirs.taken) |t| {
+        const sp = split(t);
+        if (std.mem.eql(u8, sp.base, base)) newest = @max(newest, sp.n);
+    }
     for ([_][]const u8{ dirs.gen, dirs.pending, dirs.trash, dirs.quarantine }) |dir_path| {
         var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
         defer dir.close(io);

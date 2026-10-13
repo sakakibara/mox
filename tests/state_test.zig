@@ -338,6 +338,35 @@ test "state: a torn current generation falls back to its parent with a warning, 
     try std.testing.expect(!exists(io, try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{torn}) })));
 }
 
+test "state: doctor shows a current generation that cannot be read, and --fix makes current name a readable one" {
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |missing| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_CLOCK", .value = "1783671300" }});
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        const torn = try currentId(h);
+        const gen = try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{torn}) });
+        if (missing) try Io.Dir.cwd().deleteFile(io, gen) else try Io.Dir.cwd().writeFile(io, .{ .sub_path = gen, .data = "{ torn" });
+        try testutil.gitTracked(io, a, h.repo);
+
+        const report = try h.run(&.{ "mox", "doctor" });
+        try std.testing.expectEqual(@as(u8, 1), report.rc);
+        try std.testing.expect(contains(report.out, torn));
+        _ = try h.run(&.{ "mox", "doctor", "--fix" });
+        try std.testing.expect(!std.mem.eql(u8, torn, try currentId(h)));
+        const s = try h.run(&.{ "mox", "status" });
+        try std.testing.expect(!contains(s.err, "cannot be read"));
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "doctor" })).rc);
+    }
+}
+
 test "state: an exhausted chain reads as empty with a warning, refuses writes, and doctor --fix starts over" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

@@ -28,6 +28,9 @@ pub const Report = struct {
     quarantined: std.ArrayList([]const u8) = .empty,
     /// `current` named a generation that could not be read.
     torn: bool = false,
+    /// The generation `current` named, when torn, and the one read instead.
+    torn_id: ?[]const u8 = null,
+    fallback_id: ?[]const u8 = null,
     /// No generation could be read: reads are empty and writes refuse.
     exhausted: bool = false,
     /// A generation a newer mox wrote.
@@ -112,9 +115,11 @@ fn loadCurrentOnce(arena: std.mem.Allocator, io: Io, store: Store, report: *Repo
         return loadCurrentOnce(arena, io, store, report, false);
     }
     report.torn = true;
+    report.torn_id = cur.id;
     if (cur.parent) |p| {
         var pwhy: generation.Unread = .malformed;
         if (try readGeneration(arena, io, store, p, &pwhy)) |g| {
+            report.fallback_id = p;
             try report.warnings.append(arena, try std.fmt.allocPrint(arena, "generation {s} cannot be read; using {s}, the one before it (`mox doctor --fix` moves it aside)", .{ cur.id, p }));
             return .{ .gen = g, .base = base };
         }
