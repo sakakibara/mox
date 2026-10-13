@@ -188,6 +188,15 @@ pub fn currentId(h: Harness) ![]const u8 {
     return line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
 }
 
+/// Rewrite the current generation of `h`'s state through `edit`, as a
+/// damaged store would hold it.
+pub fn editCurrent(h: Harness, edit: *const fn (std.mem.Allocator, *mox.state.generation.Generation, []const u8) anyerror!void, live: []const u8) !void {
+    const store = try mox.state.Store.init(h.a, h.state);
+    var g = (try mox.state.recovery.readGeneration(h.a, h.io, store, try currentId(h), null)).?;
+    try edit(h.a, &g, live);
+    try mox.state.recovery.writeGeneration(h.a, h.io, store, g);
+}
+
 /// True when any file under `root` contains `needle`, or any symlink under it
 /// has `needle` in its target. Used to assert that nothing of a machine reaches
 /// the shared repo -- git stores a symlink as a blob whose content is the raw

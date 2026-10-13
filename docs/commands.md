@@ -1175,11 +1175,15 @@ it commits -- something other than mox wrote it while the run held the lock
 without going on, so an apply runs no `scripts/post` and uninstall strips
 nothing.
 
-An owned target whose record has lost its canonical text -- the blob
-under `v2/blobs/` is missing or damaged -- is an `ERROR` in `status`,
-`diff`, `commit` and `apply`, naming the blob and the remedy, `mox apply
+An owned target whose record has lost its canonical text is an `ERROR` in
+`status`, `diff`, `commit` and `apply`: either its blob under `v2/blobs/`,
+named, is missing or damaged, or the record names no canonical blob ("no
+canonical blob recorded"). The line gives the remedy, `mox apply
 --overwrite <path>`, which writes the owned keys again; apply leaves that
-file alone otherwise and goes on with the rest, and `mox doctor` lists it.
+file alone otherwise and goes on with the rest. `apply --overwrite`, with
+or without paths, says of each such file that its canonical text was
+missing and that it writes the owned keys from the source. `mox doctor`
+lists each one.
 
 A generation that cannot be read is skipped for the one before it, with a
 warning, and writes go on. `mox doctor` shows a current generation that

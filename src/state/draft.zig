@@ -155,22 +155,22 @@ pub const Draft = struct {
         };
         if (o.secret) return rec;
         const h = o.canonical_blob orelse {
-            rec.canonical_missing = d.store.blobs;
+            rec.canonical_missing = .unrecorded;
             return rec;
         };
         if (try blob.get(d.arena, d.io, d.store.blobs, h)) |bytes| {
             rec.canonical = bytes;
-        } else rec.canonical_missing = try blob.pathOf(d.arena, d.store.blobs, h);
+        } else rec.canonical_missing = .{ .blob = try blob.pathOf(d.arena, d.store.blobs, h) };
         return rec;
     }
 
-    /// Every live path whose owned record keeps no readable canonical text,
-    /// with where it should be.
+    /// Every owned record that keeps no readable canonical text, by its live
+    /// path, with why.
     pub fn missingCanonicals(d: *Draft) ![]const MissingCanonical {
         var out: std.ArrayList(MissingCanonical) = .empty;
         for (d.gen.paths.keys()) |k| {
             const rec = (try d.readOwned(k)) orelse continue;
-            if (rec.canonical_missing) |b| try out.append(d.arena, .{ .live = k, .blob = b });
+            if (rec.canonical_missing) |m| try out.append(d.arena, .{ .key = k, .missing = m });
         }
         return out.items;
     }
@@ -723,7 +723,7 @@ pub const Draft = struct {
     }
 };
 
-pub const MissingCanonical = struct { live: []const u8, blob: []const u8 };
+pub const MissingCanonical = struct { key: []const u8, missing: applied.CanonicalMissing };
 
 /// A file in quarantine, and for a journal what it displaced: a file's
 /// blob path, a link's target.

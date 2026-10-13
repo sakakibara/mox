@@ -113,10 +113,16 @@ pub const OwnedRecord = struct {
     secret_paths: []const []const u8,
     /// The live path the record names.
     live_path: []const u8 = "",
-    /// Where the canonical text should be, when it is not secret but is
-    /// missing or no longer matches its hash: the record exists, and what
-    /// it recorded cannot be compared against.
-    canonical_missing: ?[]const u8 = null,
+    /// Why the canonical text cannot be read, when it is not secret: the
+    /// record exists, and what it recorded cannot be compared against.
+    canonical_missing: ?CanonicalMissing = null,
+};
+
+pub const CanonicalMissing = union(enum) {
+    /// The blob at this path is missing or no longer matches its hash.
+    blob: []const u8,
+    /// The record names no canonical blob.
+    unrecorded,
 };
 
 /// A symlink record: the target mox planted, and the part that planted it.

@@ -2564,12 +2564,17 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
     };
 
     var record = try st.readOwned(live_path);
-    if (record) |r| if (r.canonical_missing) |b| {
+    if (record) |r| if (r.canonical_missing) |m| {
         if (!in.force) {
-            try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, try owned_mod.canonicalMissingWhy(ctx.alloc, b, shown) });
+            try ctx.err.print("  ERROR   {s} ({s})\n", .{ shown, try owned_mod.canonicalMissingWhy(ctx.alloc, m, shown) });
             counts.fail += 1;
             return;
         }
+        const missing = switch (m) {
+            .blob => |path| try std.fmt.allocPrint(ctx.alloc, ", {s},", .{path}),
+            .unrecorded => " (no canonical blob recorded)",
+        };
+        try ctx.out.print("  {s}: its owned record's canonical text{s} was missing; {s} the owned keys from the source\n", .{ shown, missing, if (in.dry_run) "would write" else "writing" });
         record = null;
     };
     const record_paths: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.own_paths) else &.{};

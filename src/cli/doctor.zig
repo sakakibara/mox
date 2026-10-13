@@ -240,8 +240,8 @@ fn doctorOpened(ctx: *app.Ctx, opened: state_cli.Opened, fix: bool, rebuild_prov
     // it is written again.
     const missing = try st.missingCanonicals();
     for (missing) |m| {
-        const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(m.live, context.paths.home)});
-        try ctx.out.print("  missing-canonical {s} ({s})\n", .{ shown, try mox.apply.owned.canonicalMissingWhy(ctx.alloc, m.blob, shown) });
+        const shown = try std.fmt.allocPrint(ctx.alloc, "{f}", .{display.of(m.key, context.paths.home)});
+        try ctx.out.print("  missing-canonical {s} ({s})\n", .{ shown, try mox.apply.owned.canonicalMissingWhy(ctx.alloc, m.missing, shown) });
     }
 
     const other_problems = missing.len + try stateRows(ctx, st, opened.report, fix);

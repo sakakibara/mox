@@ -938,3 +938,40 @@ test "ids: mv's trash sorts after the id current names, though that generation's
     try std.testing.expectEqual(@as(usize, 1), trash.len);
     try std.testing.expect(mox.state.id.older({}, named, trash[0]));
 }
+
+const editCurrent = testutil.editCurrent;
+
+test "state: an owned record naming no canonical blob says so, doctor lists it, and --overwrite says it wrote it again" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 1\n");
+    try writeRepo(io, &tmp, "home/app.toml", "[a]\nk = 0\n\n[b]\nx = 1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const live = try h.liveOf("app.toml");
+    try editCurrent(h, struct {
+        fn unrecord(_: std.mem.Allocator, g: *mox.state.generation.Generation, p: []const u8) !void {
+            g.paths.getPtr(p).?.owned.?.canonical_blob = null;
+        }
+    }.unrecord, live);
+
+    const s = try h.run(&.{ "mox", "status" });
+    const said = try std.mem.concat(a, u8, &.{ s.out, s.err });
+    try std.testing.expect(contains(said, "no canonical blob recorded"));
+    try std.testing.expect(!contains(said, try std.fmt.allocPrint(a, "{s},", .{try statePath(h, &.{ "v2", "blobs" })})));
+
+    const doc = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(contains(doc.out, "missing-canonical ~/app.toml"));
+
+    try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 2\n");
+    const fixed = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), fixed.rc);
+    try std.testing.expect(contains(fixed.out, "canonical text (no canonical blob recorded) was missing; writing the owned keys"));
+    try std.testing.expect(contains(try read(io, a, live), "k = 2"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
