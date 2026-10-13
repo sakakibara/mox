@@ -17,6 +17,7 @@
 const std = @import("std");
 const cli = @import("cli");
 const app = @import("app.zig");
+const state_cli = @import("state.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
 const apply_cmd = @import("apply.zig");
@@ -112,6 +113,8 @@ fn resolveArg(ctx: *app.Ctx, home: []const u8, cwd: ?[]const u8, name: []const u
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox export")) return 2;
     if (try apply_cmd.privateRefusal(ctx, "mox export")) return 2;
+    // It reads the private expectation, so a state mox cannot use refuses first.
+    _ = (try state_cli.open(ctx, .{ .writes = false, .locked = false })) orelse return 2;
     const context = ctx.context.?;
     const out_dir = (try resolveArg(ctx, context.paths.home, context.cwd, a.out)) orelse return 2;
     const facts_arg: ?[]const u8 = if (a.facts) |f|

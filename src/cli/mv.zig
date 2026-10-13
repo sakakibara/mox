@@ -9,6 +9,7 @@ const std = @import("std");
 const cli = @import("cli");
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
+const state_cli = @import("state.zig");
 const lock_mod = @import("lock.zig");
 const edit = @import("edit.zig");
 const fileops = @import("fileops.zig");
@@ -31,6 +32,8 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     const lk = (try lock_mod.acquireForCommand(ctx, "mv")) orelse return 1;
     defer lk.release();
+    // It reads the private expectation, so a state mox cannot use refuses first.
+    _ = (try state_cli.open(ctx, .{ .writes = false, .locked = true })) orelse return 2;
 
     const old_live = edit.liveTarget(ctx.alloc, context.paths.home, context.cwd, old_name) catch |e| switch (e) {
         error.OutOfMemory => return e,

@@ -104,6 +104,34 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
     return .{ .ready = .{ .draft = d, .report = report } };
 }
 
+/// The displaced history under a state directory: the store.
+pub const History = struct {
+    path: []const u8,
+    present: bool,
+};
+
+pub fn history(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !History {
+    const path = try std.fs.path.join(arena, &.{ state_dir, draft.store_dir_name });
+    return .{ .path = path, .present = exists(io, path) };
+}
+
+/// True when `name`, a top-level entry of a state directory, holds the
+/// displaced history.
+pub fn isHistory(name: []const u8) bool {
+    return std.mem.eql(u8, name, draft.store_dir_name);
+}
+
+pub const Deleted = struct { path: []const u8, err: ?anyerror = null };
+
+/// Delete the history, `v2/`, whatever state it is in: no generation needs
+/// to be readable.
+pub fn purgeHistory(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !?Deleted {
+    const h = try history(arena, io, state_dir);
+    if (!h.present) return null;
+    Io.Dir.cwd().deleteTree(io, h.path) catch |e| return .{ .path = h.path, .err = e };
+    return .{ .path = h.path };
+}
+
 /// Move every generation file that does not parse into `quarantine/`.
 pub fn quarantineUnreadable(arena: std.mem.Allocator, io: Io, store: Store, report: *recovery.Report) !void {
     const inv = try retention.inventory(arena, io, store);

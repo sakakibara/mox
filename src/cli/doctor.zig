@@ -756,33 +756,22 @@ fn stateRows(ctx: *app.Ctx, st: *mox.state.Draft, report: mox.state.recovery.Rep
     const inv = try mox.state.retention.inventory(ctx.alloc, ctx.io, st.store);
     for (inv.gens) |l| if (l.gen.kind == .recovered) try ctx.out.print("  recovered {s} (a run that did not finish, folded from its journal)\n", .{l.id});
     for (inv.unreadable) |gid| {
-        const path = try st.store.genPath(ctx.alloc, gid);
+        const path = try st.generationPath(gid);
         if (fix) {
-            var r: mox.state.recovery.Report = .{};
-            try mox.state.recovery.quarantine(ctx.alloc, ctx.io, st.store, path, &r);
-            for (r.quarantined.items) |q| try ctx.out.print("  moved {s} to quarantine: {s}\n", .{ path, q });
+            try ctx.out.print("  moved {s} to quarantine: {s}\n", .{ path, try st.quarantineGeneration(gid) });
         } else {
             problems += 1;
             try ctx.out.print("  bad-generation {s} (does not parse; --fix moves it to quarantine)\n", .{path});
         }
     }
     for (report.quarantined.items) |q| try ctx.out.print("  moved to quarantine: {s}\n", .{q});
-    for (try mox.source.dirent.sortedPath(ctx.alloc, ctx.io, st.store.quarantine, .{ .iterate = true })) |e| {
-        const path = try std.fs.path.join(ctx.alloc, &.{ st.store.quarantine, e.name });
-        try ctx.out.print("  quarantined {s}\n", .{path});
-        if (!std.mem.endsWith(u8, e.name, ".jsonl")) continue;
-        const bytes = Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.alloc, .limited(max_state_bytes)) catch continue;
-        const j = (try mox.state.journal.parse(ctx.alloc, bytes)) orelse continue;
-        for (j.ops) |op| {
-            if (op.map != .displaced) continue;
-            const v = op.value orelse continue;
-            const d = mox.state.generation.parseFlatDisplaced(ctx.alloc, v) catch continue;
-            switch (d.type) {
-                .file => try ctx.out.print("    displaced {s} file {s}\n", .{ op.key, try st.blobPath(d.blob orelse continue) }),
-                .link => try ctx.out.print("    displaced {s} link -> {s}\n", .{ op.key, d.target orelse "" }),
-                .dir => try ctx.out.print("    displaced {s} dir\n", .{op.key}),
-            }
-        }
+    for (try st.quarantined()) |q| {
+        try ctx.out.print("  quarantined {s}\n", .{q.path});
+        for (q.displaced) |d| switch (d.type) {
+            .file => try ctx.out.print("    displaced {s} file {s}\n", .{ d.key, d.where }),
+            .link => try ctx.out.print("    displaced {s} link -> {s}\n", .{ d.key, d.where }),
+            .dir => try ctx.out.print("    displaced {s} dir\n", .{d.key}),
+        };
     }
     return problems;
 }
@@ -977,7 +966,7 @@ test "findMalformedProvenance: a blob that does not parse, and one that is missi
     const a = arena.allocator();
     const st = try mox.state.draft.testDraft(a, io, try tmpAbs(a, io, &tmp, "state"));
     try st.record("/h/a", "a\n", null);
-    try st.persistProvenanceBlob("/h/a", try mox.state.blob.put(a, io, st.store.blobs, "{ not valid json"));
+    try st.persistProvenanceBlob("/h/a", try st.putBlob("{ not valid json"));
     try st.persistProvenanceBlob("/h/gone", mox.apply.applied.contentHashHex("never stored"));
     try st.persistProvenance("/h/ok", &.{});
     const bad = try findMalformedProvenance(a, st);

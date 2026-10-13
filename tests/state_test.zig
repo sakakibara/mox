@@ -611,7 +611,7 @@ test "doctor: a provenance rebuild of a secret-bearing composition nulls the con
     try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".envrc")).?.file.?.cache == null);
 }
 
-test "allowlist: no file outside src/state/ names a path of the state store" {
+test "allowlist: no file outside src/state/ names a path of the state store or reaches into it" {
     // A string literal equal to a store name is a path into the store, unless
     // listed here as a use that is not one.
     const io = std.testing.io;
@@ -634,6 +634,13 @@ test "allowlist: no file outside src/state/ names a path of the state store" {
         if (std.mem.startsWith(u8, rel, "state/")) continue;
         const file = try std.fmt.allocPrint(a, "src/{s}", .{rel});
         const text = try entry.dir.readFileAlloc(io, entry.basename, a, .limited(16 * 1024 * 1024));
+        // The store's own paths and directory name are the state API's.
+        const store_fields = std.mem.count(u8, text, ".store.") - std.mem.count(u8, text, "coupling.store.");
+        const store_name = std.mem.count(u8, text, "store_dir_name");
+        if (store_fields + store_name > 0) {
+            std.debug.print("\n{s}: reaches into the state store {d} times\n", .{ file, store_fields + store_name });
+            bad = true;
+        }
         for (names) |n| {
             const quoted = try std.fmt.allocPrint(a, "\"{s}\"", .{n});
             const count = std.mem.count(u8, text, quoted);
@@ -648,4 +655,44 @@ test "allowlist: no file outside src/state/ names a path of the state store" {
         }
     }
     try std.testing.expect(!bad);
+}
+
+test "uninstall: --purge-snapshots deletes the history of a state with no readable generation" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "state/v2/current", "not an id\n");
+    const kept = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 2), kept.rc);
+    try std.testing.expect(exists(io, try statePath(h, &.{"v2"})));
+    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
+}
+
+test "state: mv and export run the start checks, refusing a state a newer mox wrote" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "x\n");
+    try writeRepo(io, &tmp, "state/v2/current", "20260101T000000Z\n");
+    try writeRepo(io, &tmp, "state/v2/gen/20260101T000000Z.json", "{\"v\":3}");
+    const mv = try h.run(&.{ "mox", "mv", ".zshrc", ".zshrc2" });
+    try std.testing.expectEqual(@as(u8, 2), mv.rc);
+    try std.testing.expect(contains(mv.err, "state written by a newer mox (v3)"));
+    try std.testing.expect(exists(io, try h.srcOf(".zshrc")));
+    const out = try std.fs.path.join(a, &.{ h.root, "export-out" });
+    const ex = try h.run(&.{ "mox", "export", out });
+    try std.testing.expectEqual(@as(u8, 2), ex.rc);
+    try std.testing.expect(contains(ex.err, "state written by a newer mox (v3)"));
 }

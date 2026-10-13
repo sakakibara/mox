@@ -22,16 +22,17 @@ const Io = std.Io;
 const lock_name = mox.state.lock.lock_name;
 const max_prompt_attempts = 100;
 
-pub const Action = enum { remove, preserve, prompt };
+pub const Action = enum { remove, preserve, prompt, history };
 
 /// Decide what to do with a top-level entry of the state dir. The private
-/// layer is preserved unless `--purge-private`; the history in `v2/` and
-/// trash are prompted (they hold the user's recoverable originals); the lock file is left to the lock's own
+/// layer is preserved unless `--purge-private`; trash and the history
+/// (`v2/`) are asked about, since they hold the user's recoverable
+/// originals; the lock file is left to the lock's own
 /// release; everything else is removed.
 pub fn actionFor(name: []const u8, purge_private: bool) Action {
     if (std.mem.eql(u8, name, lock_name)) return .preserve;
     if (std.mem.eql(u8, name, "trash")) return .prompt;
-    if (std.mem.eql(u8, name, mox.state.draft.store_dir_name)) return .prompt;
+    if (mox.state.isHistory(name)) return .history;
     if (std.mem.eql(u8, name, "private")) return if (purge_private) .remove else .preserve;
     return .remove;
 }
@@ -57,53 +58,52 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         else => return e,
     };
     dir.close(ctx.io);
-    const st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = true, .locked = true })) orelse return 2;
+
+    // The history is asked about first, since deleting it needs no readable
+    // generation and keeping it needs one to forget the records in.
+    const history = try mox.state.history(ctx.alloc, ctx.io, context.paths.state_dir);
+    const purge_history = history.present and (a.purge_snapshots or (tty.isInteractive(0) and try confirmHistory(ctx, history)));
+    const st = (try state_cli.open(ctx, .{ .run_kind = .uninstall, .writes = !purge_history, .locked = true })) orelse return 2;
 
     // Sorted so kept/removed lines print in the same order on every machine.
     dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true, .follow_symlinks = false });
     const entries = try dirent.sorted(ctx.alloc, ctx.io, dir);
     dir.close(ctx.io);
-    var names: std.ArrayList([]const u8) = .empty;
-    for (entries) |e| try names.append(ctx.alloc, e.name);
 
     var removed: usize = 0;
-    var prompt_names: std.ArrayList([]const u8) = .empty;
-
-    for (names.items) |name| {
-        const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, name });
-        switch (actionFor(name, purge_private)) {
+    var trash_seen = false;
+    for (entries) |e| {
+        const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, e.name });
+        switch (actionFor(e.name, purge_private)) {
             .preserve => try ctx.out.print("  kept {f}\n", .{display.of(path, ctx.context.?.paths.home)}),
-            .prompt => try prompt_names.append(ctx.alloc, name),
+            .history => {},
+            .prompt => trash_seen = true,
             .remove => try removeEntry(ctx, path, &removed),
         }
     }
 
-    // Recoverable entries (the history, trash): delete only if the matching
-    // --purge flag is set or an interactive user confirms; otherwise keep.
-    var history_kept = false;
-    var history_asked = false;
-    var purge_history = false;
-    for (prompt_names.items) |name| {
-        const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, name });
-        const is_trash = std.mem.eql(u8, name, "trash");
-        const do_delete = if (is_trash)
-            a.purge_trash or (tty.isInteractive(0) and try confirm(ctx, name, path))
-        else blk: {
-            if (!history_asked) {
-                history_asked = true;
-                purge_history = a.purge_snapshots or (tty.isInteractive(0) and try confirm(ctx, "snapshots", st.store.v2));
-            }
-            break :blk purge_history;
-        };
-        if (do_delete) {
+    // Trash holds recoverable originals: deleted only on --purge-trash or
+    // an interactive yes.
+    if (trash_seen) {
+        const path = try std.fs.path.join(ctx.alloc, &.{ context.paths.state_dir, "trash" });
+        if (a.purge_trash or (tty.isInteractive(0) and try confirm(ctx, "trash", path))) {
             try removeEntry(ctx, path, &removed);
-        } else {
-            if (!is_trash) history_kept = true;
-            try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-{s})\n", .{ display.of(path, ctx.context.?.paths.home), if (is_trash) "trash" else "snapshots" });
-        }
+        } else try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-trash)\n", .{display.of(path, ctx.context.?.paths.home)});
     }
 
-    if (history_kept and !try forgetRecords(ctx, st)) return 2;
+    if (purge_history) {
+        if (try mox.state.purgeHistory(ctx.alloc, ctx.io, context.paths.state_dir)) |r| {
+            if (r.err) |err| {
+                try ctx.err.print("  kept {f} (delete failed: {s})\n", .{ display.of(r.path, context.paths.home), @errorName(err) });
+            } else {
+                removed += 1;
+                try ctx.out.print("  removed {f}\n", .{display.of(r.path, context.paths.home)});
+            }
+        }
+    } else if (history.present) {
+        try ctx.out.print("  kept {f} (preserved; delete manually or re-run with --purge-snapshots)\n", .{display.of(history.path, ctx.context.?.paths.home)});
+        if (!try forgetRecords(ctx, st)) return 2;
+    }
 
     try ctx.out.print("mox uninstall: removed {d} state entr(ies); source repo untouched\n", .{removed});
     return 0;
@@ -115,7 +115,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 fn forgetRecords(ctx: *app.Ctx, st: *mox.state.Draft) !bool {
     try st.forgetEverything();
     if (!try state_cli.commit(ctx, st, .{ .skip_gc = true })) return false;
-    try mox.state.retention.stripRecords(ctx.alloc, ctx.io, st.store);
+    try st.stripHistory();
     return true;
 }
 
@@ -138,16 +138,25 @@ fn deleteEntry(io: Io, path: []const u8) !void {
     };
 }
 
+/// Ask once whether to delete the history.
+fn confirmHistory(ctx: *app.Ctx, h: mox.state.History) !bool {
+    return confirmText(ctx, try std.fmt.allocPrint(ctx.alloc, "Delete the snapshot history at {f}? [y/N] ", .{display.of(h.path, ctx.context.?.paths.home)}));
+}
+
 /// Prompt `[y/N]` for deleting a preserved entry, with a hard re-ask bound so
 /// unparsable input cannot spin. Empty input / EOF defaults to No (keep).
 fn confirm(ctx: *app.Ctx, name: []const u8, path: []const u8) !bool {
+    return confirmText(ctx, try std.fmt.allocPrint(ctx.alloc, "Delete {s} at {f}? [y/N] ", .{ name, display.of(path, ctx.context.?.paths.home) }));
+}
+
+fn confirmText(ctx: *app.Ctx, question: []const u8) !bool {
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), ctx.io, &stdin_buf);
     const input: *Io.Reader = &stdin_reader.interface;
 
     var attempts: usize = 0;
     while (attempts < max_prompt_attempts) : (attempts += 1) {
-        try ctx.out.print("Delete {s} at {f}? [y/N] ", .{ name, display.of(path, ctx.context.?.paths.home) });
+        try ctx.out.writeAll(question);
         try ctx.out.flush();
         const line = (try input.takeDelimiter('\n')) orelse return false;
         const t = std.mem.trim(u8, line, " \t\r");
@@ -178,6 +187,9 @@ test "actionFor: private preserved by default, removed on purge; trash and the h
     try testing.expectEqual(Action.prompt, actionFor("trash", false));
     try testing.expectEqual(Action.preserve, actionFor(lock_name, false));
     try testing.expectEqual(Action.remove, actionFor("coupling", false));
-    // The history holds the pre-mox originals: prompt, never silently removed.
-    try testing.expectEqual(Action.prompt, actionFor(mox.state.draft.store_dir_name, false));
+    // The history holds the pre-mox originals: asked about, never silently
+    // removed.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectEqual(Action.history, actionFor(std.fs.path.basename((try mox.state.history(arena_state.allocator(), testing.io, "/nonexistent")).path), true));
 }

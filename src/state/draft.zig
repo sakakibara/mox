@@ -22,7 +22,6 @@ const Generation = generation.Generation;
 pub const Hex = generation.Hex;
 const PathEntry = generation.PathEntry;
 
-/// Where the store keeps everything, under `<state>/v2/`.
 /// The directory under the state directory that holds the store.
 pub const store_dir_name = "v2";
 
@@ -647,6 +646,62 @@ pub const Draft = struct {
         }
     }
 
+    /// Keep `bytes` as a blob, returning its name.
+    pub fn putBlob(d: *const Draft, bytes: []const u8) !Hex {
+        return blob.put(d.arena, d.io, d.store.blobs, bytes);
+    }
+
+    /// Where files that could not be recovered or read are kept.
+    pub fn quarantineDir(d: *const Draft) []const u8 {
+        return d.store.quarantine;
+    }
+
+    /// Where generation `gen_id` is kept.
+    pub fn generationPath(d: *const Draft, gen_id: []const u8) ![]const u8 {
+        return d.store.genPath(d.arena, gen_id);
+    }
+
+    /// Move generation `gen_id`, one that cannot be read, into quarantine;
+    /// returns where it went.
+    pub fn quarantineGeneration(d: *const Draft, gen_id: []const u8) ![]const u8 {
+        const recovery = @import("recovery.zig");
+        var r: recovery.Report = .{};
+        try recovery.quarantine(d.arena, d.io, d.store, try d.store.genPath(d.arena, gen_id), &r);
+        return r.quarantined.items[0];
+    }
+
+    /// Every file in quarantine, oldest name first, with what a quarantined
+    /// journal displaced.
+    pub fn quarantined(d: *const Draft) ![]const Quarantined {
+        var out: std.ArrayList(Quarantined) = .empty;
+        for (try @import("../source/dirent.zig").sortedPath(d.arena, d.io, d.store.quarantine, .{ .iterate = true })) |e| {
+            const path = try std.fs.path.join(d.arena, &.{ d.store.quarantine, e.name });
+            var entries: std.ArrayList(QuarantinedEntry) = .empty;
+            if (std.mem.endsWith(u8, e.name, ".jsonl")) parsed: {
+                const bytes = Io.Dir.cwd().readFileAlloc(d.io, path, d.arena, .limited(256 * 1024 * 1024)) catch break :parsed;
+                const j = (try journal.parse(d.arena, bytes)) orelse break :parsed;
+                for (j.ops) |op| {
+                    if (op.map != .displaced) continue;
+                    const v = op.value orelse continue;
+                    const x = generation.parseFlatDisplaced(d.arena, v) catch continue;
+                    try entries.append(d.arena, .{ .key = op.key, .type = x.type, .where = switch (x.type) {
+                        .file => try blob.pathOf(d.arena, d.store.blobs, x.blob orelse continue),
+                        .link => x.target orelse "",
+                        .dir => "",
+                    } });
+                }
+            }
+            try out.append(d.arena, .{ .path = path, .displaced = entries.items });
+        }
+        return out.items;
+    }
+
+    /// Strip every retained generation down to its displaced history, then
+    /// collect the blobs only the records named.
+    pub fn stripHistory(d: *const Draft) !void {
+        return @import("retention.zig").stripRecords(d.arena, d.io, d.store);
+    }
+
     pub fn readBlob(d: *const Draft, h: Hex) !?[]const u8 {
         return blob.get(d.arena, d.io, d.store.blobs, h);
     }
@@ -684,6 +739,11 @@ pub const Draft = struct {
 };
 
 pub const MissingCanonical = struct { live: []const u8, blob: []const u8 };
+
+/// A file in quarantine, and for a journal what it displaced: a file's
+/// blob path, a link's target.
+pub const Quarantined = struct { path: []const u8, displaced: []const QuarantinedEntry };
+pub const QuarantinedEntry = struct { key: []const u8, type: generation.EntryType, where: []const u8 };
 
 /// A writable draft over an empty store at `state_dir`, for unit tests.
 pub fn testDraft(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !*Draft {

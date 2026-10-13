@@ -7944,6 +7944,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/state/recovery.zig", "writeGeneration", 1 },
         .{ "src/state/retention.zig", "afterCommit", 1 },
         .{ "src/state/retention.zig", "collect", 1 },
+        .{ "src/state/root.zig", "purgeHistory", 1 },
         .{ "src/trigger/state.zig", "save", 2 },
         .{ "src/trigger/state.zig", "settlePending", 2 },
     };
