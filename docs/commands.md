@@ -737,31 +737,39 @@ Show a unified diff of the composed output against each live file (`--stat`
 for a per-file added/removed summary). A partially owned file diffs its
 canonical owned content only, with secret-bearing keys masked on both sides.
 A resolved secret is never printed: a hunk touching a secret line on either
-side is masked, and a live file whose source resolves a secret, or whose
-record was written for one, while the provenance that masks its live side is
-missing, is not shown; stderr says so, and `mox doctor --rebuild-provenance`
-records the provenance again. A live line is masked when it is one the last
-apply wrote from a secret, wherever it now sits: apply records a keyed
-digest of each such line (the key is `v2/secret-lines.key`, 0600; the value
-is never kept), and diff masks no live line by its position. A live file
-that may hold a secret whose provenance names no such lines is not shown
-either; stderr says so, and that `mox apply` records what diff needs. A file
-whose source left the tree, which apply would remove, shows its live content
-on the removed side, and such a symlink the line `symlink -> <target>`, as
-does an unedited file of a generator that left the tree; a file that does
-not parse in its format is an `ERROR` line on stderr, as apply reports it.
-Read-only: it takes no writer lock, only the readers lock. A difference is
-not an error, so a run that completes exits 0 whether or not anything
-differs. An `attributes.toml`, the repo's or the private layer's, that is
-not valid TOML or cannot be read stops the run with exit 2, as it does in
-every command that reads attributes (add, apply, commit, doctor, edit,
-export, facts, mv, remove and status); rollback warns instead. A refusal
-exits 1: a path that is not managed, a head ownership declaration that does
-not parse, and an attributes entry that breaks the schema, with or without a
-source. A file's own `ERROR` that does not come from an attributes file -- a
-head directive on an unstructured target, one spelled with another file's
-comment marker, a mox directive in strict JSON, or a layer or output that
-does not parse -- is reported and the run still exits 0.
+side is masked, and a live line is masked when it holds a secret value,
+wherever it sits and whatever was edited around the value. Apply records, in
+the file's provenance, keyed digests of short windows of each secret value
+it resolved (every 8-byte window of each line of the value, or the whole
+line when it is shorter; a line under 4 bytes is not looked for), and never
+the value; the key is `v2/secret-lines.key`, 0600. Diff looks for those
+windows, and for the windows of the secret values its own render resolves,
+which it digests in memory and never stores. A live file that may hold a
+resolved secret (its source resolves one, its record was written for one,
+or its provenance names one) is not shown when neither source can say which
+values it holds: its provenance is missing, records no windows, or records
+them under another key, and this render does not reproduce what the last
+apply wrote. stderr says so, and that `mox apply` records what diff needs,
+or, for a file with edits, `mox apply --overwrite <path>`, which writes it
+again and keeps the edits in a snapshot. A `v2/secret-lines.key` that exists
+but cannot be read, or is not a 32-byte key, stops every command that reads
+the state with a message naming it; mox makes a new key only where none
+exists. A file whose source left the tree, which apply would remove, shows
+its live content on the removed side, and such a symlink the line `symlink
+-> <target>`, as does an unedited file of a generator that left the tree; a
+file that does not parse in its format is an `ERROR` line on stderr, as
+apply reports it. Read-only: it takes no writer lock, only the readers lock.
+A difference is not an error, so a run that completes exits 0 whether or not
+anything differs. An `attributes.toml`, the repo's or the private layer's,
+that is not valid TOML or cannot be read stops the run with exit 2, as it
+does in every command that reads attributes (add, apply, commit, doctor,
+edit, export, facts, mv, remove and status); rollback warns instead. A
+refusal exits 1: a path that is not managed, a head ownership declaration
+that does not parse, and an attributes entry that breaks the schema, with or
+without a source. A file's own `ERROR` that does not come from an attributes
+file -- a head directive on an unstructured target, one spelled with another
+file's comment marker, a mox directive in strict JSON, or a layer or output
+that does not parse -- is reported and the run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |

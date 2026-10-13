@@ -261,11 +261,11 @@ pub const verbatim = struct {
     }
 }{};
 
-/// Provenance bytes as they read without their secret-line digests, which
+/// Provenance bytes as they read without their secret-value digests, which
 /// depend on this state's key.
 fn withoutDigests(arena: std.mem.Allocator, bytes: ?[]const u8) !?[]const u8 {
     const b = bytes orelse return null;
     const m = prov_map.deserialize(arena, b) catch return b;
-    if (m.secret_lines == null) return b;
+    if (m.secret_windows == null) return b;
     return try prov_map.serialize(arena, m.live_path, m.segments, null);
 }

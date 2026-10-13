@@ -23,6 +23,15 @@ pub const Cache = struct {
     pub fn get(self: *const Cache, uri_str: []const u8) ?[]const u8 {
         return self.map.get(uri_str);
     }
+
+    /// Every value resolved so far.
+    pub fn values(self: *const Cache, arena: std.mem.Allocator) ![]const []const u8 {
+        const out = try arena.alloc([]const u8, self.map.count());
+        var it = self.map.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |v| : (i += 1) out[i] = v.*;
+        return out;
+    }
 };
 
 test "Cache: put then get" {

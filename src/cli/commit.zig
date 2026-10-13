@@ -1215,6 +1215,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
+    st.secrets = &secret_cache;
 
     const src_dir = try std.fs.path.join(ctx.alloc, &.{ context.paths.repo_dir, "src" });
     var walk_diag: mox.source.tree.Diag = .{};
@@ -2385,7 +2386,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         }
         try st.record(gc.leaf_live_path, r.live, gc.gen_file.source_base_path);
         if (!r.secret) try st.recordContent(gc.leaf_live_path, r.live);
-        try st.persistProvenance(gc.leaf_live_path, r.live, r.prov);
+        try st.persistProvenance(gc.leaf_live_path, r.prov);
         try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2430,7 +2431,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
                     if (!mox.provenance.map.hasSecret(r.prov)) {
                         try st.recordContent(file.live_path, r.live);
                     }
-                    try st.persistProvenance(file.live_path, r.live, r.prov);
+                    try st.persistProvenance(file.live_path, r.prov);
                 }
                 try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                 committed_count += 1;

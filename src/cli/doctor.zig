@@ -799,6 +799,7 @@ fn rebuildProvenance(ctx: *app.Ctx, st: *mox.state.Draft, src_dir: []const u8) !
     const bindings: mox.dsl.resolver.Resolver = .{ .live = &live_ctx };
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
+    st.secrets = &secret_cache;
 
     const base_tree = mox.source.tree.walk(ctx.alloc, ctx.io, src_dir, m_state.home) catch return 0;
     const tree = (try apply_cmd.mergePrivate(ctx, "mox doctor", base_tree)) orelse return null;
@@ -971,7 +972,7 @@ test "findMalformedProvenance: a blob that does not parse, and one that is missi
     try st.record("/h/a", "a\n", null);
     try st.persistProvenanceBlob("/h/a", try st.putBlob("{ not valid json"));
     try st.persistProvenanceBlob("/h/gone", mox.apply.applied.contentHashHex("never stored"));
-    try st.persistProvenance("/h/ok", "", &.{});
+    try st.persistProvenance("/h/ok", &.{});
     const bad = try findMalformedProvenance(a, st);
     try testing.expectEqual(@as(usize, 2), bad.len);
 }

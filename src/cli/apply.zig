@@ -292,6 +292,7 @@ fn applyPass(
 
     var secret_cache = mox.secret.cache.Cache.init(ctx.alloc);
     const secrets: mox.compose.catB.SecretCtx = .{ .env = context.env, .cache = &secret_cache };
+    st.secrets = &secret_cache;
 
     // Setup scripts inherit mox's environment plus MOX_REPO/MOX_STATE_DIR/
     // MOX_HOME and every fact as MOX_FACT_<UPPERCASE_NAME>, so a bootstrap
@@ -2291,7 +2292,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
                 if (!contains_secret) {
                     try st.recordContent(in.live_path, in.bytes);
                 }
-                try st.persistProvenance(in.live_path, in.bytes, in.prov_items);
+                try st.persistProvenance(in.live_path, in.prov_items);
             }
             try ctx.out.print("  unchanged {s}\n", .{shown});
             return;
@@ -2335,7 +2336,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
         if (!contains_secret) {
             try st.recordContent(in.live_path, in.bytes);
         }
-        try st.persistProvenance(in.live_path, in.bytes, in.prov_items);
+        try st.persistProvenance(in.live_path, in.prov_items);
     }
     counts.ok += 1;
     try ctx.out.print("  {s} {s}\n", .{ if (in.create_once) "seeded" else "wrote", shown });

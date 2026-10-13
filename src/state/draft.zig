@@ -17,6 +17,7 @@ const id_mod = @import("id.zig");
 const durable = @import("durable.zig");
 const lock = @import("lock.zig");
 const write_mod = @import("../apply/write.zig");
+const secret_cache = @import("../secret/cache.zig");
 
 const Generation = generation.Generation;
 pub const Hex = generation.Hex;
@@ -25,15 +26,33 @@ const PathEntry = generation.PathEntry;
 /// The directory under the state directory that holds the store.
 pub const store_dir_name = "v2";
 
-/// The key secret-line digests are made with: 32 random bytes, 0600,
-/// created by the first run that records a secret line.
+/// The key secret-value digests are made with: 32 random bytes, 0600,
+/// created by the first run that records a secret value.
 pub const secret_key_name = "secret-lines.key";
 
-/// The key at `store`, when there is one of the right length.
-pub fn readSecretKey(arena: std.mem.Allocator, io: Io, store: Store) ?[prov_map.key_len]u8 {
-    const bytes = Io.Dir.cwd().readFileAlloc(io, store.secret_key, arena, .limited(prov_map.key_len + 1)) catch return null;
-    if (bytes.len != prov_map.key_len) return null;
+pub const KeyError = error{ SecretKeyUnreadable, SecretKeyMalformed, OutOfMemory };
+
+/// The key at `store`, or null when there is none. Any other failure to
+/// read it is an error: a key is made only where none exists.
+pub fn readSecretKey(arena: std.mem.Allocator, io: Io, store: Store) KeyError!?[prov_map.key_len]u8 {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, store.secret_key, arena, .limited(prov_map.key_len + 1)) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.SecretKeyMalformed,
+        else => return error.SecretKeyUnreadable,
+    };
+    if (bytes.len != prov_map.key_len) return error.SecretKeyMalformed;
     return bytes[0..prov_map.key_len].*;
+}
+
+/// Why the key at `store` cannot be used, or null when it can or is absent.
+pub fn secretKeyProblemAt(arena: std.mem.Allocator, io: Io, store: Store) !?[]const u8 {
+    const why = if (readSecretKey(arena, io, store)) |_| return null else |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SecretKeyMalformed => "it is not a 32-byte key",
+        error.SecretKeyUnreadable => "it cannot be read",
+    };
+    return try std.fmt.allocPrint(arena, "{s}: {s}; it is the key diff masks secret values with, so mox never replaces it: make it readable by this user, or move it aside so the next apply makes a new one\n", .{ store.secret_key, why });
 }
 
 pub const Store = struct {
@@ -122,8 +141,11 @@ pub const Draft = struct {
     run_id: ?[]const u8 = null,
     changed: bool = false,
     committed: bool = false,
-    /// The secret-line key, once read or made.
+    /// The secret-value key, once read or made.
     secret_key: ?[prov_map.key_len]u8 = null,
+    /// The secret values this run resolved, which a provenance with a
+    /// secret segment records the digests of.
+    secrets: ?*const secret_cache.Cache = null,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
     /// What a step that waits for the readers says first.
@@ -381,26 +403,24 @@ pub const Draft = struct {
         try d.setPath(live, e);
     }
 
-    /// Keep `segments` as where each line of `content`, the bytes written to
-    /// `live`, came from, with the digests of its secret lines.
-    pub fn persistProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) !void {
-        const h = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, content, segments));
+    /// Keep `segments` as where each line of the bytes written to `live`
+    /// came from, with the digests of the secret values this run
+    /// resolved when a segment is a secret.
+    pub fn persistProvenance(d: *Draft, live: []const u8, segments: []const prov_map.Segment) !void {
+        const h = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, segments));
         try d.persistProvenanceBlob(live, h);
     }
 
-    fn serializeProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) ![]u8 {
+    fn serializeProvenance(d: *Draft, live: []const u8, segments: []const prov_map.Segment) ![]u8 {
         if (!prov_map.hasSecret(segments)) return prov_map.serialize(d.arena, live, segments, null);
+        const values = (d.secrets orelse return error.SecretValuesUnknown).values(d.arena);
         const key = try d.makeSecretKey();
-        return prov_map.serialize(d.arena, live, segments, try prov_map.secretLinesOf(d.arena, &key, content, segments));
+        return prov_map.serialize(d.arena, live, segments, try prov_map.windowsOf(d.arena, &key, try values, null));
     }
 
-    /// The secret-line key, made when there is none.
+    /// The secret-value key, made when there is none.
     fn makeSecretKey(d: *Draft) ![prov_map.key_len]u8 {
-        if (d.secret_key) |k| return k;
-        if (readSecretKey(d.arena, d.io, d.store)) |k| {
-            d.secret_key = k;
-            return k;
-        }
+        if (try d.secretKey()) |k| return k;
         var k: [prov_map.key_len]u8 = undefined;
         try d.io.randomSecure(&k);
         try durable.writeFile(d.io, d.store.secret_key, &k);
@@ -408,10 +428,15 @@ pub const Draft = struct {
         return k;
     }
 
-    /// The secret-line key, when there is one.
-    pub fn secretKey(d: *Draft) ?[prov_map.key_len]u8 {
-        if (d.secret_key == null) d.secret_key = readSecretKey(d.arena, d.io, d.store);
+    /// The secret-value key, when there is one.
+    pub fn secretKey(d: *Draft) KeyError!?[prov_map.key_len]u8 {
+        if (d.secret_key == null) d.secret_key = try readSecretKey(d.arena, d.io, d.store);
         return d.secret_key;
+    }
+
+    /// Why this state's secret-value key cannot be used, if it cannot.
+    pub fn secretKeyProblem(d: *Draft) !?[]const u8 {
+        return secretKeyProblemAt(d.arena, d.io, d.store);
     }
 
     pub fn persistProvenanceBlob(d: *Draft, live: []const u8, h: Hex) !void {
@@ -432,7 +457,7 @@ pub const Draft = struct {
         var e = d.entry(live) orelse return;
         if (e.kind != .file) return;
         e.file.?.cache_blob = if (secret) null else try blob.put(d.arena, d.io, d.store.blobs, content);
-        e.file.?.provenance_blob = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, content, segments));
+        e.file.?.provenance_blob = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, segments));
         try d.setPath(live, e);
         try d.clearResidue(live);
     }

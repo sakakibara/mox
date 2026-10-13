@@ -57,11 +57,18 @@ All notable changes to mox are documented here. The format follows
   later one does, and `mox doctor` shows what waits for it. uninstall and
   `doctor --fix` wait for such a reader instead, saying so. See "The state
   directory" in commands.md.
-- `mox diff` masks a live line that came from a secret wherever the line
-  now sits: apply records a keyed digest of each such line, under a key
-  kept in `v2/secret-lines.key`, and never the value. A live file that may
-  hold a secret is not shown when its provenance is missing or names no
-  such lines; diff says so and that `mox apply` records what it needs.
+- `mox diff` masks a live line that holds a secret value wherever the line
+  now sits and however it was edited around the value: apply records keyed
+  digests of short windows of each secret value it resolved, under a key
+  kept in `v2/secret-lines.key`, and never the value, and diff also looks
+  for the values its own render resolves. A live file that may hold a
+  secret is not shown when neither says which values it holds -- its
+  provenance is missing, records none, or records them under another key,
+  and the current render does not reproduce what the last apply wrote; diff
+  says so and that `mox apply` (or `mox apply --overwrite <path>` for a file
+  with edits) records what it needs. A `secret-lines.key` that cannot be
+  read stops the command with a message naming it; mox makes a new key only
+  where none exists.
 - An owned target whose record lost its canonical text is an `ERROR` in
   `status`, `diff`, `commit` and `apply`, naming the missing blob, or "no
   canonical blob recorded", and the remedy `mox apply --overwrite <path>`,

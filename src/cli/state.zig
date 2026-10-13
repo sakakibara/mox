@@ -57,6 +57,10 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
         .ready => |r| {
             for (r.report.warnings.items) |w| try ctx.err.print("mox: warning: {s}\n", .{w});
             for (r.report.quarantined.items) |q| try ctx.err.print("mox: warning: a journal that could not be recovered was moved to {s}\n", .{q});
+            if (try r.draft.secretKeyProblem()) |why| {
+                try ctx.err.print("mox: {s}", .{why});
+                return null;
+            }
             if (o.writes and r.draft.exhausted) {
                 try ctx.err.print("mox: the state at {s} has no readable generation; run `mox doctor --fix`\n", .{context.paths.state_dir});
                 return null;

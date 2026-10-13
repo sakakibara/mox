@@ -404,7 +404,7 @@ test "recovery: a dead run's journal folds records, residue, generators, flags a
     const d = try f.draft("", null);
     try d.save(home, live, "old\n");
     try d.record(live, "new\n", "src/x");
-    try d.persistProvenance(live, "", &.{});
+    try d.persistProvenance(live, &.{});
     try d.setProduced("/g", &.{"/g/a"}, "src/g");
     try d.recordSymlink("/l", "/t", "src/l");
     try d.markTombstones(&.{"/gone"}, @import("../apply/stale.zig").foldCase);
