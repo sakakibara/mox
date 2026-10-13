@@ -176,6 +176,10 @@ pub fn build(b: *std.Build) void {
     });
     apply_tests_mod.addImport("mox", lib_mod);
     apply_tests_mod.addImport("json", json_mod);
+    // The source scans read src/ from the checkout, wherever the test runs.
+    const source_options = b.addOptions();
+    source_options.addOption([]const u8, "src_dir", b.pathFromRoot("src"));
+    apply_tests_mod.addOptions("source_options", source_options);
     const apply_tests = b.addTest(.{ .root_module = apply_tests_mod });
     test_step.dependOn(&b.addRunArtifact(apply_tests).step);
 

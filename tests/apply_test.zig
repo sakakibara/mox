@@ -7953,10 +7953,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/trigger/state.zig", "settlePending", 2 },
     };
 
-    var src = Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return e,
-    };
+    var src = try Io.Dir.cwd().openDir(io, @import("source_options").src_dir, .{ .iterate = true });
     defer src.close(io);
     var found = std.StringHashMap(usize).init(a);
     var walker = try src.walk(a);
@@ -8080,10 +8077,7 @@ test "apply: every test override is read only in a test build" {
         "brew_prefixes_override", "elevation_override", "admin_refresh_override", "stall_override",
         "stall_out_override",
     };
-    var src = Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return e,
-    };
+    var src = try Io.Dir.cwd().openDir(io, @import("source_options").src_dir, .{ .iterate = true });
     defer src.close(io);
     var bad = false;
     var walker = try src.walk(a);
