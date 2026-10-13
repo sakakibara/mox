@@ -25,9 +25,10 @@ All notable changes to mox are documented here. The format follows
   snapshot-first, an edited one is drift until named (`apply --overwrite
   <path>` removes it, `commit <path>` keeps the edit and forgets the path
   here), and a partially owned one is left in place, no longer managed, its
-  records forgotten. Every record and generator manifest now names the repo
-  and the HOME it was applied under, so one repo's apply, or a run under
-  another HOME sharing the state directory, never touches another's files.
+  records forgotten. Every record, and every generator's produced set, now
+  names the repo and the HOME it was applied under, so one repo's apply, or
+  a run under another HOME sharing the state directory, never touches
+  another's files.
 - `mox status` and `mox diff` show the files of a generator that left the
   tree, as the orphan sweep would judge them: `STALE` (or `DRIFT` when
   edited) "its generator left the tree", and an unedited one as a removal
@@ -39,6 +40,18 @@ All notable changes to mox are documented here. The format follows
   wins over the repo's mode and the automatic 0600.
 
 ### Changed
+- What mox applied is kept as one history in `<state dir>/v2/`: each run
+  that changes it writes a generation -- records, provenance, generators'
+  produced sets, the private-layer and tombstone notes, and what the run
+  displaced, its content kept by hash -- and makes it current last, so a
+  run interrupted at any point leaves the state from before it or after it.
+  An interrupted run's changes wait in a journal that the next command
+  recovers; one that cannot be recovered is moved to `v2/quarantine/` and
+  reported. `mox snapshot <id>` lists what a snapshot holds and where each
+  kept copy is. The lock is a kernel lock the system releases when its
+  holder dies, `mox private retire` takes it, `mox.lock` stays after a run,
+  empty, and a filesystem that cannot lock a file fails closed. See "The
+  state directory" in commands.md.
 - Every structured layer, matching this machine or not, is parsed in its
   format and dialect before it composes, and every composed output after
   capture expansion. Some previously composed files may now report `ERROR`
@@ -98,8 +111,8 @@ All notable changes to mox are documented here. The format follows
   no tombstone.
 - A tombstone matches a generator by its recorded live path, case-folded on
   macOS and Windows, and one that matches nothing mox manages here is a
-  warning in `status` and `apply`. A generator's manifest now records the
-  generator's live path.
+  warning in `status` and `apply`. mox now records each generator by its
+  live path.
 - `mox mv` moves no state: the next apply on every machine removes the old
   live file (or reports it as drift, or leaves an old partially owned file in
   place), instead of leaving it orphaned. A move whose attributes entry the
@@ -182,14 +195,6 @@ All notable changes to mox are documented here. The format follows
 - A machine on an older mox rejects an attributes file carrying the new keys
   (`format`, the directive keys, `released`), and `mox remove` now writes
   one. Upgrade every machine before committing them.
-- A record written before records named their repo is never swept: a file
-  deleted, drifted or gated off before the upgrade stays as it was, and the
-  first apply after upgrading tags every file it still produces.
-- A generator manifest written before this release names no repo and is
-  never swept. The first apply that still produces the generator rewrites
-  its manifest tagged. A generator that left the tree before the upgrade
-  keeps its files: apply never removes them, `mox status` lists each as
-  `ORPHAN`, and `mox commit <file>` forgets one.
 - This release keeps its state in `<state dir>/v2/` and reads nothing of
   0.12.4's stores (`applied/`, `applied-content/`, `applied-owned/`,
   `applied-symlink/`, `provenance/`, `generated/`, `snapshots/`, `tmp/`).

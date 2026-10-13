@@ -11,18 +11,28 @@ day-to-day tasks.
 
 The source repo lives at `$MOX_REPO`, default `$XDG_DATA_HOME/mox/dotfiles`;
 `mox path` prints it. Machine-local state lives at `$MOX_STATE_DIR`, default
-`$XDG_STATE_HOME/mox`.
+`$XDG_STATE_HOME/mox`. It belongs to one machine: keep it off a synced or
+network folder.
 
 Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
-`rollback`, `uninstall`, `update`, `facts set`, `facts ask`, a bare `facts`
-that reaches the interview, and `doctor` under `--fix`, `--rebuild-provenance`
-or `--rebuild-coupling`) take a single-writer lock at `<state dir>/mox.lock`
-(`$MOX_STATE_DIR`, default `$XDG_STATE_HOME/mox`); a second process sharing
-that state directory is refused while the first runs. The lock is per state
-directory, so runs given different `MOX_STATE_DIR` values take different locks
-and do not serialize against each other -- one state directory per live tree.
-`upgrade` takes no lock: it replaces the mox binary, not the repo or the live
-tree. An unknown command exits 2.
+`rollback`, `uninstall`, `update`, `private retire`, `facts set`, `facts
+ask`, a bare `facts` that reaches the interview, and `doctor` under `--fix`,
+`--rebuild-provenance` or `--rebuild-coupling`) take a single-writer lock: an
+exclusive kernel lock on `<state dir>/mox.lock` (`$MOX_STATE_DIR`, default
+`$XDG_STATE_HOME/mox`), which the system releases when its holder exits or
+dies. `private retire --dry-run` takes none. A second process sharing that
+state directory is refused while the first runs: `lock held by <pid>
+(<command>); wait`. The file stays after a run, empty. On a filesystem that
+cannot lock a file, every command that would take the lock fails closed:
+`mox: the state directory <dir> cannot be locked (<errno>); mox does not run
+without its lock`. The lock is per state directory, so runs given different
+`MOX_STATE_DIR` values take different locks and do not serialize against
+each other -- one state directory per live tree. `upgrade` takes no lock: it
+replaces the mox binary, not the repo or the live tree. An unknown command
+exits 2.
+
+What mox applied lives in `<state dir>/v2/` (see [The state
+directory](#the-state-directory)).
 
 ## Path arguments
 
@@ -189,13 +199,13 @@ mv moves no state. Every machine's next apply, this one included, writes
 the new path and converges the old one (see [dsl.md](dsl.md#sources-that-leave-the-tree)):
 an unedited old live file is removed, snapshot-first, an edited one is
 reported as drift, and an old partially owned file is left in place, no
-longer managed. A machine whose record of the old path names no repo
-keeps the old file.
+longer managed.
 
 ## remove
 
 Stop managing a file and keep its live file on every machine: move its
-source (base + `.d/`) into `<state dir>/trash/<timestamp>/` recoverably,
+source (base + `.d/`) into `<state dir>/trash/<timestamp>/` recoverably
+(the timestamp carries a `-N` suffix when that second is already taken),
 and leave a tombstone, `released = true`, in `.mox/attributes.toml` in
 place of its entry. Every machine's apply then forgets the path's records
 and leaves its file alone; a released generator's leaves stay too,
@@ -328,7 +338,7 @@ left the tree, judged as the sweep would. `mox apply --overwrite <path>` is
 how an edited one is removed, since an unscoped `--overwrite` keeps it, and
 `mox commit <path>` keeps its edit by forgetting the path on this machine.
 A file of a generator that left the tree is resolved the same two ways;
-commit also drops it from the generator's manifest.
+commit also drops it from the generator's produced set.
 
 apply never removes a path through a symlinked directory: when a
 directory between HOME and the path is a symlink, or a path the tree
@@ -1020,10 +1030,10 @@ and `remove` -- exits 2 before it writes or removes anything: `private layer
 private retire` to stop expecting it`. `rollback` warns, restores whole
 files, and re-patches no partially owned file; `doctor` reports it.
 
-`private retire` removes that expectation (`--dry-run` says whether there is
-one). The next apply then treats the private layer as absent: the files only
-it provided have a source that left the tree, and the sweeps remove them,
-snapshot-first, as for any other.
+`private retire` removes that expectation under the lock (`--dry-run` says
+whether there is one, and takes no lock). The next apply then treats the
+private layer as absent: the files only it provided have a source that
+left the tree, and the sweeps remove them, snapshot-first, as for any other.
 
 <!-- generated: flags private retire -->
 | Flag | Description |
@@ -1036,24 +1046,33 @@ snapshot-first, as for any other.
 Health report: source files not tracked by git, source modes git cannot carry
 that are not yet in `.mox/attributes.toml` (lost on clone), sources that
 compose to nothing under every configuration (a contradictory or mistyped
-whole-file gate), malformed state (provenance), a file in the private layer's
-`data/` that is not a data source (`private-data <path>`), since nothing
-applies it, and a `facts.toml` fact bound
-on this machine that nothing in the repo consumes (`unused-fact <name> (bound
-but unused by this repo)`) -- advisory, since deleting or renaming a fact the
-repo no longer reads is the user's call. When the unused name is a probable
-rename of some still-unbound fact (a short edit distance), the advisory
-bridges the two and names the migration directly: `unused-fact persona (bound
-but unused; unbound "profile" -- renamed? mox facts set profile <value>)`. A
-leftover `data/facts-schema.toml` gets its own one-line notice: nothing
-reads it (the interview derives from the repo's own sources), delete it.
+whole-file gate), malformed state (provenance that does not parse,
+`bad-provenance <path>`), the state's own health (below), a file in the
+private layer's `data/` that is not a data source (`private-data <path>`),
+since nothing applies it, and a `facts.toml` fact bound on this machine that
+nothing in the repo consumes (`unused-fact <name> (bound but unused by this
+repo)`) -- advisory, since deleting or renaming a fact the repo no longer
+reads is the user's call. When the unused name is a probable rename of some
+still-unbound fact (a short edit distance), the advisory bridges the two and
+names the migration directly: `unused-fact persona (bound but unused;
+unbound "profile" -- renamed? mox facts set profile <value>)`. A leftover
+`data/facts-schema.toml` gets its own one-line notice: nothing reads it (the
+interview derives from the repo's own sources), delete it.
 `--rebuild-provenance` recomposes and re-records every tracked file's
 provenance (partial targets keep no line provenance and are skipped);
 `--rebuild-coupling` rescans source tokens and rewrites the stored coupling
-graph under `<state dir>/coupling/`; `--fix` performs the safe rebuilds. Mutating
-runs take the lock; exits 1 while any problem or advisory remains, or a check
-could not run (a source tree outside git skips the tracked-source check), so
-it can gate CI.
+graph under `<state dir>/coupling/`; `--fix` performs the safe rebuilds.
+Mutating runs take the lock; exits 1 while any problem or advisory remains,
+or a check could not run (a source tree outside git skips the tracked-source
+check), so it can gate CI.
+
+The state rows: a generation that cannot be read (doctor names it, and
+`--fix` moves it to `v2/quarantine/`), a run recovered from its journal,
+and every file in `v2/quarantine/`, a quarantined journal's displaced
+entries listed with it. On a state with no readable generation, `--fix`
+moves every unreadable generation, `current` and any dead journal to
+`v2/quarantine/`, reports each, and starts over from an empty state; the
+retained generations' displaced content stays listed and restorable.
 
 The run ends on exactly one summary line: `mox doctor: N problem(s) found`,
 or `N advisory item(s) need attention` when there are no problems, or
@@ -1070,42 +1089,78 @@ or `N advisory item(s) need attention` when there are no problems, or
 
 ## snapshot / rollback
 
-`snapshot` lists apply snapshots (taken before every overwrite);
-`rollback [<id>]` restores live files from one, defaulting to the
-newest and announcing which it took. A partially owned file
-is never whole-file restored: the snapshot's owned subtree is
-re-patched onto the current live file (the program's writes since then
-survive) through the same verification and `check` hook as apply, and
-a snapshot whose owned values were secret-masked is refused --
-re-apply the source instead. A symlink mox planted at a live path is
-replaced like any file mox wrote; an entry whose live path is a symlink mox
-did not plant, lies below a symlinked directory, or is a directory where a
-symlink now sits, is not restored: rollback names the live path and the
-snapshot copy left in place, and exits 1. A snapshot notes which of its
-symlinks mox had planted. A restored link it notes is drift until applied
-again: `status` reports it `DRIFT`, and only `apply --overwrite` replaces
-it, never writing through it; any other restored link is left with no
-record, so a link the user made reads as drift, as before. A snapshot taken
-before these notes notes none. A restored file no longer counts as a link.
-Before rollback replaces anything at a live path, it keeps what is there in
-a snapshot of its own, named in its report and in `mox snapshot`;
-`rollback` with no id never picks such a snapshot, and `mox rollback
-<id>` puts it back; it does not count toward `MOX_SNAPSHOT_RETENTION`, and
-goes when the chain of snapshots it undoes (it may undo another such
-snapshot) ends at one that is pruned; a chain with a missing link keeps it. An entry that cannot be
-restored is that entry's `ERROR`, naming its snapshot copy, and the rest
-are still restored; one whose snapshot holds a redacted secret line is
-never written ("holds a secret mox does not store; run mox apply to
-resolve it again"); a link already as the snapshot has it is left alone
-and not counted. Notes rollback cannot read (a snapshot's planted links,
-or what a snapshot of its own undoes) are a warning, and treated as
-absent. An `attributes.toml` that is not
-valid TOML or cannot be read is a warning here, not exit 2: whole files
-are still restored, and partial targets cannot be re-patched.
+`snapshot` lists the runs that displaced something -- the content an
+overwrite, a removal or a rollback replaced -- oldest first, one id per
+line; a rollback's own is annotated `(what rolling back <id> replaced)`.
+`snapshot <id>` lists that run's entries, one per line: the home-relative
+key and `file <path of its kept copy>`, `link -> <target>`, or `dir` with
+the directory's entries indented beneath it. A refused restore can be
+finished by hand from it.
 
-`MOX_SNAPSHOT_RETENTION` is how many to keep (default 10); apply prunes
-the oldest of the rest, ordering same-second snapshots by their `-N`
-suffix. A value that is not an integer warns and the default stands.
+`rollback [<id>]` restores live files from one, defaulting to the newest
+and announcing which it took. A partially owned file is never whole-file
+restored: the snapshot's owned subtree is re-patched onto the current live
+file (the program's writes since then survive) through the same
+verification and `check` hook as apply, and a snapshot whose owned values
+were secret-masked is refused -- re-apply the source instead. A symlink mox
+planted at a live path is replaced like any file mox wrote; an entry whose
+live path is a symlink mox did not plant, lies below a symlinked directory,
+or is a directory where a symlink now sits, is not restored: rollback names
+the live path and where its content is (the kept copy, the link's target,
+or the run's id and key for a directory), and exits 1. A run notes which of
+the symlinks it displaced mox had planted. A restored link it notes is
+drift until applied again: `status` reports it `DRIFT`, and only `apply
+--overwrite` replaces it, never writing through it; any other restored link
+is left with no record, so a link the user made reads as drift, as before.
+A restored file no longer counts as a link. A directory entry is recreated
+where absent with the modes it recorded, never replacing a live directory,
+and its modes are set after everything inside it is restored. Before
+rollback replaces anything at a live path, it keeps what is there as a
+snapshot of its own, named in its report and in `mox snapshot`; `rollback`
+with no id never picks such a snapshot, and `mox rollback <id>` puts it
+back; it does not count toward `MOX_SNAPSHOT_RETENTION`, and goes when the
+chain of snapshots it undoes (it may undo another such snapshot) ends at one
+that is pruned; a chain with a missing link keeps it. An entry that cannot
+be restored is that entry's `ERROR`, naming where its content is, and the
+rest are still restored; one whose kept copy is missing or damaged is
+refused, naming it; one whose snapshot holds a redacted secret line is never
+written ("holds a secret mox does not store; run mox apply to resolve it
+again"); a link already as the snapshot has it is left alone and not
+counted. An `attributes.toml` that is not valid TOML or cannot be read is a
+warning here, not exit 2: whole files are still restored, and partial
+targets cannot be re-patched.
+
+`MOX_SNAPSHOT_RETENTION` is how many to keep (default 10, at least 1); an
+apply that displaced or removed something prunes the oldest of the rest,
+ordering same-second snapshots by their `-N` suffix. The current state is
+never pruned, so a clock that moved backwards loses nothing. A value that
+is not an integer warns and the default stands.
+
+## The state directory
+
+Everything mox applied lives in `<state dir>/v2/`. Each run that changes it
+-- apply, commit, rollback, remove, doctor's fixes, private retire,
+uninstall -- writes one generation: every record, the provenance of each
+file, each generator's produced set, the private-layer and tombstone notes,
+and what the run displaced, its content kept by hash in `v2/blobs/`. The
+run makes it current by rewriting `v2/current` last, so another mox sees
+the state from before the run or after it, never a half. A run that is
+interrupted -- killed, Ctrl-C, a crash, a power loss -- leaves its changes
+in a journal under `v2/pending/`; the next command that takes the lock
+recovers them, and `status`, `diff` and `mox snapshot` read them as
+recovered at once. Recovered runs are listed by `mox doctor`. A journal
+that cannot be recovered, because the state changed under it or its run's
+generation did not match, is moved to `v2/quarantine/` and reported;
+nothing there is deleted.
+
+A generation that cannot be read is skipped for the one before it, with a
+warning, and writes go on. When none can be read, every command reads an
+empty state with a warning and every command that writes refuses: `mox:
+the state at <dir> has no readable generation; run `mox doctor --fix``.
+`v2/` holding generations but no `current` refuses the same way, since it
+would otherwise read as an empty state. A generation a newer mox wrote
+refuses every command that touches state: `mox: state written by a newer mox
+(v<n>); upgrade mox to use <dir>`.
 
 ## update
 
@@ -1213,12 +1268,13 @@ for a specific one; never auto-downgrades; `--yes` skips the prompt.
 
 ## uninstall
 
-Remove mox's machine-local state (applied records, provenance, ...).
-The private layer is preserved unless `--purge-private`; snapshots (the
-pre-mox content of every file mox overwrote) and trash (the sources
-`remove` and `mv` displaced) are preserved unless
-`--purge-snapshots` / `--purge-trash` or confirmed on a terminal. The
-user's source repo is never touched.
+Remove mox's machine-local state: records, provenance, generators and
+notes are forgotten. The private layer is preserved unless
+`--purge-private`; the snapshot history in `v2/` (the pre-mox content of
+every file mox overwrote) and trash (the sources `remove` and `mv`
+displaced) are preserved unless `--purge-snapshots` / `--purge-trash` or
+confirmed on a terminal, and `mox rollback <id>` still works from a kept
+history. The user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |

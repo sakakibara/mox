@@ -480,13 +480,18 @@ mox git -- log --oneline    # run git in the repo without leaving here
 
 ## Undoing an apply
 
-Every overwrite is snapshotted first:
+Every overwrite or removal keeps what it replaced first, as a snapshot named
+by the run's id:
 
 ```sh
 mox rollback            # the newest snapshot, named as it goes
 mox snapshot            # list them, oldest first
+mox snapshot <id>       # what one holds, and where each kept copy is
 mox rollback <id>       # restore the live files from a specific one
 ```
+
+A run interrupted part way keeps what it had done; the next command picks it
+up, so its snapshot is there to roll back.
 
 A [partially owned file](#a-file-a-program-also-writes) is not whole-file
 restored -- that would clobber what the program wrote since the snapshot.

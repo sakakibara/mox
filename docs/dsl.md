@@ -230,8 +230,8 @@ locked by tests.
 A generator directive makes its source file a GENERATOR: the file emits one
 live file per data row into its own target directory and never materializes
 at its own path. A generator source holds exactly its directive and nothing
-else; stray top-level content is rejected. Its produced set is manifest-
-tracked: removing a row removes that row's file on the next apply, a false
+else; stray top-level content is rejected. mox records its produced
+set: removing a row removes that row's file on the next apply, a false
 gate empties (and so prunes) the whole set, and a generator whose source
 leaves the tree has its set swept -- all snapshot-first, recoverable.
 
@@ -332,15 +332,16 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   error that never
   echoes the value; an empty `<secret:>` is rejected up front. A resolved
   secret never reaches disk or the terminal: its value is kept out of the
-  applied-content cache and snapshots, and `mox diff` redacts any hunk touching
-  a secret line. (Redaction of a secret you have since removed relies on that
-  file's stored provenance.) A live file that resolves an `op://` or
-  `pass://` secret is applied at mode 0600 automatically (dedicated secret
-  managers hold only secrets, so this is never a false positive), unless
-  `.mox/attributes.toml` sets an explicit mode. The ambiguous schemes
-  (`env:`, `file://`, `cmd:` -- the last often a non-secret value like a
-  computed theme name) are left at their composed mode; mark one `mode =
-  "0600"` in `.mox/attributes.toml` when it is sensitive.
+  content mox keeps of what it applied and of what it displaced, and `mox
+  diff` redacts any hunk touching a secret line. (Redaction of a secret you
+  have since removed relies on that file's stored provenance.) A live file
+  that resolves an `op://` or `pass://` secret is applied at mode 0600
+  automatically (dedicated secret managers hold only secrets, so this is
+  never a false positive), unless `.mox/attributes.toml` sets an explicit
+  mode. The ambiguous schemes (`env:`, `file://`, `cmd:` -- the last often a
+  non-secret value like a computed theme name) are left at their composed
+  mode; mark one `mode = "0600"` in `.mox/attributes.toml` when it is
+  sensitive.
 
 Captures must not be adjacent (`<a><b>`) and a name must not repeat within one
 template; both are compose-time errors. A malformed `data.` capture (`<data.x>`
@@ -910,17 +911,17 @@ owns nothing here") is exempt.
 
 ## Sources that leave the tree
 
-Every record mox keeps of a file it wrote names the repo it came from and the
-HOME it was applied under (the real paths of both), so one repo's records,
-or one HOME's, are never mistaken for another's when several `MOX_REPO`s or
-HOMEs share a state directory. After the walk, `mox apply` finds the records
-of this repo and HOME whose path no managed file -- repo or private layer,
-gated-off ones included, since a gate is not removal -- and no generator
-manifest names: a source that was deleted, moved, or released. The sweep of
-an orphaned generator's files takes only manifests of this repo and HOME
-that list no file outside it. Both sweeps leave a `.moxignore`-matched file
-alone, and `status` and `diff` judge every such file exactly as the sweep
-would.
+Every record mox keeps of a file it wrote, and of a generator's produced
+set, names the repo it came from and the HOME it was applied under (the real
+paths of both), so one repo's records, or one HOME's, are never mistaken for
+another's when several `MOX_REPO`s or HOMEs share a state directory. After
+the walk, `mox apply` finds the records of this repo and HOME whose path no
+managed file -- repo or private layer, gated-off ones included, since a gate
+is not removal -- and no generator names: a source that was deleted, moved,
+or released. The sweep of an orphaned generator's files takes only
+generators of this repo and HOME that list no file outside it. Both sweeps
+leave a `.moxignore`-matched file alone, and `status` and `diff` judge every
+such file exactly as the sweep would.
 
 - An unedited whole file or symlink is removed, snapshot-first, so `mox
   rollback` recovers it; an edited one is drift, kept until it is named:
@@ -962,9 +963,8 @@ nothing on its own: it removes only a named path whose source left the
 tree, or a named file of a generator that left the tree, judged as the
 sweep would. A failure
 at a moved path must not remove the old path's file before the new one is
-written. A record that names no repo -- a one-line whole-file record, a
-bare symlink target, an owned record without `repo` -- is never swept; apply
-tags the record of every file it still produces, unchanged ones included.
+written. apply records the repo and HOME of every file it still produces,
+unchanged ones included.
 
 `mox mv` therefore moves no state: every machine's next apply, this one
 included, removes the old live file (or reports it as drift) and writes the
@@ -1026,3 +1026,5 @@ The lock does not cover third-party writers: an external edit made to a live
 file between mox reading it and writing it in the same run is not captured in
 that run's snapshot, so a later `mox rollback` restores the pre-run content, not
 the intervening edit. Do not edit a managed file while mox is applying.
+Commands that only read the state (`status`, `diff`, `mox snapshot`) take no
+lock and see the state from before a live run until it finishes.
