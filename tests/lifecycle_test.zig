@@ -6382,7 +6382,7 @@ test "orphans: a generator recorded under an aliased HOME is left alone" {
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "a parent directory is a symlink") == null);
-    const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state });
+    const dump = try mox.state.dump.load(a, io, .{ .state_dir = h.state });
     try std.testing.expect(dump.generator(try std.fs.path.join(a, &.{ alias, ".config", "g.inc" })) != null);
 }
 

@@ -22,7 +22,6 @@ pub const provenance = @import("provenance/root.zig");
 pub const packages = @import("packages/root.zig");
 pub const cli = @import("cli/root.zig");
 pub const state = @import("state/root.zig");
-pub const state_dump = state.dump;
 
 /// External: TOML 1.1 parser/encoder. Used by the Cat A composer.
 pub const toml = @import("toml");

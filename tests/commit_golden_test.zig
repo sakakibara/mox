@@ -8,7 +8,7 @@ const testutil = @import("testutil.zig");
 const Harness = testutil.Harness;
 
 const repo_exclusions = [_][]const u8{".git"};
-const state_exclusions = [_][]const u8{"bin"} ++ mox.state_dump.store_entries;
+const state_exclusions = [_][]const u8{"bin"} ++ mox.state.dump.store_entries;
 
 // A transcript holds what a capture renders and digests of state that
 // records it, so the hostname is pinned like os and arch. Dotted, so the
@@ -187,8 +187,8 @@ fn transcript(a: std.mem.Allocator, io: Io, h: Harness, res: testutil.RunResult,
     }
     try out.appendSlice(a, "--- state\n");
     try appendTree(&out, a, io, n, h.state, &state_exclusions, true);
-    const dump = try mox.state_dump.load(a, io, .{ .state_dir = h.state, .parts = &.{.{ .repo = h.repo, .home = h.home }} });
-    try out.appendSlice(a, try sortedBlocks(a, try n.recordName(a, try mox.state_dump.render(a, dump, n))));
+    const dump = try mox.state.dump.load(a, io, .{ .state_dir = h.state, .parts = &.{.{ .repo = h.repo, .home = h.home }} });
+    try out.appendSlice(a, try sortedBlocks(a, try n.recordName(a, try mox.state.dump.render(a, dump, n))));
     return out.items;
 }
 

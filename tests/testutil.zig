@@ -132,8 +132,8 @@ fn noRefresh(_: ?*anyopaque, _: Io) void {}
 
 /// The state dump of `h`'s state directory, its flags asked of `h`'s repo
 /// and HOME.
-pub fn dumpOf(h: Harness) !mox.state_dump.Dump {
-    return mox.state_dump.load(h.a, h.io, .{ .state_dir = h.state, .parts = &.{.{ .repo = h.repo, .home = h.home }} });
+pub fn dumpOf(h: Harness) !mox.state.dump.Dump {
+    return mox.state.dump.load(h.a, h.io, .{ .state_dir = h.state, .parts = &.{.{ .repo = h.repo, .home = h.home }} });
 }
 
 pub const RecordKind = enum { file, owned, link };
@@ -162,9 +162,9 @@ pub fn anyRecord(h: Harness, kind: RecordKind) !bool {
 }
 
 /// The entry snapshot `id` holds for the HOME-relative `key`, or null.
-pub fn snapshotEntry(h: Harness, id: []const u8, key: []const u8) !?mox.state_dump.Entry {
+pub fn snapshotEntry(h: Harness, id: []const u8, key: []const u8) !?mox.state.dump.Entry {
     for ((try dumpOf(h)).generations) |g| {
-        if (std.mem.eql(u8, g.id, id)) return mox.state_dump.entryOf(g, key);
+        if (std.mem.eql(u8, g.id, id)) return mox.state.dump.entryOf(g, key);
     }
     return null;
 }

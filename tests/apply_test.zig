@@ -484,7 +484,7 @@ test "apply: an external edit between the read and the removal is refused, keepi
     });
 
     Interleaved.real = io;
-    Interleaved.trigger_dir = try mox.state_dump.displacedStore(a, c.state);
+    Interleaved.trigger_dir = try mox.state.dump.displacedStore(a, c.state);
     Interleaved.live_path = live;
     Interleaved.edit = "[id]\n\tname = one\nthe user's own line\n";
     Interleaved.fired = false;
@@ -761,10 +761,10 @@ test "apply: a hand-hardened default-mode file is not re-loosened on unchanged a
 }
 
 fn snapshotHas(io: Io, a: std.mem.Allocator, state_dir: []const u8, rel: []const u8, want: []const u8) !bool {
-    const d = try mox.state_dump.load(a, io, .{ .state_dir = state_dir });
+    const d = try mox.state.dump.load(a, io, .{ .state_dir = state_dir });
     const hash = mox.apply.applied.contentHashHex(want);
     for (d.generations) |g| {
-        const e = mox.state_dump.entryOf(g, rel) orelse continue;
+        const e = mox.state.dump.entryOf(g, rel) orelse continue;
         if (e.sha256) |h| if (std.mem.eql(u8, &h, &hash)) return true;
     }
     return false;
@@ -3466,7 +3466,7 @@ test "apply generator: mox remove --purge does not delete a leaf another generat
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/data/da.toml", .data = "not toml [[[\n" });
     _ = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqualStrings("val=b\n", try read(io, a, shared));
-    try std.testing.expect((try mox.state_dump.load(a, io, .{ .state_dir = c.state })).generator(try c.homePath(".config/genA.inc")) != null);
+    try std.testing.expect((try mox.state.dump.load(a, io, .{ .state_dir = c.state })).generator(try c.homePath(".config/genA.inc")) != null);
 
     const r = try c.run(&.{ "mox", "remove", "--purge", ".config/genA.inc" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -5358,7 +5358,7 @@ test "apply: an external edit between the read and the write is refused, keeping
     try tmp.dir.writeFile(io, .{ .sub_path = "repo/src/notes.txt", .data = "v2\n" });
 
     Interleaved.real = io;
-    Interleaved.trigger_dir = try mox.state_dump.displacedStore(a, c.state);
+    Interleaved.trigger_dir = try mox.state.dump.displacedStore(a, c.state);
     Interleaved.live_path = live;
     Interleaved.edit = "the user's own edit\n";
     Interleaved.fired = false;

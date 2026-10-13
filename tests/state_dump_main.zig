@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (i != args.len or repos.items.len != homes.items.len) return error.Usage;
 
-    var parts: std.ArrayList(mox.state_dump.Part) = .empty;
+    var parts: std.ArrayList(mox.state.dump.Part) = .empty;
     for (repos.items, homes.items) |r, h| try parts.append(arena, .{ .repo = r, .home = h });
     var tombstones: []const []const u8 = &.{};
     if (parts.items.len > 0) {
@@ -39,13 +39,13 @@ pub fn main(init: std.process.Init) !void {
             tombstones = tree.released;
         } else |_| {}
     }
-    const d = try mox.state_dump.load(arena, io, .{
+    const d = try mox.state.dump.load(arena, io, .{
         .state_dir = state orelse return error.Usage,
         .parts = parts.items,
         .tombstones = tombstones,
     });
     var buf: [4096]u8 = undefined;
     var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &buf);
-    try w.interface.writeAll(try mox.state_dump.render(arena, d, mox.state_dump.verbatim));
+    try w.interface.writeAll(try mox.state.dump.render(arena, d, mox.state.dump.verbatim));
     try w.interface.flush();
 }
