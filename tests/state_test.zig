@@ -999,6 +999,48 @@ test "readers: a store created between a reader's start checks and its load is r
     }
 }
 
+test "readers: every command that reads the state without writing it reads current under the readers lock" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".zshrc"), .data = "v1\nedited\n" });
+    const out = try std.fs.path.join(a, &.{ h.root, "export-out" });
+
+    defer mox.state.recovery.on_read_current = null;
+    const runs = [_][]const []const u8{
+        &.{ "mox", "status" },
+        &.{ "mox", "diff" },
+        &.{ "mox", "snapshot" },
+        &.{ "mox", "export", out },
+        &.{ "mox", "doctor" },
+        &.{ "mox", "apply", "--dry-run" },
+        &.{ "mox", "commit", "--dry-run" },
+        &.{ "mox", "private", "retire", "--dry-run" },
+        &.{ "mox", "mv", ".zshrc", ".zshrc2" },
+    };
+    var bad: usize = 0;
+    for (runs) |argv| {
+        unlocked_reads = 0;
+        locked_reads = 0;
+        mox.state.recovery.on_read_current = noteRead;
+        _ = try h.run(argv);
+        mox.state.recovery.on_read_current = null;
+        if (unlocked_reads != 0 or locked_reads == 0) {
+            std.debug.print("{s} {s}: {d} reads of current under the readers lock, {d} without\n", .{ argv[1], if (argv.len > 2) argv[2] else "", locked_reads, unlocked_reads });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
 var waiting_on: ?mox.state.lock.Readers = null;
 var waits: usize = 0;
 
