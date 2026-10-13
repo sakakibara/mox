@@ -16,22 +16,24 @@ network folder.
 
 Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
 `rollback`, `uninstall`, `update`, `private retire`, `facts set`, `facts
-ask`, a bare `facts` that reaches the interview, and `doctor` under `--fix`,
-`--rebuild-provenance` or `--rebuild-coupling`) take a single-writer lock: an
-exclusive kernel lock on `<state dir>/mox.lock` (`$MOX_STATE_DIR`, default
-`$XDG_STATE_HOME/mox`), which the system releases when its holder exits or
-dies. `private retire --dry-run` takes none. A second process sharing that
-state directory is refused while the first runs: `lock held by <pid>
-(<command>); wait`. A holder that has taken the lock but not yet written its
-line is refused with `lock held by another mox that has not yet said who it
-is; wait`. The file stays after a run, empty. On a filesystem that cannot
-lock a file, every command that would take the lock fails closed: `mox: the
-state directory <dir> cannot be locked (<errno>); mox does not run without
-its lock`. The lock is per state directory, so runs given different
-`MOX_STATE_DIR` values take different locks and do not serialize against
-each other -- one state directory per live tree. `upgrade` takes no lock: it
-replaces the mox binary, not the repo or the live tree. An unknown command
-exits 2.
+ask`, a bare `facts` that reaches the interview, and `doctor` under
+`--fix`, `--rebuild-provenance` or `--rebuild-coupling`) take a
+single-writer lock: an exclusive kernel lock on `<state dir>/mox.lock`
+(`$MOX_STATE_DIR`, default `$XDG_STATE_HOME/mox`), which the system
+releases when its holder exits or dies. `private retire --dry-run` takes
+none. A second process sharing that state directory is refused while the
+first runs: `lock held by <pid> (<command>); wait`. A holder that has taken
+the lock but not yet written its line is refused with `lock held by another
+mox that has not yet said who it is; wait`. The file stays after a run,
+empty. On a filesystem that cannot lock a file, every command that would
+take the lock fails closed: `mox: the state directory <dir> cannot be locked
+(<errno>); mox does not run without its lock`. The lock is per state
+directory, so runs given different `MOX_STATE_DIR` values take different
+locks and do not serialize against each other -- one state directory per
+live tree. A command that only reads the state holds the readers lock
+instead (see [The state directory](#the-state-directory)). `upgrade` takes
+no lock: it replaces the mox binary, not the repo or the live tree. An
+unknown command exits 2.
 
 What mox applied lives in `<state dir>/v2/` (see [The state
 directory](#the-state-directory)).
@@ -206,15 +208,15 @@ longer managed.
 ## remove
 
 Stop managing a file and keep its live file on every machine: move its
-source (base + `.d/`) into `<state dir>/trash/<timestamp>/` recoverably
-(the timestamp carries a `-N` suffix when that second is already taken,
-and continues from the newest one there when the clock is behind it),
-and leave a tombstone, `released = true`, in `.mox/attributes.toml` in
-place of its entry. Every machine's apply then forgets the path's records
-and leaves its file alone; a released generator's leaves stay too,
-forgotten. mox forgets the path's applied state here as well, so a later
-re-add starts from first contact; `mox add` or `mox mv` onto the path
-removes the tombstone, and tombstones are never pruned otherwise.
+source (base + `.d/`) into `<state dir>/trash/<timestamp>/` recoverably (the
+timestamp carries a `-N` suffix when that second is already taken, and
+continues from the newest one there when the clock is behind it), and leave
+a tombstone, `released = true`, in `.mox/attributes.toml` in place of its
+entry. Every machine's apply then forgets the path's records and leaves its
+file alone; a released generator's leaves stay too, forgotten. mox forgets
+the path's applied state here as well, so a later re-add starts from first
+contact; `mox add` or `mox mv` onto the path removes the tombstone, and
+tombstones are never pruned otherwise.
 
 `--purge` deletes the live file here, snapshotting it first (a
 generator's produced files likewise), and leaves no tombstone, so every
@@ -730,32 +732,30 @@ packages entirely.
 
 ## diff
 
-Show a unified diff of the composed output against each live file
-(`--stat` for a per-file added/removed summary). A partially owned
-file diffs its canonical owned content only, with secret-bearing keys
-masked on both sides. A resolved secret is never printed: a hunk touching
-a secret line on either side is masked, and a live file whose source
-resolves a secret, or whose record was written for one, while the
-provenance that masks its live side is missing, is not shown; stderr says
-so, and `mox doctor --rebuild-provenance` records the provenance again. A
-file whose source left the tree, which apply
-would remove, shows its live content on the removed side, and such a
-symlink the line `symlink -> <target>`, as does an unedited file of a
-generator that left the tree; a file that
-does not parse in its format is an `ERROR` line on stderr, as apply
-reports it. Read-only and takes no lock. A difference is not
-an error, so a run that completes exits 0 whether or not anything
-differs. An `attributes.toml`, the repo's or the private layer's, that is
-not valid TOML or cannot be read stops the run with exit 2, as it does in
-every command that reads attributes (add, apply, commit, doctor, edit,
-export, facts, mv, remove and status); rollback warns instead. A
-refusal exits 1: a path that is not managed, a head ownership declaration
-that does not parse, and an attributes entry that breaks the schema, with
-or without a source. A file's own `ERROR` that does not come from an
-attributes file -- a head directive on an unstructured target, one spelled
-with another file's comment marker, a mox directive in strict JSON, or a
-layer or output that does not parse -- is reported and the run still exits
-0.
+Show a unified diff of the composed output against each live file (`--stat`
+for a per-file added/removed summary). A partially owned file diffs its
+canonical owned content only, with secret-bearing keys masked on both sides.
+A resolved secret is never printed: a hunk touching a secret line on either
+side is masked, and a live file whose source resolves a secret, or whose
+record was written for one, while the provenance that masks its live side is
+missing, is not shown; stderr says so, and `mox doctor --rebuild-provenance`
+records the provenance again. A file whose source left the tree, which apply
+would remove, shows its live content on the removed side, and such a symlink
+the line `symlink -> <target>`, as does an unedited file of a generator that
+left the tree; a file that does not parse in its format is an `ERROR` line
+on stderr, as apply reports it. Read-only: it takes no writer lock, only the
+readers lock. A difference is not an error, so a run that completes exits 0
+whether or not anything differs. An `attributes.toml`, the repo's or the
+private layer's, that is not valid TOML or cannot be read stops the run with
+exit 2, as it does in every command that reads attributes (add, apply,
+commit, doctor, edit, export, facts, mv, remove and status); rollback warns
+instead. A refusal exits 1: a path that is not managed, a head ownership
+declaration that does not parse, and an attributes entry that breaks the
+schema, with or without a source. A file's own `ERROR` that does not come
+from an attributes file -- a head directive on an unstructured target, one
+spelled with another file's comment marker, a mox directive in strict JSON,
+or a layer or output that does not parse -- is reported and the run still
+exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |
@@ -1039,9 +1039,10 @@ private retire` to stop expecting it`. `rollback` warns, restores whole
 files, and re-patches no partially owned file; `doctor` reports it.
 
 `private retire` removes that expectation under the lock (`--dry-run` says
-whether there is one, and takes no lock). The next apply then treats the
-private layer as absent: the files only it provided have a source that
-left the tree, and the sweeps remove them, snapshot-first, as for any other.
+whether there is one, and takes no writer lock, only the readers lock).
+The next apply then treats the private layer as absent: the files only it
+provided have a source that left the tree, and the sweeps remove them,
+snapshot-first, as for any other.
 
 <!-- generated: flags private retire -->
 | Flag | Description |
@@ -1148,11 +1149,11 @@ targets cannot be re-patched.
 apply that displaced or removed something prunes the oldest of the rest,
 ordering same-second snapshots by their `-N` suffix. The current state is
 never pruned, so a clock that moved backwards loses nothing, and the state
-that was current before the run is kept through it, as the one a
-`current` that cannot be read falls back to; the next pruning run counts
-it like any other. Pruning waits for no reader: while another mox reads the
-state, the run prunes nothing and the next one catches up. A value that is
-not an integer warns and the default stands.
+that was current before the run is kept through it, as the one a `current`
+that cannot be read falls back to; the next pruning run counts it like any
+other. Pruning waits for no reader: while another mox reads the state, the
+run prunes nothing and the next one catches up. A value that is not an
+integer warns and the default stands.
 
 ## The state directory
 
@@ -1160,46 +1161,45 @@ Everything mox applied lives in `<state dir>/v2/`. Each run that changes it
 -- apply, commit, rollback, remove, doctor's fixes, private retire,
 uninstall -- writes one generation: every record, the provenance of each
 file, each generator's produced set, the private-layer and tombstone notes,
-and what the run displaced, its content kept by hash in `v2/blobs/`. The
-run makes it current by rewriting `v2/current` last, so another mox sees
-the state from before the run or after it, never a half. A command that
-reads the state without writing it -- `status`, `diff`, `mox snapshot`,
-`export`, `doctor` without a fix, a dry run -- holds `v2/readers.lock`
-shared until it exits; while one does, a run that commits deletes no
-generation and no blob in `v2/blobs/`, and the next run catches up. A
-reader never holds up a run that writes. A run that is interrupted --
-killed, Ctrl-C, a crash, a power loss -- leaves its changes in a journal
-under `v2/pending/`; the next command that takes the lock
-recovers them, and `status`, `diff` and `mox snapshot` read them as
-recovered at once. Recovered runs are listed by `mox doctor`. A journal
-that cannot be recovered, because the state changed under it or its run's
-generation did not match, is moved to `v2/quarantine/` and reported;
-nothing there is deleted. A run that finds `current` changed under it when
-it commits -- something other than mox wrote it while the run held the lock
--- commits nothing: its journal goes to `v2/quarantine/`, and it exits 2
-without going on, so an apply runs no `scripts/post` and uninstall strips
-nothing.
+and what the run displaced, its content kept by hash in `v2/blobs/`. The run
+makes it current by rewriting `v2/current` last, so another mox sees the
+state from before the run or after it, never a half. A command that reads
+the state without writing it -- `status`, `diff`, `mox snapshot`, `export`,
+`doctor` without a fix, a dry run -- holds `v2/readers.lock` shared until it
+exits; while one does, a run that commits deletes no generation and no blob
+in `v2/blobs/`, and the next run catches up. A reader never holds up a run
+that writes. A run that is interrupted -- killed, Ctrl-C, a crash, a power
+loss -- leaves its changes in a journal under `v2/pending/`; the next
+command that takes the lock recovers them, and `status`, `diff` and `mox
+snapshot` read them as recovered at once. Recovered runs are listed by `mox
+doctor`. A journal that cannot be recovered, because the state changed under
+it or its run's generation did not match, is moved to `v2/quarantine/` and
+reported; nothing there is deleted. A run that finds `current` changed under
+it when it commits -- something other than mox wrote it while the run held
+the lock -- commits nothing: its journal goes to `v2/quarantine/`, and it
+exits 2 without going on, so an apply runs no `scripts/post` and uninstall
+strips nothing.
 
 An owned target whose record has lost its canonical text is an `ERROR` in
 `status`, `diff`, `commit` and `apply`: either its blob under `v2/blobs/`,
 named, is missing or damaged, or the record names no canonical blob ("no
-canonical blob recorded"). The line gives the remedy, `mox apply
---overwrite <path>`, which writes the owned keys again; apply leaves that
-file alone otherwise and goes on with the rest. `apply --overwrite`, with
-or without paths, says of each such file that its canonical text was
-missing and that it writes the owned keys from the source. `mox doctor`
-lists each one.
+canonical blob recorded"). The line gives the remedy, `mox apply --overwrite
+<path>`, which writes the owned keys again; apply leaves that file alone
+otherwise and goes on with the rest. `apply --overwrite`, with or without
+paths, says of each such file that its canonical text was missing and that
+it writes the owned keys from the source. `mox doctor` lists each one.
 
 A generation that cannot be read is skipped for the one before it, with a
 warning, and writes go on. `mox doctor` shows a current generation that
-cannot be read, and `doctor --fix` moves it to `v2/quarantine/` and makes
-`current` name the readable one, which ends the warning. When none can be read, every command reads an
-empty state with a warning and every command that writes refuses: `mox:
-the state at <dir> has no readable generation; run `mox doctor --fix``.
-`v2/` holding generations but no `current` refuses the same way, since it
-would otherwise read as an empty state. A generation a newer mox wrote
-refuses every command that touches state: `mox: state written by a newer mox
-(v<n>); upgrade mox to use <dir>`.
+cannot be read, and `doctor --fix` moves its file, when there is one, to
+`v2/quarantine/` and commits a generation that follows the readable one, so
+`current` names a generation that reads, which ends the warning. When none
+can be read, every command reads an empty state with a warning and every
+command that writes refuses: `mox: the state at <dir> has no readable
+generation; run `mox doctor --fix``. `v2/` holding generations but no
+`current` refuses the same way, since it would otherwise read as an empty
+state. A generation a newer mox wrote refuses every command that touches
+state: `mox: state written by a newer mox (v<n>); upgrade mox to use <dir>`.
 
 ## update
 
@@ -1307,18 +1307,17 @@ for a specific one; never auto-downgrades; `--yes` skips the prompt.
 
 ## uninstall
 
-Remove mox's machine-local state: records, provenance, generators and
-notes are forgotten. The private layer is preserved unless
-`--purge-private`; the snapshot history in `v2/` (the pre-mox content of
-every file mox overwrote) and trash (the sources `remove` and `mv`
-displaced) are preserved unless `--purge-snapshots` / `--purge-trash` or
-confirmed on a terminal, and `mox rollback <id>` still works from a kept
-history. The question about the history is asked only after the check every
-command that touches state makes, so a state this version refuses is refused
-before any question. Deleting it needs no readable generation, so
-`--purge-snapshots` works on a state every other write refuses; keeping it
-needs one, to forget the records in. The user's source repo is never
-touched.
+Remove mox's machine-local state: records, provenance, generators and notes
+are forgotten. The private layer is preserved unless `--purge-private`; the
+snapshot history in `v2/` (the pre-mox content of every file mox overwrote)
+and trash (the sources `remove` and `mv` displaced) are preserved unless
+`--purge-snapshots` / `--purge-trash` or confirmed on a terminal, and `mox
+rollback <id>` still works from a kept history. The question about the
+history is asked only after the check every command that touches state
+makes, so a state this version refuses is refused before any question.
+Deleting it needs no readable generation, so `--purge-snapshots` works on a
+state every other write refuses; keeping it needs one, to forget the records
+in. The user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |

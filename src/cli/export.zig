@@ -3,8 +3,8 @@
 //! Every managed file is composed for the current machine (or the axis tuple
 //! given by `--as`) and written under `<out>/<live-rel>`, where `<live-rel>`
 //! is the file's live path relative to HOME. This is the walk-away guarantee
-//! and the CI parity harness input. Read-only wrt mox state: no lock, no
-//! record or provenance touched.
+//! and the CI parity harness input. Read-only wrt mox state: it holds only
+//! the readers lock, and touches no record or provenance.
 //!
 //! Composed in full before anything is written. Two reasons the phases have to
 //! be separate: whether the export bakes a resolved secret is knowable only

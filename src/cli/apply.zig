@@ -462,8 +462,9 @@ fn applyPass(
     var regular_live: std.StringHashMap(void) = .init(ctx.alloc);
     for (files) |f| try regular_live.put(f.live_path, {});
     // Every generator seen this run (succeeded or failed), so pruning and
-    // recording produced sets happen AFTER all generators have composed. This makes the keep set
-    // global and order-independent instead of "producers seen so far".
+    // recording produced sets happen AFTER all generators have composed.
+    // This makes the keep set global and order-independent instead of
+    // "producers seen so far".
     var gen_states: std.ArrayList(GenState) = .empty;
     var compose_failed: std.ArrayList([]const u8) = .empty;
 
@@ -499,8 +500,8 @@ fn applyPass(
 
         // A GENERATOR (`for ... into`) fans out to N files instead of writing
         // its own path. Each output flows through the SAME per-file write path
-        // as a normal file. Pruning the prior set and recording the produced set are
-        // deferred to a second pass against the global keep set below.
+        // as a normal file. Pruning the prior set and recording the produced
+        // set are deferred to a second pass against the global keep set below.
         if (try applyGenerator(ctx, st, file, &bindings, &m_state, secrets, force, dry_run, &units, &reported_generators, &counts, &snapshotted, &produced, &regular_live, &gen_states, &ruleset, home)) continue;
 
         // A tracked source matching an ignore rule (itself or a containing
@@ -659,9 +660,9 @@ fn applyPass(
     // generator output, every regular managed target, and every FAILED
     // generator's PRIOR leaves. A transient compose failure must delete nothing
     // -- its old files stay both on disk (protected here from the exact sweep)
-    // and tracked (its produced set is left intact below). A leaf handed from one
-    // generator to another is owned by whichever produces it this run, so the
-    // generator that dropped it never prunes it.
+    // and tracked (its produced set is left intact below). A leaf handed from
+    // one generator to another is owned by whichever produces it this run, so
+    // the generator that dropped it never prunes it.
     var keep_set: std.StringHashMap(void) = .init(ctx.alloc);
     {
         var rit = regular_live.keyIterator();
@@ -685,9 +686,9 @@ fn applyPass(
 
     // Second pass: prune each SUCCEEDED generator's dropped leaves against the
     // global keep, then record its current set. A failed generator prunes
-    // nothing and keeps its old produced set. `mute_drift_message` suppresses the
-    // per-leaf DRIFT line: a refused, still-in-tree generator folds into the
-    // ONE `generated_set` unit below instead of a per-leaf row.
+    // nothing and keeps its old produced set. `mute_drift_message` suppresses
+    // the per-leaf DRIFT line: a refused, still-in-tree generator folds into
+    // the ONE `generated_set` unit below instead of a per-leaf row.
     for (gen_states.items) |g| {
         if (!g.succeeded) continue;
         const prune = try mox.apply.generated.pruneStale(ctx.alloc, ctx.io, .{
@@ -2223,7 +2224,8 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
         },
     }
     // A file whose composition inlined a resolved secret must NOT have its
-    // cleartext cached: the content cache and snapshots are secret-aware. The hash record is still stored (preimage-resistant).
+    // cleartext cached: the content cache and snapshots are secret-aware.
+    // The hash record is still stored (preimage-resistant).
     const contains_secret = mox.provenance.map.hasSecret(in.prov_items);
     // A dedicated-manager (op://|pass://) secret auto-restricts the file to
     // 0600 when it has no explicit mode. An explicit attribute mode overrides.
