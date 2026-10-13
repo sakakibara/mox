@@ -51,7 +51,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const lk = (try lock_mod.acquireForCommand(ctx, "uninstall")) orelse return 1;
     defer lk.release();
 
-    var dir = Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
+    var dir = Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound => {
             try ctx.out.writeAll("mox uninstall: no state to remove\n");
             return 0;
@@ -74,7 +74,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     // Sorted so kept/removed lines print in the same order on every machine.
-    dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true, .follow_symlinks = false });
+    dir = try Io.Dir.cwd().openDir(ctx.io, context.paths.state_dir, .{ .iterate = true });
     const entries = try dirent.sorted(ctx.alloc, ctx.io, dir);
     dir.close(ctx.io);
 

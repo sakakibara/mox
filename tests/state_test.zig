@@ -159,6 +159,17 @@ test "state: an apply that fails after finding the private layer still records t
     try std.testing.expect(d.expects_private[0]);
 }
 
+/// `h` with its state directory at `state`.
+fn withState(h: Harness, state: []const u8) !Harness {
+    const m = try h.a.create(std.process.Environ.Map);
+    m.* = try h.env.createMap(h.a);
+    try m.put("MOX_STATE_DIR", state);
+    var out = h;
+    out.env = .{ .map = m };
+    out.state = state;
+    return out;
+}
+
 var raced_state: []const u8 = "";
 
 test "ids: a run that trashed but changed no state keeps its id from the next run" {
@@ -872,6 +883,27 @@ test "uninstall: --purge-snapshots deletes the history of a state with no readab
     const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
+}
+
+test "uninstall: a state directory that is a symlink is uninstalled through it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setup(a, io, &tmp);
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    try tmp.dir.symLink(io, h.state, "statelink", .{ .is_directory = true });
+    h = try withState(h, try std.fs.path.join(a, &.{ h.root, "statelink" }));
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".zshrc")) != null);
+    const r = try h.run(&.{ "mox", "uninstall" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(exists(io, try statePath(h, &.{"v2"})));
+    try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".zshrc")) == null);
 }
 
 test "state: mv and export run the start checks, refusing a state a newer mox wrote" {
