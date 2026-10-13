@@ -103,6 +103,7 @@ pub fn claimFrom(arena: std.mem.Allocator, io: Io, dirs: Dirs, how: Claim, base:
                     else => return e,
                 };
                 f.close(io);
+                try durable.syncDir(io, dirs.pending);
             },
             .trash => {
                 try Io.Dir.cwd().createDirPath(io, dirs.trash);
@@ -178,4 +179,26 @@ test "claim: an id is past every one taken in any of the four directories" {
     // An id freed by a dropped generation is not taken again.
     try tmp.dir.deleteFile(io, "gen/20260710T081500Z.json");
     try std.testing.expectEqualStrings("20260710T081500Z-6", try claimFrom(a, io, dirs, .journal, base));
+}
+
+test "claim: a journal's exclusive create is flushed into pending/" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const pending = try std.fs.path.join(a, &.{ root, "pending" });
+    try durable.makeDir(io, pending);
+    var log: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (log.items) |p| std.testing.allocator.free(p);
+        log.deinit(std.testing.allocator);
+    }
+    durable.synced = &log;
+    defer durable.synced = null;
+    _ = try claimFrom(a, io, .{ .gen = root, .pending = pending, .quarantine = root, .trash = root }, .journal, formatId(0));
+    try std.testing.expectEqual(@as(usize, 1), log.items.len);
+    try std.testing.expectEqualStrings(pending, log.items[0]);
 }

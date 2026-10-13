@@ -22,12 +22,16 @@ pub fn syncFile(io: Io, file: Io.File) !void {
 /// Flush the directory entry list of `dir_path`, so a rename into it is
 /// durable. Windows has no directory fsync; its renames write through.
 pub fn syncDir(io: Io, dir_path: []const u8) !void {
+    if (builtin.is_test) if (synced) |log| log.append(std.testing.allocator, std.testing.allocator.dupe(u8, dir_path) catch unreachable) catch unreachable;
     if (is_windows) return;
     var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
     const f: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
     try syncFile(io, f);
 }
+
+/// The test seam that records every directory `syncDir` flushes.
+pub var synced: ?*std.ArrayList([]const u8) = null;
 
 var temp_counter: std.atomic.Value(u32) = .init(0);
 
@@ -57,9 +61,17 @@ pub fn privateDir() Io.File.Permissions {
     return if (Io.File.Permissions.has_executable_bit) .fromMode(0o700) else .default_dir;
 }
 
-/// Create `path` and its parents, the last one 0700.
+/// Create `path` and its parents, 0700, flushing the parent of each one
+/// created so its entry is durable.
 pub fn makeDir(io: Io, path: []const u8) !void {
-    _ = try Io.Dir.cwd().createDirPathStatus(io, path, privateDir());
+    if (Io.Dir.cwd().access(io, path, .{})) |_| return else |_| {}
+    const parent = std.fs.path.dirname(path);
+    if (parent) |p| try makeDir(io, p);
+    Io.Dir.cwd().createDir(io, path, privateDir()) catch |e| switch (e) {
+        error.PathAlreadyExists => return,
+        else => return e,
+    };
+    if (parent) |p| try syncDir(io, p);
 }
 
 fn pid() u32 {
@@ -189,4 +201,27 @@ test "writeFile: replaces the target whole, 0600" {
         const st = try tmp.dir.statFile(io, "f", .{});
         try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
     }
+}
+
+test "makeDir: the parent of every directory it creates is flushed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var log: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (log.items) |p| std.testing.allocator.free(p);
+        log.deinit(std.testing.allocator);
+    }
+    synced = &log;
+    defer synced = null;
+    try makeDir(io, try std.fs.path.join(a, &.{ root, "state", "v2", "pending" }));
+    const want = [_][]const u8{ root, try std.fs.path.join(a, &.{ root, "state" }), try std.fs.path.join(a, &.{ root, "state", "v2" }) };
+    try std.testing.expectEqual(want.len, log.items.len);
+    for (want, log.items) |w, got| try std.testing.expectEqualStrings(w, got);
+    try makeDir(io, try std.fs.path.join(a, &.{ root, "state", "v2", "pending" }));
+    try std.testing.expectEqual(want.len, log.items.len);
 }
