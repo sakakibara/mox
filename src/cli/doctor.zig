@@ -753,7 +753,7 @@ fn stateRows(ctx: *app.Ctx, st: *mox.state.Draft, report: mox.state.recovery.Rep
             try ctx.out.print("  torn-current {s} (cannot be read; reading {s}, the one before it; --fix moves current past it)\n", .{ torn, parent });
         }
     }
-    const inv = try mox.state.retention.inventory(ctx.alloc, ctx.io, st.store);
+    const inv = try st.generations();
     for (inv.gens) |l| if (l.gen.kind == .recovered) try ctx.out.print("  recovered {s} (a run that did not finish, folded from its journal)\n", .{l.id});
     for (inv.unreadable) |gid| {
         const path = try st.generationPath(gid);

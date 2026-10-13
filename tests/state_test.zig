@@ -678,6 +678,72 @@ test "doctor: a provenance rebuild of a secret-bearing composition nulls the con
     try std.testing.expect((try testutil.dumpOf(h)).path(try h.liveOf(".envrc")).?.file.?.cache == null);
 }
 
+const Reach = struct { line: usize, what: []const u8 };
+
+/// Every reference in Zig source `text`, outside comments and literals, to
+/// the store type, a draft's `.store` field, the store's id directories or
+/// its directory name. `.store(` is an atomic's method and `coupling.store`
+/// another module.
+fn storeReaches(a: std.mem.Allocator, text: []const u8) ![]const Reach {
+    var out: std.ArrayList(Reach) = .empty;
+    var i: usize = 0;
+    var line: usize = 1;
+    var prev_ident: []const u8 = "";
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '\n') {
+            line += 1;
+            i += 1;
+        } else if (std.mem.startsWith(u8, text[i..], "//") or std.mem.startsWith(u8, text[i..], "\\\\")) {
+            while (i < text.len and text[i] != '\n') i += 1;
+        } else if (c == '"' or c == '\'') {
+            i += 1;
+            while (i < text.len and text[i] != c and text[i] != '\n') : (i += 1) {
+                if (text[i] == '\\') i += 1;
+            }
+            i += 1;
+        } else if (std.ascii.isAlphabetic(c) or c == '_') {
+            const start = i;
+            while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) i += 1;
+            const ident = text[start..i];
+            const dotted = start > 0 and text[start - 1] == '.';
+            var j = i;
+            while (j < text.len and text[j] == ' ') j += 1;
+            const called = j < text.len and text[j] == '(';
+            const what: ?[]const u8 = if (std.mem.eql(u8, ident, "Store") or std.mem.eql(u8, ident, "idDirs") or std.mem.eql(u8, ident, "store_dir_name"))
+                ident
+            else if (dotted and std.mem.eql(u8, ident, "store") and !called and !std.mem.eql(u8, prev_ident, "coupling"))
+                ".store"
+            else
+                null;
+            if (what) |w| try out.append(a, .{ .line = line, .what = w });
+            prev_ident = ident;
+        } else i += 1;
+    }
+    return out.items;
+}
+
+test "storeReaches: names the store and a draft's store, never a literal, a comment, an atomic's store or the coupling store" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\const s = try mox.state.Store.init(a, dir);
+        \\x(st.store);
+        \\_ = d.store.idDirs();
+        \\// a Store in a comment, st.store too
+        \\const t = ".DS_Store st.store";
+        \\flag.store(true, .release);
+        \\try mox.coupling.store.saveGraph(a);
+        \\
+    ;
+    const got = try storeReaches(a, src);
+    try std.testing.expectEqual(@as(usize, 4), got.len);
+    try std.testing.expectEqualStrings("Store", got[0].what);
+    try std.testing.expectEqual(@as(usize, 2), got[1].line);
+    try std.testing.expectEqualStrings("idDirs", got[3].what);
+}
+
 test "allowlist: no file outside src/state/ names a path of the state store or reaches into it" {
     // A string literal equal to a store name is a path into the store, unless
     // listed here as a use that is not one.
@@ -701,11 +767,10 @@ test "allowlist: no file outside src/state/ names a path of the state store or r
         if (std.mem.startsWith(u8, rel, "state/")) continue;
         const file = try std.fmt.allocPrint(a, "src/{s}", .{rel});
         const text = try entry.dir.readFileAlloc(io, entry.basename, a, .limited(16 * 1024 * 1024));
-        // The store's own paths and directory name are the state API's.
-        const store_fields = std.mem.count(u8, text, ".store.") - std.mem.count(u8, text, "coupling.store.");
-        const store_name = std.mem.count(u8, text, "store_dir_name");
-        if (store_fields + store_name > 0) {
-            std.debug.print("\n{s}: reaches into the state store {d} times\n", .{ file, store_fields + store_name });
+        // The store, its paths and its directory name are the state API's.
+        const reaches = try storeReaches(a, text);
+        if (reaches.len > 0) {
+            for (reaches) |r| std.debug.print("\n{s}:{d}: reaches into the state store ({s})\n", .{ file, r.line, r.what });
             bad = true;
         }
         for (names) |n| {

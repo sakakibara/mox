@@ -630,6 +630,12 @@ pub const Draft = struct {
         return blob.put(d.arena, d.io, d.store.blobs, bytes);
     }
 
+    /// Every generation under `gen/`, oldest first, and every one that
+    /// cannot be read.
+    pub fn generations(d: *const Draft) !@import("retention.zig").Inventory {
+        return @import("retention.zig").inventory(d.arena, d.io, d.store);
+    }
+
     /// Where files that could not be recovered or read are kept.
     pub fn quarantineDir(d: *const Draft) []const u8 {
         return d.store.quarantine;

@@ -33,31 +33,29 @@ fn list(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// and the blob path of its content or the target of its link; a
 /// directory's members follow it, indented.
 fn entries(ctx: *app.Ctx, st: *const mox.state.Draft, id: []const u8) !u8 {
-    const context = ctx.context.?;
     const g = (try st.displacedOf(id)) orelse {
         try ctx.err.print("mox snapshot: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
         return 1;
     };
-    const store = try mox.state.Store.init(ctx.alloc, context.paths.state_dir);
     const keys = try ctx.alloc.dupe([]const u8, g.displaced.keys());
     std.mem.sort([]const u8, keys, {}, lessStr);
     for (keys) |key| {
         const d = g.displaced.get(key).?;
         if (d.root != null) continue;
-        try line(ctx, store, "", key, d);
+        try line(ctx, st, "", key, d);
         if (d.type != .dir) continue;
         for (keys) |member| {
             const m = g.displaced.get(member).?;
             const root = m.root orelse continue;
-            if (std.mem.eql(u8, root, key)) try line(ctx, store, "  ", member, m);
+            if (std.mem.eql(u8, root, key)) try line(ctx, st, "  ", member, m);
         }
     }
     return 0;
 }
 
-fn line(ctx: *app.Ctx, store: mox.state.Store, indent: []const u8, key: []const u8, d: mox.state.generation.Displaced) !void {
+fn line(ctx: *app.Ctx, st: *const mox.state.Draft, indent: []const u8, key: []const u8, d: mox.state.generation.Displaced) !void {
     switch (d.type) {
-        .file => try ctx.out.print("{s}{s} file {s}\n", .{ indent, key, try mox.state.blob.pathOf(ctx.alloc, store.blobs, d.blob.?) }),
+        .file => try ctx.out.print("{s}{s} file {s}\n", .{ indent, key, try st.blobPath(d.blob.?) }),
         .link => try ctx.out.print("{s}{s} link -> {s}\n", .{ indent, key, d.target orelse "" }),
         .dir => try ctx.out.print("{s}{s} dir\n", .{ indent, key }),
     }
