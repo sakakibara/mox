@@ -1,7 +1,9 @@
 //! `mox diff`: show, per managed file, a unified diff of the composed output
-//! against the current live file. Read-only: takes only the readers lock and writes nothing.
-//! `--stat` prints a one-line added/removed summary per file instead of the
-//! full hunks. A difference is not an error (exit 0); a refusal exits 1.
+//! against the current live file. It takes no writer lock and writes no
+//! live file or record: it holds the readers lock, creating its file when
+//! missing. `--stat` prints a one-line added/removed summary
+//! per file instead of the full hunks. A difference is not an error (exit
+//! 0); a refusal exits 1.
 
 const std = @import("std");
 const cli = @import("cli");
