@@ -755,25 +755,30 @@ values it holds: its provenance is missing, records no windows, or records
 them under another key, and this render does not reproduce what the last
 apply wrote. stderr says so, and that `mox apply` records what diff needs,
 or, for a file with edits, `mox apply --overwrite <path>`, which writes it
-again and keeps the edits in a snapshot. A `v2/secret-lines.key` that exists
-but cannot be read, or is not a 32-byte key, stops every command that reads
-the state with a message naming it; mox makes a new key only where none
-exists. A file whose source left the tree, which apply would remove, shows
-its live content on the removed side, and such a symlink the line `symlink
--> <target>`, as does an unedited file of a generator that left the tree; a
-file that does not parse in its format is an `ERROR` line on stderr, as
-apply reports it. Read-only: it takes no writer lock, only the readers lock.
-A difference is not an error, so a run that completes exits 0 whether or not
-anything differs. An `attributes.toml`, the repo's or the private layer's,
-that is not valid TOML or cannot be read stops the run with exit 2, as it
-does in every command that reads attributes (add, apply, commit, doctor,
-edit, export, facts, mv, remove and status); rollback warns instead. A
-refusal exits 1: a path that is not managed, a head ownership declaration
-that does not parse, and an attributes entry that breaks the schema, with or
-without a source. A file's own `ERROR` that does not come from an attributes
-file -- a head directive on an unstructured target, one spelled with another
-file's comment marker, a mox directive in strict JSON, or a layer or output
-that does not parse -- is reported and the run still exits 0.
+again and keeps the edits in a snapshot. Only the commands that use
+`v2/secret-lines.key` read it: diff, when it masks a file whose provenance
+records windows, and `apply`, `commit` and `doctor --rebuild-provenance` (or
+`--fix`), which record them, before they start; a dry run records none. One
+that exists but cannot be read, or is not a 32-byte key, stops those
+commands, exit 2, with a message naming it, and every other command
+(`status`, `snapshot`, `rollback` and the rest) runs as it would; mox makes
+a new key only where none exists. A file whose source left the tree, which
+apply would remove, shows its live content on the removed side, and such a
+symlink the line `symlink -> <target>`, as does an unedited file of a
+generator that left the tree; a file that does not parse in its format is an
+`ERROR` line on stderr, as apply reports it. Read-only: it takes no writer
+lock, only the readers lock. A difference is not an error, so a run that
+completes exits 0 whether or not anything differs. An `attributes.toml`, the
+repo's or the private layer's, that is not valid TOML or cannot be read
+stops the run with exit 2, as it does in every command that reads attributes
+(add, apply, commit, doctor, edit, export, facts, mv, remove and status);
+rollback warns instead. A refusal exits 1: a path that is not managed, a
+head ownership declaration that does not parse, and an attributes entry that
+breaks the schema, with or without a source. A file's own `ERROR` that does
+not come from an attributes file -- a head directive on an unstructured
+target, one spelled with another file's comment marker, a mox directive in
+strict JSON, or a layer or output that does not parse -- is reported and the
+run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |

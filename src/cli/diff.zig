@@ -194,6 +194,13 @@ const Spec = struct {
 };
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
+    return diffRun(ctx, a) catch |e| switch (e) {
+        error.SecretKeyReported => 2,
+        else => e,
+    };
+}
+
+fn diffRun(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox diff")) return 2;
     if (try apply_cmd.privateRefusal(ctx, "mox diff")) return 2;
     const context = ctx.context.?;
@@ -542,7 +549,8 @@ const Masks = struct {
 
 /// The secret values to look for in the live file of `live_path`: those the
 /// last apply recorded, when this state's key made them, and those this run
-/// resolved, digested in memory only.
+/// resolved, digested in memory only. The state's key is read only for a
+/// file whose provenance records digests.
 fn liveMasks(
     ctx: *app.Ctx,
     st: *State,
@@ -552,11 +560,18 @@ fn liveMasks(
     prov_segments: []const mox.provenance.map.Segment,
 ) !Masks {
     const pm = mox.provenance.map;
-    const state_key = try st.secretKey();
+    var state_key: ?[pm.key_len]u8 = null;
     const recorded: ?pm.SecretWindows = blk: {
         const m = prior orelse break :blk null;
         const w = m.secretWindows() orelse break :blk null;
         if (w.sets.len == 0) break :blk w;
+        state_key = st.secretKey() catch |e| switch (e) {
+            error.SecretKeyUnreadable, error.SecretKeyMalformed => {
+                try ctx.err.print("mox: {s}", .{(try st.secretKeyProblem()) orelse "the secret-value key could not be read\n"});
+                return error.SecretKeyReported;
+            },
+            else => return e,
+        };
         const key = state_key orelse break :blk null;
         const id = w.key_id orelse break :blk null;
         if (!std.mem.eql(u8, &id, &pm.keyId(&key))) break :blk null;

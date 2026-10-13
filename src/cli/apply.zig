@@ -188,7 +188,7 @@ fn applyPass(
     // apply must finish or be cleared first, not a decision the user resolves.
     const lk = (try lock_mod.acquireForCommand(ctx, "apply")) orelse return 2;
     defer lk.release();
-    const st = (try state_cli.open(ctx, .{ .run_kind = .apply, .writes = !dry_run, .locked = true })) orelse return 2;
+    const st = (try state_cli.open(ctx, .{ .run_kind = .apply, .writes = !dry_run, .locked = true, .records_secrets = !dry_run })) orelse return 2;
     // Every exit after the first write commits what the run did.
     defer _ = state_cli.commit(ctx, st, .{}) catch false;
     if (!dry_run and try mox.private.layer.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir)) try st.notePrivate();

@@ -1659,7 +1659,7 @@ test "diff: a record whose provenance records no secret values is shown masked w
     try std.testing.expect(contains(after.out, "-edited\n"));
 }
 
-test "diff: a secret-line key that cannot be read is an error naming it, and no command makes a new one" {
+test "diff: a secret-line key that cannot be read fails diff and apply naming it, leaves the commands that do not read it working, and no command makes a new one" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (std.c.geteuid() == 0) return error.SkipZigTest;
     const io = std.testing.io;
@@ -1674,8 +1674,16 @@ test "diff: a secret-line key that cannot be read is an error naming it, and no 
     const key = try statePath(h, &.{ "v2", "secret-lines.key" });
     const before = try read(io, a, key);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\ntoken=tok-4c1d-SECRET # x\nz\n" });
+    const status_before = try h.run(&.{ "mox", "status" });
     try chmodPath(a, key, 0);
     defer chmodPath(a, key, 0o600) catch {};
+    const status = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(status_before.rc, status.rc);
+    try std.testing.expectEqualStrings(status_before.out, status.out);
+    try std.testing.expect(!contains(status.err, key));
+    const snaps = try h.run(&.{ "mox", "snapshot" });
+    try std.testing.expectEqual(@as(u8, 0), snaps.rc);
+    try std.testing.expect(!contains(snaps.err, key));
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(d.rc != 0);
     try std.testing.expect(!contains(d.out, "4c1d"));

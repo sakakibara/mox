@@ -15,6 +15,9 @@ pub const Open = struct {
     /// The caller holds the lock.
     locked: bool,
     repair: bool = false,
+    /// The run records the digests of secret values, so a secret-value key
+    /// it cannot use stops it before it starts.
+    records_secrets: bool = false,
 };
 
 /// The state for this command, or null after saying why it cannot run.
@@ -57,10 +60,10 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
         .ready => |r| {
             for (r.report.warnings.items) |w| try ctx.err.print("mox: warning: {s}\n", .{w});
             for (r.report.quarantined.items) |q| try ctx.err.print("mox: warning: a journal that could not be recovered was moved to {s}\n", .{q});
-            if (try r.draft.secretKeyProblem()) |why| {
+            if (o.records_secrets) if (try r.draft.secretKeyProblem()) |why| {
                 try ctx.err.print("mox: {s}", .{why});
                 return null;
-            }
+            };
             if (o.writes and r.draft.exhausted) {
                 try ctx.err.print("mox: the state at {s} has no readable generation; run `mox doctor --fix`\n", .{context.paths.state_dir});
                 return null;

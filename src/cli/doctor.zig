@@ -62,7 +62,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         lk = (try lock_mod.acquireForCommand(ctx, "doctor")) orelse return 1;
     }
     defer if (lk) |l| l.release();
-    const opened = (try state_cli.openWithReport(ctx, .{ .run_kind = .doctor, .writes = mutating, .locked = mutating, .repair = fix })) orelse return 2;
+    const opened = (try state_cli.openWithReport(ctx, .{ .run_kind = .doctor, .writes = mutating, .locked = mutating, .repair = fix, .records_secrets = rebuild_prov })) orelse return 2;
     const st = opened.draft;
     return state_cli.finish(ctx, st, .{}, doctorOpened(ctx, opened, fix, rebuild_prov, rebuild_coupling));
 }

@@ -95,8 +95,11 @@ All notable changes to mox are documented here. The format follows
   and the current render does not reproduce what the last apply wrote; diff
   says so and that `mox apply` (or `mox apply --overwrite <path>` for a file
   with edits) records what it needs. A `secret-lines.key` that cannot be
-  read stops the command with a message naming it; mox makes a new key only
-  where none exists.
+  read stops, with a message naming it, only the commands that use it: diff
+  when it masks a file whose provenance records digests, and apply, commit
+  and `doctor --rebuild-provenance` (or `--fix`), which record them; every
+  other command runs as it would. mox makes a new key only where none
+  exists.
 - An owned target whose record lost its canonical text is an `ERROR` in
   `status`, `diff`, `commit` and `apply`, naming the missing blob, or "no
   canonical blob recorded", and the remedy `mox apply --overwrite <path>`,
