@@ -22,10 +22,12 @@ exclusive kernel lock on `<state dir>/mox.lock` (`$MOX_STATE_DIR`, default
 `$XDG_STATE_HOME/mox`), which the system releases when its holder exits or
 dies. `private retire --dry-run` takes none. A second process sharing that
 state directory is refused while the first runs: `lock held by <pid>
-(<command>); wait`. The file stays after a run, empty. On a filesystem that
-cannot lock a file, every command that would take the lock fails closed:
-`mox: the state directory <dir> cannot be locked (<errno>); mox does not run
-without its lock`. The lock is per state directory, so runs given different
+(<command>); wait`. A holder that has taken the lock but not yet written its
+line is refused with `lock held by another mox that has not yet said who it
+is; wait`. The file stays after a run, empty. On a filesystem that cannot
+lock a file, every command that would take the lock fails closed: `mox: the
+state directory <dir> cannot be locked (<errno>); mox does not run without
+its lock`. The lock is per state directory, so runs given different
 `MOX_STATE_DIR` values take different locks and do not serialize against
 each other -- one state directory per live tree. `upgrade` takes no lock: it
 replaces the mox binary, not the repo or the live tree. An unknown command

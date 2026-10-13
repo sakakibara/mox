@@ -34,7 +34,11 @@ pub fn acquireForCommand(ctx: *app.Ctx, command: []const u8) !?Lock {
 
 /// The refusal for a lock another process holds, which only waiting frees.
 pub fn printHeld(ctx: *app.Ctx, h: state_lock.Held) !void {
-    try ctx.err.print("lock held by {d} ({s}); wait\n", .{ h.pid, h.command });
+    if (h.pid == 0) {
+        try ctx.err.writeAll("lock held by another mox that has not yet said who it is; wait\n");
+    } else {
+        try ctx.err.print("lock held by {d} ({s}); wait\n", .{ h.pid, h.command });
+    }
 }
 
 pub fn printUnsupported(ctx: *app.Ctx, errno: []const u8) !void {

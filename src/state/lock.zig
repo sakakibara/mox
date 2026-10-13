@@ -369,3 +369,24 @@ test "lock: a lock file no process holds does not refuse, empty or holding the l
         got.acquired.release();
     }
 }
+
+test "lock: a held kernel lock refuses, whatever its line holds" {
+    if (is_windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sd = try tmpState(a, io, &tmp);
+    for ([_][]const u8{ "", "not a holder\n", "2000000000 12.5 apply\n" }) |content| {
+        try tmp.dir.writeFile(io, .{ .sub_path = lock_name, .data = content });
+        const holder = try tmp.dir.openFile(io, lock_name, .{ .mode = .read_write });
+        defer holder.close(io);
+        try testing.expect(try holder.tryLock(io, .exclusive));
+        defer holder.unlock(io);
+        const got = try acquire(a, io, sd, "apply");
+        try testing.expect(got == .held);
+        try testing.expectEqual(@as(Pid, 0), got.held.pid);
+    }
+}
