@@ -20,6 +20,7 @@ const tty = @import("tty.zig");
 const Io = std.Io;
 
 const lock_name = mox.state.lock.lock_name;
+const readers_name = mox.state.lock.readers_name;
 const max_prompt_attempts = 100;
 
 pub const Action = enum { remove, preserve, prompt, history };
@@ -27,10 +28,10 @@ pub const Action = enum { remove, preserve, prompt, history };
 /// Decide what to do with a top-level entry of the state dir. The private
 /// layer is preserved unless `--purge-private`; trash and the history
 /// (`v2/`) are asked about, since they hold the user's recoverable
-/// originals; the lock file is left to the lock's own
+/// originals; the lock files are left to the locks' own
 /// release; everything else is removed.
 pub fn actionFor(name: []const u8, purge_private: bool) Action {
-    if (std.mem.eql(u8, name, lock_name)) return .preserve;
+    if (std.mem.eql(u8, name, lock_name) or std.mem.eql(u8, name, readers_name)) return .preserve;
     if (std.mem.eql(u8, name, "trash")) return .prompt;
     if (mox.state.isHistory(name)) return .history;
     if (std.mem.eql(u8, name, "private")) return if (purge_private) .remove else .preserve;
@@ -193,6 +194,7 @@ test "actionFor: private preserved by default, removed on purge; trash and the h
     try testing.expectEqual(Action.remove, actionFor("private", true));
     try testing.expectEqual(Action.prompt, actionFor("trash", false));
     try testing.expectEqual(Action.preserve, actionFor(lock_name, false));
+    try testing.expectEqual(Action.preserve, actionFor(readers_name, true));
     try testing.expectEqual(Action.remove, actionFor("coupling", false));
     // The history holds the pre-mox originals: asked about, never silently
     // removed.

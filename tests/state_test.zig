@@ -950,7 +950,7 @@ fn chmodPath(a: std.mem.Allocator, path: []const u8, mode: u32) !void {
     _ = std.c.chmod(z.ptr, @intCast(mode));
 }
 
-test "readers: a readers.lock that is only readable, and a v2/ where it cannot be created, still let status read" {
+test "readers: a readers.lock that is only readable, and a state directory where it cannot be created, still let status read" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -961,7 +961,7 @@ test "readers: a readers.lock that is only readable, and a v2/ where it cannot b
     const h = try setup(a, io, &tmp);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    const readers = try statePath(h, &.{ "v2", "readers.lock" });
+    const readers = try statePath(h, &.{"readers.lock"});
     try std.testing.expect(exists(io, readers));
 
     try chmodPath(a, readers, 0o400);
@@ -971,10 +971,9 @@ test "readers: a readers.lock that is only readable, and a v2/ where it cannot b
     try std.testing.expectEqualStrings("", ro.err);
 
     try Io.Dir.cwd().deleteFile(io, readers);
-    const v2 = try statePath(h, &.{"v2"});
-    try chmodPath(a, v2, 0o500);
+    try chmodPath(a, h.state, 0o500);
     const no_file = try h.run(&.{ "mox", "status" });
-    try chmodPath(a, v2, 0o700);
+    try chmodPath(a, h.state, 0o700);
     try std.testing.expectEqual(@as(u8, 0), no_file.rc);
     try std.testing.expectEqualStrings("", no_file.err);
     try std.testing.expect(!exists(io, readers));
@@ -991,7 +990,7 @@ test "readers: a readers.lock that cannot be opened names its path and what to d
     const h = try setup(a, io, &tmp);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    const readers = try statePath(h, &.{ "v2", "readers.lock" });
+    const readers = try statePath(h, &.{"readers.lock"});
 
     try chmodPath(a, readers, 0o000);
     const st = try h.run(&.{ "mox", "status" });
@@ -1120,7 +1119,7 @@ test "readers: doctor says what a commit left for a reader, and stops once a com
     const clean = try h.run(&.{ "mox", "doctor" });
     try std.testing.expect(!contains(clean.out, "left for a reader"));
 
-    const held = try mox.state.lock.foreignReader(io, try statePath(h, &.{ "v2", "readers.lock" }));
+    const held = try mox.state.lock.foreignReader(io, try statePath(h, &.{"readers.lock"}));
     for ([_][]const u8{ "v2\n", "v3\n", "v4\n" }) |v| {
         try writeRepo(io, &tmp, "repo/src/.zshrc", v);
         try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -1172,7 +1171,7 @@ test "readers: uninstall waits for a running reader, saying so once, then collec
     try std.testing.expect(try blobCount(h) > 0);
 
     waits = 0;
-    waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{ "v2", "readers.lock" }));
+    waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{"readers.lock"}));
     defer if (waiting_on) |r| r.release();
     mox.state.lock.before_readers_wait = releaseWaitedOn;
     defer mox.state.lock.before_readers_wait = null;
@@ -1203,7 +1202,7 @@ test "readers: uninstall --purge-snapshots and doctor --fix wait for a running r
         try testutil.gitTracked(io, a, h.repo);
 
         waits = 0;
-        waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{ "v2", "readers.lock" }));
+        waiting_on = try mox.state.lock.foreignReader(io, try statePath(h, &.{"readers.lock"}));
         defer if (waiting_on) |r| r.release();
         mox.state.lock.before_readers_wait = releaseWaitedOn;
         defer mox.state.lock.before_readers_wait = null;
@@ -1214,6 +1213,72 @@ test "readers: uninstall --purge-snapshots and doctor --fix wait for a running r
             try std.testing.expectEqual(@as(u8, 0), r.rc);
             try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
         } else try std.testing.expect(!exists(io, gen));
+    }
+}
+
+test "readers: the readers lock is in the state directory, next to mox.lock, outside v2/" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    const store = try mox.state.Store.init(a, h.state);
+    try std.testing.expectEqualStrings(try statePath(h, &.{"readers.lock"}), store.readers);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(exists(io, store.readers));
+    try std.testing.expect(!exists(io, try statePath(h, &.{ "v2", "readers.lock" })));
+}
+
+/// A reader that opens the lock file while a step waits for the one before
+/// it; it locks it once the step is done.
+var latecomer: ?Io.File = null;
+var latecomer_path: []const u8 = "";
+
+fn releaseAndOpen(io: Io, _: []const u8) void {
+    releaseWaitedOn(io, "");
+    latecomer = Io.Dir.cwd().openFile(io, latecomer_path, .{}) catch null;
+}
+
+/// The latecomer's file is still the one at the lock's path, and its shared
+/// lock is seen there.
+fn expectLatecomerHolds(h: Harness) !void {
+    const f = latecomer orelse return error.NoLatecomer;
+    defer f.close(h.io);
+    latecomer = null;
+    try std.testing.expect(exists(h.io, latecomer_path));
+    const at_path = try Io.Dir.cwd().statFile(h.io, latecomer_path, .{});
+    try std.testing.expectEqual(at_path.inode, (try f.stat(h.io)).inode);
+    try f.lock(h.io, .shared);
+    defer f.unlock(h.io);
+    try std.testing.expect(mox.state.lock.readersHeld(h.io, latecomer_path));
+}
+
+test "readers: the purge leaves the readers lock where it is, so a reader waiting on it still excludes the next step" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        latecomer_path = try statePath(h, &.{"readers.lock"});
+        waits = 0;
+        waiting_on = try mox.state.lock.foreignReader(io, latecomer_path);
+        defer if (waiting_on) |r| r.release();
+        mox.state.lock.before_readers_wait = releaseAndOpen;
+        defer mox.state.lock.before_readers_wait = null;
+        const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
+        try std.testing.expectEqual(@as(usize, 1), waits);
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(!exists(io, try statePath(h, &.{"v2"})));
+        try expectLatecomerHolds(h);
     }
 }
 

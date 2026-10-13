@@ -191,10 +191,10 @@ fn unlockFile(io: Io, file: Io.File) void {
     file.unlock(io);
 }
 
-/// The file under `v2/` that every command reading the state without
-/// writing it holds shared while it reads, and that every step deleting or
-/// moving generations, blobs or `v2/` itself holds exclusive. Only removing
-/// or moving `v2/` takes it away, under the exclusive lock.
+/// The file in the state directory, next to `mox.lock`, that every command
+/// reading the state without writing it holds shared while it reads, and
+/// that every step deleting or moving generations, blobs or `v2/` itself
+/// holds exclusive. It is never unlinked, moved or renamed.
 pub const readers_name = "readers.lock";
 
 pub const Readers = struct {
@@ -239,10 +239,16 @@ pub const Wait = struct {
     notice: *const fn (ctx: *anyopaque, path: []const u8) void,
 };
 
-/// The file at `path`, opened for reading, created 0600 when missing:
-/// `no_store` when its directory is missing, `unavailable` when the
-/// directory will not take it.
-fn openReaders(io: Io, path: []const u8) union(enum) { file: Io.File, no_store, unavailable, failed: anyerror } {
+fn exists(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+/// The lock file at `path`, opened for reading, created 0600 when missing:
+/// `no_store` when the store at `store` or the lock's directory is missing,
+/// `unavailable` when the directory will not take it.
+fn openReaders(io: Io, path: []const u8, store: ?[]const u8) union(enum) { file: Io.File, no_store, unavailable, failed: anyerror } {
+    if (store) |s| if (!exists(io, s)) return .no_store;
     if (Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false })) |f| return .{ .file = f } else |e| switch (e) {
         error.FileNotFound => {},
         else => return .{ .failed = e },
@@ -274,10 +280,11 @@ fn lockReaders(io: Io, file: Io.File, exclusive: bool, wait: bool) Io.File.LockE
     return file.tryLock(io, mode);
 }
 
-/// Hold the readers lock at `path` shared, waiting while a step that deletes
-/// holds it exclusive.
-pub fn holdReaders(io: Io, path: []const u8) Shared {
-    const file = switch (openReaders(io, path)) {
+/// Hold the readers lock at `path` shared for the store at `store`, waiting
+/// while a step that deletes holds it exclusive. A store that step removed
+/// is `no_store`.
+pub fn holdReaders(io: Io, path: []const u8, store: []const u8) Shared {
+    const file = switch (openReaders(io, path, store)) {
         .file => |f| f,
         .no_store => return .no_store,
         .unavailable => return .unavailable,
@@ -287,6 +294,11 @@ pub fn holdReaders(io: Io, path: []const u8) Shared {
         file.close(io);
         return .{ .failed = e };
     };
+    if (!exists(io, store)) {
+        unlockFile(io, file);
+        file.close(io);
+        return .no_store;
+    }
     shared_holds += 1;
     return .{ .held = .{ .io = io, .file = file, .counted = true } };
 }
@@ -298,11 +310,11 @@ pub const Mode = union(enum) {
     wait: ?Wait,
 };
 
-/// The readers lock at `path` held exclusive. A process holding it shared
-/// must release that first.
-pub fn excludeReaders(io: Io, path: []const u8, mode: Mode) error{HoldingShared}!Exclusive {
+/// The readers lock at `path` held exclusive for the store at `store`. A
+/// process holding it shared must release that first.
+pub fn excludeReaders(io: Io, path: []const u8, store: []const u8, mode: Mode) error{HoldingShared}!Exclusive {
     if (shared_holds > 0) return error.HoldingShared;
-    const file = switch (openReaders(io, path)) {
+    const file = switch (openReaders(io, path, store)) {
         .file => |f| f,
         .no_store => return .no_store,
         .unavailable => return .{ .failed = error.AccessDenied },
@@ -332,8 +344,8 @@ pub fn excludeReaders(io: Io, path: []const u8, mode: Mode) error{HoldingShared}
 
 /// The readers lock at `path` held exclusive for a step that must not skip,
 /// waiting for the readers; null when there is no store.
-pub fn waitExclusive(io: Io, path: []const u8, wait: ?Wait) !?Readers {
-    return switch (try excludeReaders(io, path, .{ .wait = wait })) {
+pub fn waitExclusive(io: Io, path: []const u8, store: []const u8, wait: ?Wait) !?Readers {
+    return switch (try excludeReaders(io, path, store, .{ .wait = wait })) {
         .held => |r| r,
         .no_store => null,
         .busy => unreachable,
@@ -350,7 +362,7 @@ pub var before_readers_wait: ?*const fn (Io, []const u8) void = null;
 /// process's count. Tests only.
 pub fn foreignReader(io: Io, path: []const u8) !Readers {
     if (!builtin.is_test) @compileError("a test seam");
-    const file = switch (openReaders(io, path)) {
+    const file = switch (openReaders(io, path, null)) {
         .file => |f| f,
         else => return error.NoReadersLock,
     };
@@ -362,7 +374,7 @@ pub fn foreignReader(io: Io, path: []const u8) !Readers {
 /// process would. Tests only.
 pub fn readersHeld(io: Io, path: []const u8) bool {
     if (!builtin.is_test) @compileError("a test seam");
-    const file = switch (openReaders(io, path)) {
+    const file = switch (openReaders(io, path, null)) {
         .file => |f| f,
         else => return false,
     };
@@ -579,12 +591,13 @@ test "readers: a process asks for the exclusive lock only after releasing its sh
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const path = try std.fs.path.join(a, &.{ try tmpState(a, io, &tmp), readers_name });
-    const shared = holdReaders(io, path).held;
-    try testing.expectError(error.HoldingShared, excludeReaders(io, path, .try_once));
-    try testing.expectError(error.HoldingShared, waitExclusive(io, path, null));
+    const sd = try tmpState(a, io, &tmp);
+    const path = try std.fs.path.join(a, &.{ sd, readers_name });
+    const shared = holdReaders(io, path, sd).held;
+    try testing.expectError(error.HoldingShared, excludeReaders(io, path, sd, .try_once));
+    try testing.expectError(error.HoldingShared, waitExclusive(io, path, sd, null));
     shared.release();
-    const excl = (try waitExclusive(io, path, null)).?;
+    const excl = (try waitExclusive(io, path, sd, null)).?;
     try testing.expect(readersHeld(io, path));
     excl.release();
     try testing.expect(!readersHeld(io, path));

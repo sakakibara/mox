@@ -89,7 +89,7 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
     if (report.exhausted and opts.repair and opts.writes and opts.locked) {
         // Starting over: what cannot be read moves aside, and the state is
         // empty, `current` absent.
-        const excl = try lock.waitExclusive(io, store.readers, opts.wait);
+        const excl = try lock.waitExclusive(io, store.readers, store.v2, opts.wait);
         defer if (excl) |x| x.release();
         try quarantineUnreadable(arena, io, store, &report);
         if (exists(io, store.current)) try recovery.quarantine(arena, io, store, store.current, &report);
@@ -150,7 +150,8 @@ pub fn claimTrashId(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]
 /// Delete the history, `v2/`, whatever state it is in: no generation needs
 /// to be readable. Waits for the readers first.
 pub fn purgeHistory(arena: std.mem.Allocator, io: Io, state_dir: []const u8, wait: ?lock.Wait) !?Deleted {
-    const excl = try lock.waitExclusive(io, (try Store.init(arena, state_dir)).readers, wait);
+    const store = try Store.init(arena, state_dir);
+    const excl = try lock.waitExclusive(io, store.readers, store.v2, wait);
     defer if (excl) |x| x.release();
     const h = try history(arena, io, state_dir);
     if (!h.present) return null;
@@ -168,12 +169,12 @@ pub fn quarantineUnreadable(arena: std.mem.Allocator, io: Io, store: Store, repo
 var held_readers: ?lock.Readers = null;
 
 /// Hold the readers lock until `releaseReaders`, so no generation or blob the
-/// command reads is deleted under it: `no_store` when there is no store to
-/// hold it in. A lock file that is missing and cannot be created is read
-/// without; any other failure is why the command cannot run.
+/// command reads is deleted under it: `no_store` when there is no store. A
+/// lock file that is missing and cannot be created is read without; any
+/// other failure is why the command cannot run.
 fn holdReaders(arena: std.mem.Allocator, io: Io, store: Store) !union(enum) { ok, no_store, stop: Opened } {
     if (held_readers != null) return .ok;
-    switch (lock.holdReaders(io, store.readers)) {
+    switch (lock.holdReaders(io, store.readers, store.v2)) {
         .held => |r| held_readers = r,
         .no_store => return .no_store,
         .unavailable => {},
@@ -216,7 +217,7 @@ pub const Expectation = union(enum) {
 /// a dead run's journal included.
 pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !Expectation {
     const store = try Store.init(arena, state_dir);
-    const attempt = lock.holdReaders(io, store.readers);
+    const attempt = lock.holdReaders(io, store.readers, store.v2);
     if (builtin.is_test) if (before_reader_load) |f| f(io);
     const readers: ?lock.Readers = switch (attempt) {
         .held => |r| r,

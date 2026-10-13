@@ -1179,27 +1179,29 @@ the state without writing it -- `status`, `diff`, `mox snapshot`, `export`,
 `doctor` without a fix, `mv`, every dry run (`private retire --dry-run`
 included), the check of the private layer that `apply`, `commit`, `remove`
 and the commands above make first, and the check `uninstall` makes before it
-asks anything -- holds `v2/readers.lock` shared while it reads, opening it
-for reading and creating it, 0600, when it is missing; where it is missing
-and cannot be created, the command reads without it. A reader that finds no
-`v2/` reads an empty state. Every step that deletes or moves generations,
-blobs or `v2/` holds the lock exclusive throughout. A run that commits
-deletes no old generation and no blob while a reader holds the lock, and a
-later run catches up. uninstall (forgetting the records or deleting the
-history) and `doctor --fix` moving what cannot be read to `v2/quarantine/`
-wait for the readers instead, printing once `mox: waiting for a running mox
-command that reads the state to finish (it holds <path>)`. Apart from these,
-a reader never holds up a run that writes. A run that is interrupted --
-killed, Ctrl-C, a crash, a power loss -- leaves its changes in a journal
-under `v2/pending/`; the next command that takes the lock recovers them, and
-`status`, `diff` and `mox snapshot` read them as recovered at once.
-Recovered runs are listed by `mox doctor`. A journal that cannot be
-recovered, because the state changed under it or its run's generation did
-not match, is moved to `v2/quarantine/` and reported; nothing there is
-deleted. A run that finds `current` changed under it when it commits --
-something other than mox wrote it while the run held the lock -- commits
-nothing: its journal goes to `v2/quarantine/`, and it exits 2 without going
-on, so an apply runs no `scripts/post` and uninstall strips nothing.
+asks anything -- holds `<state dir>/readers.lock`, the readers lock next to
+`mox.lock`, shared while it reads, opening it for reading and creating it,
+0600, when it is missing; where it is missing and cannot be created, the
+command reads without it. No mox step removes, moves or renames it. A reader
+that finds no `v2/` reads an empty state. Every step that deletes or moves
+generations, blobs or `v2/` holds the lock exclusive throughout. A run that
+commits deletes no old generation and no blob while a reader holds the lock,
+and a later run catches up. uninstall (forgetting the records or deleting
+the history) and `doctor --fix` moving what cannot be read to
+`v2/quarantine/` wait for the readers instead, printing once `mox: waiting
+for a running mox command that reads the state to finish (it holds <path>)`.
+Apart from these, a reader never holds up a run that writes. A run that is
+interrupted -- killed, Ctrl-C, a crash, a power loss -- leaves its changes
+in a journal under `v2/pending/`; the next command that takes the lock
+recovers them, and `status`, `diff` and `mox snapshot` read them as
+recovered at once. Recovered runs are listed by `mox doctor`. A journal that
+cannot be recovered, because the state changed under it or its run's
+generation did not match, is moved to `v2/quarantine/` and reported; nothing
+there is deleted. A run that finds `current` changed under it when it
+commits -- something other than mox wrote it while the run held the lock --
+commits nothing: its journal goes to `v2/quarantine/`, and it exits 2
+without going on, so an apply runs no `scripts/post` and uninstall strips
+nothing.
 
 An owned target whose record has lost its canonical text is an `ERROR` in
 `status`, `diff`, `commit` and `apply`: either its blob under `v2/blobs/`,
@@ -1338,8 +1340,9 @@ history is asked only after the check every command that touches state
 makes, so a state this version refuses is refused before any question.
 Deleting it needs no readable generation, so `--purge-snapshots` works on a
 state every other write refuses; keeping it needs one, to forget the records
-in. Either way it waits, saying so, while another mox reads the state. The
-user's source repo is never touched.
+in. Either way it waits, saying so, while another mox reads the state.
+`mox.lock` and `readers.lock`, the lock files, are kept and listed as kept,
+whatever the flags. The user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |

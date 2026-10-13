@@ -59,7 +59,7 @@ pub const Store = struct {
             .quarantine = try std.fs.path.join(arena, &.{ v2, "quarantine" }),
             .trash = try std.fs.path.join(arena, &.{ state_dir, "trash" }),
             .current = try std.fs.path.join(arena, &.{ v2, "current" }),
-            .readers = try std.fs.path.join(arena, &.{ v2, lock.readers_name }),
+            .readers = try std.fs.path.join(arena, &.{ state_dir, lock.readers_name }),
             .secret_key = try std.fs.path.join(arena, &.{ v2, secret_key_name }),
         };
     }
@@ -697,7 +697,7 @@ pub const Draft = struct {
     pub fn quarantineGeneration(d: *const Draft, gen_id: []const u8) ![]const u8 {
         const recovery = @import("recovery.zig");
         var r: recovery.Report = .{};
-        const excl = try lock.waitExclusive(d.io, d.store.readers, d.wait);
+        const excl = try lock.waitExclusive(d.io, d.store.readers, d.store.v2, d.wait);
         defer if (excl) |x| x.release();
         try recovery.quarantine(d.arena, d.io, d.store, try d.store.genPath(d.arena, gen_id), &r);
         return r.quarantined.items[0];
