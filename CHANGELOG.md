@@ -50,8 +50,21 @@ All notable changes to mox are documented here. The format follows
   reported. `mox snapshot <id>` lists what a snapshot holds and where each
   kept copy is. The lock is a kernel lock the system releases when its
   holder dies, `mox private retire` takes it, `mox.lock` stays after a run,
-  empty, and a filesystem that cannot lock a file fails closed. See "The
-  state directory" in commands.md.
+  empty, and a filesystem that cannot lock a file fails closed. A command
+  that reads the state without writing it holds `v2/readers.lock` shared
+  while it runs; a run that commits meanwhile deletes no old snapshot and
+  no unused content, a later one does, and `mox doctor` shows what waits
+  for it. uninstall and `doctor --fix` wait for such a reader instead,
+  saying so. See "The state directory" in commands.md.
+- `mox diff` masks a live line that came from a secret wherever the line
+  now sits: apply records a keyed digest of each such line, under a key
+  kept in `v2/secret-lines.key`, and never the value. A live file that may
+  hold a secret is not shown when its provenance is missing or names no
+  such lines; diff says so and that `mox apply` records what it needs.
+- An owned target whose record lost its canonical text is an `ERROR` in
+  `status`, `diff`, `commit` and `apply`, naming the missing blob, or "no
+  canonical blob recorded", and the remedy `mox apply --overwrite <path>`,
+  which says that it writes the owned keys from the source again.
 - Every structured layer, matching this machine or not, is parsed in its
   format and dialect before it composes, and every composed output after
   capture expansion. Some previously composed files may now report `ERROR`
@@ -226,6 +239,8 @@ All notable changes to mox are documented here. The format follows
   release's history.
 
 ### Fixed
+- A relative `MOX_STATE_DIR` is resolved against the current directory once,
+  at startup, so the commands it prints work from anywhere.
 - A secret in a generator's `into` path -- a `<secret:...>` capture, or a row
   field holding one -- is a compose error naming the capture's column, never
   a file name holding the secret.

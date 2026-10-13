@@ -30,10 +30,11 @@ take the lock fails closed: `mox: the state directory <dir> cannot be locked
 (<errno>); mox does not run without its lock`. The lock is per state
 directory, so runs given different `MOX_STATE_DIR` values take different
 locks and do not serialize against each other -- one state directory per
-live tree. A command that only reads the state holds the readers lock
-instead (see [The state directory](#the-state-directory)). `upgrade` takes
-no lock: it replaces the mox binary, not the repo or the live tree. An
-unknown command exits 2.
+live tree. A command that reads the state without writing it holds the
+readers lock while it reads, whether or not it takes this lock too (see [The
+state directory](#the-state-directory)). `upgrade` takes no lock: it
+replaces the mox binary, not the repo or the live tree. An unknown command
+exits 2.
 
 What mox applied lives in `<state dir>/v2/` (see [The state
 directory](#the-state-directory)).
@@ -739,23 +740,28 @@ A resolved secret is never printed: a hunk touching a secret line on either
 side is masked, and a live file whose source resolves a secret, or whose
 record was written for one, while the provenance that masks its live side is
 missing, is not shown; stderr says so, and `mox doctor --rebuild-provenance`
-records the provenance again. A file whose source left the tree, which apply
-would remove, shows its live content on the removed side, and such a symlink
-the line `symlink -> <target>`, as does an unedited file of a generator that
-left the tree; a file that does not parse in its format is an `ERROR` line
-on stderr, as apply reports it. Read-only: it takes no writer lock, only the
-readers lock. A difference is not an error, so a run that completes exits 0
-whether or not anything differs. An `attributes.toml`, the repo's or the
-private layer's, that is not valid TOML or cannot be read stops the run with
-exit 2, as it does in every command that reads attributes (add, apply,
-commit, doctor, edit, export, facts, mv, remove and status); rollback warns
-instead. A refusal exits 1: a path that is not managed, a head ownership
-declaration that does not parse, and an attributes entry that breaks the
-schema, with or without a source. A file's own `ERROR` that does not come
-from an attributes file -- a head directive on an unstructured target, one
-spelled with another file's comment marker, a mox directive in strict JSON,
-or a layer or output that does not parse -- is reported and the run still
-exits 0.
+records the provenance again. A live line is masked when it is one the last
+apply wrote from a secret, wherever it now sits: apply records a keyed
+digest of each such line (the key is `v2/secret-lines.key`, 0600; the value
+is never kept), and diff masks no live line by its position. A live file
+that may hold a secret whose provenance names no such lines is not shown
+either; stderr says so, and that `mox apply` records what diff needs. A file
+whose source left the tree, which apply would remove, shows its live content
+on the removed side, and such a symlink the line `symlink -> <target>`, as
+does an unedited file of a generator that left the tree; a file that does
+not parse in its format is an `ERROR` line on stderr, as apply reports it.
+Read-only: it takes no writer lock, only the readers lock. A difference is
+not an error, so a run that completes exits 0 whether or not anything
+differs. An `attributes.toml`, the repo's or the private layer's, that is
+not valid TOML or cannot be read stops the run with exit 2, as it does in
+every command that reads attributes (add, apply, commit, doctor, edit,
+export, facts, mv, remove and status); rollback warns instead. A refusal
+exits 1: a path that is not managed, a head ownership declaration that does
+not parse, and an attributes entry that breaks the schema, with or without a
+source. A file's own `ERROR` that does not come from an attributes file -- a
+head directive on an unstructured target, one spelled with another file's
+comment marker, a mox directive in strict JSON, or a layer or output that
+does not parse -- is reported and the run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |
@@ -1081,8 +1087,11 @@ read and the one read in its place (`--fix` commits a generation that
 follows the readable one, so `current` names one that reads; it has no file
 to move when the generation's file is gone), a run recovered from its
 journal, an owned record whose canonical text is gone, and every file in
-`v2/quarantine/`, a quarantined journal's displaced entries listed with it.
-On a state with no readable generation, `--fix` moves every unreadable
+`v2/quarantine/`, a quarantined journal's displaced entries listed with it,
+and `left for a reader: N generation(s) and M blob(s)`, what a commit kept
+because another mox was reading the state and a later commit deletes; that
+row is information and changes no exit code. On a state with no readable
+generation, `--fix` moves every unreadable
 generation and `current` to `v2/quarantine/`, reports each, and starts over
 from an empty state; the retained generations' displaced content stays
 listed and restorable. A dead journal made against the `current` that was
@@ -1153,7 +1162,8 @@ never pruned, so a clock that moved backwards loses nothing, and the state
 that was current before the run is kept through it, as the one a `current`
 that cannot be read falls back to; the next pruning run counts it like any
 other. Pruning waits for no reader: while another mox reads the state, the
-run prunes nothing and the next one catches up. A value that is not an
+run prunes nothing and the next one catches up; `mox doctor` shows what
+waits. A value that is not an
 integer warns and the default stands.
 
 ## The state directory
@@ -1166,20 +1176,30 @@ and what the run displaced, its content kept by hash in `v2/blobs/`. The run
 makes it current by rewriting `v2/current` last, so another mox sees the
 state from before the run or after it, never a half. A command that reads
 the state without writing it -- `status`, `diff`, `mox snapshot`, `export`,
-`doctor` without a fix, a dry run -- holds `v2/readers.lock` shared until it
-exits; while one does, a run that commits deletes no generation and no blob
-in `v2/blobs/`, and the next run catches up. A reader never holds up a run
-that writes. A run that is interrupted -- killed, Ctrl-C, a crash, a power
-loss -- leaves its changes in a journal under `v2/pending/`; the next
-command that takes the lock recovers them, and `status`, `diff` and `mox
-snapshot` read them as recovered at once. Recovered runs are listed by `mox
-doctor`. A journal that cannot be recovered, because the state changed under
-it or its run's generation did not match, is moved to `v2/quarantine/` and
-reported; nothing there is deleted. A run that finds `current` changed under
-it when it commits -- something other than mox wrote it while the run held
-the lock -- commits nothing: its journal goes to `v2/quarantine/`, and it
-exits 2 without going on, so an apply runs no `scripts/post` and uninstall
-strips nothing.
+`doctor` without a fix, `mv`, every dry run (`private retire --dry-run`
+included), the check of the private layer that `apply`, `commit`, `remove`
+and the commands above make first, and the check `uninstall` makes before it
+asks anything -- holds `v2/readers.lock` shared while it reads, opening it
+for reading and creating it, 0600, when it is missing; where it is missing
+and cannot be created, the command reads without it. A reader that finds no
+`v2/` reads an empty state. Every step that deletes or moves generations,
+blobs or `v2/` holds the lock exclusive throughout. A run that commits
+deletes no old generation and no blob while a reader holds the lock, and a
+later run catches up. uninstall (forgetting the records or deleting the
+history) and `doctor --fix` moving what cannot be read to `v2/quarantine/`
+wait for the readers instead, printing once `mox: waiting for a running mox
+command that reads the state to finish (it holds <path>)`. Apart from these,
+a reader never holds up a run that writes. A run that is interrupted --
+killed, Ctrl-C, a crash, a power loss -- leaves its changes in a journal
+under `v2/pending/`; the next command that takes the lock recovers them, and
+`status`, `diff` and `mox snapshot` read them as recovered at once.
+Recovered runs are listed by `mox doctor`. A journal that cannot be
+recovered, because the state changed under it or its run's generation did
+not match, is moved to `v2/quarantine/` and reported; nothing there is
+deleted. A run that finds `current` changed under it when it commits --
+something other than mox wrote it while the run held the lock -- commits
+nothing: its journal goes to `v2/quarantine/`, and it exits 2 without going
+on, so an apply runs no `scripts/post` and uninstall strips nothing.
 
 An owned target whose record has lost its canonical text is an `ERROR` in
 `status`, `diff`, `commit` and `apply`: either its blob under `v2/blobs/`,
@@ -1318,7 +1338,8 @@ history is asked only after the check every command that touches state
 makes, so a state this version refuses is refused before any question.
 Deleting it needs no readable generation, so `--purge-snapshots` works on a
 state every other write refuses; keeping it needs one, to forget the records
-in. The user's source repo is never touched.
+in. Either way it waits, saying so, while another mox reads the state. The
+user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |
