@@ -1061,6 +1061,8 @@ test "readers: a readers.lock that cannot be opened names its path and what to d
     try std.testing.expectEqual(@as(u8, 0), ap.rc);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, ap.err, "warning:"));
     try std.testing.expect(contains(ap.err, readers));
+    try std.testing.expect(!contains(ap.err, "SystemResources"));
+    try std.testing.expect(contains(ap.err, "local filesystem"));
 }
 
 var raced_harness: ?Harness = null;

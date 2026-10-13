@@ -171,7 +171,15 @@ pub fn leftover(arena: std.mem.Allocator, io: Io, store: Store) !Leftover {
 }
 
 fn notPruned(arena: std.mem.Allocator, store: Store, e: anyerror) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} could not be locked ({s}), so this run deleted no old generation and no unused blob", .{ store.readers, @errorName(e) });
+    const what = switch (e) {
+        error.FileLocksUnsupported, error.SystemResources => "the filesystem holding it cannot lock files; keep the state directory on a local filesystem",
+        error.AccessDenied, error.PermissionDenied => if (@import("builtin").os.tag == .windows)
+            "make it readable by you"
+        else
+            try std.fmt.allocPrint(arena, "make it readable by you: chmod 600 {s}", .{try @import("quote.zig").sh(arena, store.readers)}),
+        else => "it must be a file you own, on a local filesystem",
+    };
+    return std.fmt.allocPrint(arena, "{s} could not be locked, so this run deleted no old generation and no unused blob; {s}, and a later run deletes them", .{ store.readers, what });
 }
 
 /// Strip every generation down to its ids, its displaced history and the
