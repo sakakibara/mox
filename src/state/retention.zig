@@ -81,6 +81,19 @@ pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?
     };
     defer excl.release();
     var inv = try inventory(arena, io, store);
+    const gone = try doomedGenerations(arena, io, store, inv.gens, prune_keep);
+    var it = gone.keyIterator();
+    while (it.next()) |id| Io.Dir.cwd().deleteFile(io, try store.genPath(arena, id.*)) catch {};
+    if (!gc or inv.unreadable.len > 0) return null;
+    inv = try inventory(arena, io, store);
+    if (inv.unreadable.len > 0) return null;
+    try collect(arena, io, store);
+    return null;
+}
+
+/// The generations a commit's cleanup deletes: those pruned past
+/// `prune_keep`, and every empty one, never `current` or the one before it.
+fn doomedGenerations(arena: std.mem.Allocator, io: Io, store: Store, gens: []const Listed, prune_keep: ?usize) !std.StringHashMap(void) {
     const cur = recovery.parseCurrent(try recovery.readCurrent(arena, io, store));
     var protect = std.StringHashMap(void).init(arena);
     // The generation current was before this commit stays through it, so a
@@ -90,17 +103,25 @@ pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?
         if (c.parent) |p| try protect.put(p, {});
     }
     var gone = std.StringHashMap(void).init(arena);
-    if (prune_keep) |keep| try prune(arena, inv.gens, keep, &protect, &gone);
-    for (inv.gens) |l| {
+    if (prune_keep) |keep| try prune(arena, gens, keep, &protect, &gone);
+    for (gens) |l| {
         if (l.gen.displaced.count() == 0 and !protect.contains(l.id)) try gone.put(l.id, {});
     }
+    return gone;
+}
+
+pub const Leftover = struct { generations: usize, blobs: usize };
+
+/// What a commit's cleanup would delete now, pruning past `prune_keep`: what
+/// one left while a reader held the readers lock.
+pub fn leftover(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: usize) !Leftover {
+    const inv = try inventory(arena, io, store);
+    const gone = try doomedGenerations(arena, io, store, inv.gens, prune_keep);
+    if (inv.unreadable.len > 0) return .{ .generations = gone.count(), .blobs = 0 };
+    var skip = std.StringHashMap(void).init(arena);
     var it = gone.keyIterator();
-    while (it.next()) |id| Io.Dir.cwd().deleteFile(io, try store.genPath(arena, id.*)) catch {};
-    if (!gc or inv.unreadable.len > 0) return null;
-    inv = try inventory(arena, io, store);
-    if (inv.unreadable.len > 0) return null;
-    try collect(arena, io, store);
-    return null;
+    while (it.next()) |id| try skip.put(try std.fmt.allocPrint(arena, "{s}.json", .{id.*}), {});
+    return .{ .generations = gone.count(), .blobs = (try unreferenced(arena, io, store, &skip)).len };
 }
 
 fn notPruned(arena: std.mem.Allocator, store: Store, e: anyerror) ![]const u8 {
@@ -161,6 +182,16 @@ pub fn prune(arena: std.mem.Allocator, gens: []const Listed, keep_in: usize, pro
 
 /// Delete every blob no generation, journal or quarantined file names.
 pub fn collect(arena: std.mem.Allocator, io: Io, store: Store) !void {
+    var none = std.StringHashMap(void).init(arena);
+    const doomed = try unreferenced(arena, io, store, &none);
+    var dir = Io.Dir.cwd().openDir(io, store.blobs, .{}) catch return;
+    defer dir.close(io);
+    for (doomed) |name| dir.deleteFile(io, name) catch {};
+}
+
+/// Every blob no generation, journal or quarantined file names, the files
+/// `skip` names left out; none when one of them cannot be read.
+fn unreferenced(arena: std.mem.Allocator, io: Io, store: Store, skip: *const std.StringHashMap(void)) ![]const []const u8 {
     var keep = std.StringHashMap(void).init(arena);
     for ([_][]const u8{ store.gen, store.pending, store.quarantine }) |dir_path| {
         var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
@@ -168,11 +199,12 @@ pub fn collect(arena: std.mem.Allocator, io: Io, store: Store) !void {
         var it = dir.iterate();
         while (try it.next(io)) |e| {
             if (e.kind != .file) continue;
-            const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ dir_path, e.name }), arena, .limited(256 * 1024 * 1024)) catch return;
+            if (std.mem.eql(u8, dir_path, store.gen) and skip.contains(e.name)) continue;
+            const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ dir_path, e.name }), arena, .limited(256 * 1024 * 1024)) catch return &.{};
             try hexTokens(arena, bytes, &keep);
         }
     }
-    var dir = Io.Dir.cwd().openDir(io, store.blobs, .{ .iterate = true }) catch return;
+    var dir = Io.Dir.cwd().openDir(io, store.blobs, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
     var doomed: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
@@ -181,7 +213,7 @@ pub fn collect(arena: std.mem.Allocator, io: Io, store: Store) !void {
         if (generation.parseHex(e.name) == null) continue;
         if (!keep.contains(e.name)) try doomed.append(arena, try arena.dupe(u8, e.name));
     }
-    for (doomed.items) |name| dir.deleteFile(io, name) catch {};
+    return doomed.items;
 }
 
 /// Every run of 64 lowercase hex digits in `bytes`.

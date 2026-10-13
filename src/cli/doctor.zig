@@ -764,6 +764,9 @@ fn stateRows(ctx: *app.Ctx, st: *mox.state.Draft, report: mox.state.recovery.Rep
             try ctx.out.print("  bad-generation {s} (does not parse; --fix moves it to quarantine)\n", .{path});
         }
     }
+    const keep = if (ctx.context.?.env.get(ctx.alloc, "MOX_SNAPSHOT_RETENTION")) |v| std.fmt.parseInt(usize, v, 10) catch 10 else 10;
+    const left = try st.leftover(keep);
+    if (left.generations + left.blobs > 0) try ctx.out.print("  left for a reader: {d} generation(s) and {d} blob(s) a commit kept while another mox read the state; a later commit deletes them\n", .{ left.generations, left.blobs });
     for (report.quarantined.items) |q| try ctx.out.print("  moved to quarantine: {s}\n", .{q});
     for (try st.quarantined()) |q| {
         try ctx.out.print("  quarantined {s}\n", .{q.path});

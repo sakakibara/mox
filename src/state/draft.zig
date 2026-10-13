@@ -661,6 +661,11 @@ pub const Draft = struct {
         return r.quarantined.items[0];
     }
 
+    /// What a commit's cleanup would delete now, pruning past `keep`.
+    pub fn leftover(d: *const Draft, keep: usize) !@import("retention.zig").Leftover {
+        return @import("retention.zig").leftover(d.arena, d.io, d.store, keep);
+    }
+
     /// Every file in quarantine, oldest name first, with what a quarantined
     /// journal displaced.
     pub fn quarantined(d: *const Draft) ![]const Quarantined {

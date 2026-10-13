@@ -1041,6 +1041,38 @@ test "readers: every command that reads the state without writing it reads curre
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
 
+test "readers: doctor says what a commit left for a reader, and stops once a commit deletes it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_SNAPSHOT_RETENTION", .value = "1" }});
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try testutil.gitTracked(io, a, h.repo);
+    const clean = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(!contains(clean.out, "left for a reader"));
+
+    const held = try mox.state.lock.foreignReader(io, try statePath(h, &.{ "v2", "readers.lock" }));
+    for ([_][]const u8{ "v2\n", "v3\n", "v4\n" }) |v| {
+        try writeRepo(io, &tmp, "repo/src/.zshrc", v);
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    }
+    held.release();
+    const left = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(contains(left.out, "left for a reader"));
+    const left_rc = left.rc;
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v5\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const after = try h.run(&.{ "mox", "doctor" });
+    try std.testing.expect(!contains(after.out, "left for a reader"));
+    try std.testing.expectEqual(after.rc, left_rc);
+}
+
 var waiting_on: ?mox.state.lock.Readers = null;
 var waits: usize = 0;
 
