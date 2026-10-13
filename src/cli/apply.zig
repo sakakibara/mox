@@ -2901,7 +2901,7 @@ fn generatedParentEscapes(io: std.Io, base_dir: []const u8, live_path: []const u
 /// lines redacted using the last-persisted provenance for this path. mox only
 /// authored a secret line where it recorded provenance, so an absent or
 /// non-secret provenance leaves the content unchanged.
-fn redactedPriorContent(st: *const State, live_path: []const u8, content: []const u8) ![]const u8 {
+fn redactedPriorContent(st: *State, live_path: []const u8, content: []const u8) ![]const u8 {
     const prior = (try st.provenance(live_path)) orelse return content;
     return mox.provenance.map.redactSecretLines(st.arena, content, prior.segments);
 }

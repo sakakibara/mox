@@ -75,6 +75,11 @@ pub fn readGeneration(arena: std.mem.Allocator, io: Io, store: Store, id: []cons
     };
 }
 
+fn genExists(arena: std.mem.Allocator, io: Io, store: Store, id: []const u8) bool {
+    Io.Dir.cwd().access(io, store.genPath(arena, id) catch return true, .{}) catch return false;
+    return true;
+}
+
 pub const Loaded = struct {
     gen: ?Generation,
     base: []const u8,
@@ -83,8 +88,13 @@ pub const Loaded = struct {
 /// The generation `current` names, else the parent it names, with a warning;
 /// none when `current` is absent. `report.exhausted` when neither reads.
 pub fn loadCurrent(arena: std.mem.Allocator, io: Io, store: Store, report: *Report) !Loaded {
+    return loadCurrentOnce(arena, io, store, report, true);
+}
+
+fn loadCurrentOnce(arena: std.mem.Allocator, io: Io, store: Store, report: *Report, retry: bool) !Loaded {
     const base = try readCurrent(arena, io, store);
     if (base.len == 0) return .{ .gen = null, .base = base };
+    if (after_current_read) |f| f(io);
     const cur = parseCurrent(base) orelse {
         report.exhausted = true;
         try report.warnings.append(arena, "the state's current generation cannot be read; run `mox doctor --fix`");
@@ -95,6 +105,11 @@ pub fn loadCurrent(arena: std.mem.Allocator, io: Io, store: Store, report: *Repo
     if (why == .newer) {
         report.newer = why.newer;
         return .{ .gen = null, .base = base };
+    }
+    // A commit since `current` was read may have dropped the generation it
+    // named.
+    if (retry and !genExists(arena, io, store, cur.id) and !std.mem.eql(u8, try readCurrent(arena, io, store), base)) {
+        return loadCurrentOnce(arena, io, store, report, false);
     }
     report.torn = true;
     if (cur.parent) |p| {
@@ -112,6 +127,10 @@ pub fn loadCurrent(arena: std.mem.Allocator, io: Io, store: Store, report: *Repo
     try report.warnings.append(arena, try std.fmt.allocPrint(arena, "generation {s} and every one before it cannot be read; the state reads as empty, and every command that writes refuses until `mox doctor --fix`", .{cur.id}));
     return .{ .gen = null, .base = base };
 }
+
+/// The test seam between reading `current` and reading the generation it
+/// names.
+pub var after_current_read: ?*const fn (Io) void = null;
 
 pub const RecoverOptions = struct {
     writes: bool,
@@ -618,4 +637,36 @@ test "quarantine: a move never replaces a file already there" {
     try testing.expectEqualStrings("first", try Io.Dir.cwd().readFileAlloc(io, there, a, .unlimited));
     try testing.expect(!std.mem.eql(u8, there, report.quarantined.items[0]));
     try testing.expectEqualStrings("second", try Io.Dir.cwd().readFileAlloc(io, report.quarantined.items[0], a, .unlimited));
+}
+
+var seam_store: ?Store = null;
+
+test "loadCurrent: a reader that finds the generation current named gone re-reads current once" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, io, &tmp);
+    try writeGeneration(a, io, f.store, .{ .id = "20260101T000000Z", .kind = .apply, .run_kind = .apply });
+    try durable.writeFile(io, f.store.current, "20260101T000000Z\n");
+    seam_store = f.store;
+    after_current_read = struct {
+        fn commitAnother(io_: Io) void {
+            var buf: [4096]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&buf);
+            const s = seam_store.?;
+            writeGeneration(fba.allocator(), io_, s, .{ .id = "20260101T000001Z", .parent = "20260101T000000Z", .kind = .apply, .run_kind = .apply }) catch unreachable;
+            durable.writeFile(io_, s.current, "20260101T000001Z 20260101T000000Z\n") catch unreachable;
+            Io.Dir.cwd().deleteFile(io_, s.genPath(fba.allocator(), "20260101T000000Z") catch unreachable) catch unreachable;
+            after_current_read = null;
+        }
+    }.commitAnother;
+    defer after_current_read = null;
+    var report: Report = .{};
+    const got = try loadCurrent(a, io, f.store, &report);
+    try testing.expectEqualStrings("20260101T000001Z", got.gen.?.id);
+    try testing.expect(!report.torn);
+    try testing.expectEqual(@as(usize, 0), report.warnings.items.len);
 }

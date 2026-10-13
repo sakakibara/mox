@@ -470,7 +470,7 @@ fn diffLinkReplace(
 /// and must never reach stdout.
 fn diffOne(
     ctx: *app.Ctx,
-    st: *const State,
+    st: *State,
     sty: style.Style,
     stat_mode: bool,
     live_path: []const u8,

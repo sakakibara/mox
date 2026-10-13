@@ -1135,7 +1135,10 @@ targets cannot be re-patched.
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10, at least 1); an
 apply that displaced or removed something prunes the oldest of the rest,
 ordering same-second snapshots by their `-N` suffix. The current state is
-never pruned, so a clock that moved backwards loses nothing. A value that
+never pruned, so a clock that moved backwards loses nothing, and the state
+that was current before the run is kept through it, so another mox still
+reading it finds what it names; the next pruning run counts it like any
+other. A value that
 is not an integer warns and the default stands.
 
 ## The state directory

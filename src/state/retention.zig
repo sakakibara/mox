@@ -54,9 +54,14 @@ pub fn inventory(arena: std.mem.Allocator, io: Io, store: Store) !Inventory {
     for (ids.items) |id| {
         if (try recovery.readGeneration(arena, io, store, id, null)) |g| {
             try gens.append(arena, .{ .id = id, .gen = g });
-        } else try bad.append(arena, id);
+        } else if (exists(io, try store.genPath(arena, id))) try bad.append(arena, id);
     }
     return .{ .gens = gens.items, .unreadable = bad.items };
+}
+
+fn exists(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
 }
 
 fn isRollback(g: Generation) bool {
@@ -68,10 +73,14 @@ pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?
     var inv = try inventory(arena, io, store);
     const cur = recovery.parseCurrent(try recovery.readCurrent(arena, io, store));
     var protect = std.StringHashMap(void).init(arena);
-    if (cur) |c| try protect.put(c.id, {});
+    // The generation current was before this commit stays through it, so a
+    // reader still on it finds what it names.
+    if (cur) |c| {
+        try protect.put(c.id, {});
+        if (c.parent) |p| try protect.put(p, {});
+    }
     var gone = std.StringHashMap(void).init(arena);
     if (prune_keep) |keep| try prune(arena, inv.gens, keep, &protect, &gone);
-    if (cur) |c| if (c.parent) |p| try protect.put(p, {});
     for (inv.gens) |l| {
         if (l.gen.displaced.count() == 0 and !protect.contains(l.id)) try gone.put(l.id, {});
     }
@@ -234,4 +243,34 @@ test "collect: nothing is deleted while a generation does not parse, nor any blo
     try std.testing.expect(try blob.get(a, io, store.blobs, kept) != null);
     try std.testing.expect(try blob.get(a, io, store.blobs, named) != null);
     try std.testing.expect(try blob.get(a, io, store.blobs, loose) == null);
+}
+
+test "afterCommit: the generation current was before this commit keeps its blobs and is not pruned by it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const store = try Store.init(a, try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "state" }));
+    const blob = @import("blob.zig");
+    const old = try blob.put(a, io, store.blobs, "old");
+    const new = try blob.put(a, io, store.blobs, "new");
+    var g1: Generation = .{ .id = "20260101T000000Z", .kind = .apply, .run_kind = .apply };
+    try g1.displaced.put(a, "f", .{ .type = .file, .blob = old });
+    try recovery.writeGeneration(a, io, store, g1);
+    var g2: Generation = .{ .id = "20260101T000001Z", .parent = g1.id, .kind = .apply, .run_kind = .apply };
+    try g2.displaced.put(a, "f", .{ .type = .file, .blob = new });
+    try recovery.writeGeneration(a, io, store, g2);
+    try @import("durable.zig").writeFile(io, store.current, "20260101T000001Z 20260101T000000Z\n");
+    try afterCommit(a, io, store, 1, true);
+    try std.testing.expect(try recovery.readGeneration(a, io, store, g1.id, null) != null);
+    try std.testing.expect(try blob.get(a, io, store.blobs, old) != null);
+    var g3: Generation = .{ .id = "20260101T000002Z", .parent = g2.id, .kind = .apply, .run_kind = .apply };
+    try g3.displaced.put(a, "f", .{ .type = .file, .blob = new });
+    try recovery.writeGeneration(a, io, store, g3);
+    try @import("durable.zig").writeFile(io, store.current, "20260101T000002Z 20260101T000001Z\n");
+    try afterCommit(a, io, store, 1, true);
+    try std.testing.expect(try recovery.readGeneration(a, io, store, g1.id, null) == null);
+    try std.testing.expect(try blob.get(a, io, store.blobs, old) == null);
 }

@@ -374,7 +374,7 @@ fn forgetRecords(st: *state.Draft, live_path: []const u8) !void {
 /// for `live_path`. A generated leaf may hold a resolved secret; its cleartext
 /// must not be copied into a snapshot. An absent/non-secret provenance leaves
 /// the content unchanged.
-fn redactedContent(arena: std.mem.Allocator, st: *const state.Draft, live_path: []const u8, content: []const u8) ![]const u8 {
+fn redactedContent(arena: std.mem.Allocator, st: *state.Draft, live_path: []const u8, content: []const u8) ![]const u8 {
     const prior = (try st.provenance(live_path)) orelse return content;
     return prov_map.redactSecretLines(arena, content, prior.segments);
 }
