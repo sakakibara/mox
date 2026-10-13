@@ -28,7 +28,7 @@ pub const Opened = struct { draft: *state.Draft, report: state.recovery.Report }
 /// `open`, with what loading the state found.
 pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
     const context = ctx.context.?;
-    const opened = try state.open(ctx.alloc, ctx.io, .{
+    const opened = state.open(ctx.alloc, ctx.io, .{
         .state_dir = context.paths.state_dir,
         .repo_dir = context.paths.repo_dir,
         .home = context.paths.home,
@@ -38,7 +38,13 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
         .locked = o.locked,
         .repair = o.repair,
         .wait = waitFor(ctx),
-    });
+    }) catch |e| switch (e) {
+        error.ReadersLockFailed => {
+            try printReadersFailure(ctx);
+            return null;
+        },
+        else => return e,
+    };
     switch (opened) {
         .refused => |why| {
             try ctx.err.writeAll(why);
@@ -57,6 +63,16 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
             }
             return .{ .draft = r.draft, .report = r.report };
         },
+    }
+}
+
+/// Say why a step that waits for the readers could not take their lock, as
+/// a reader is told.
+pub fn printReadersFailure(ctx: *app.Ctx) !void {
+    switch ((try state.exclusiveFailure(ctx.alloc)).?) {
+        .refused => |why| try ctx.err.writeAll(why),
+        .unsupported => |errno| try lock_mod.printUnsupported(ctx, errno),
+        else => unreachable,
     }
 }
 
@@ -90,6 +106,10 @@ pub fn commit(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOption
 pub fn finish(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOptions, rc: anyerror!u8) anyerror!u8 {
     const code = rc catch |e| {
         _ = commit(ctx, st, opts) catch false;
+        if (e == error.ReadersLockFailed) {
+            try printReadersFailure(ctx);
+            return 2;
+        }
         return e;
     };
     if (!try commit(ctx, st, opts)) return 2;

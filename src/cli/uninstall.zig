@@ -100,7 +100,14 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     }
 
     if (purge_history) {
-        if (try mox.state.purgeHistory(ctx.alloc, ctx.io, context.paths.state_dir, state_cli.waitFor(ctx))) |r| {
+        const purged = mox.state.purgeHistory(ctx.alloc, ctx.io, context.paths.state_dir, state_cli.waitFor(ctx)) catch |e| switch (e) {
+            error.ReadersLockFailed => {
+                try state_cli.printReadersFailure(ctx);
+                return 2;
+            },
+            else => return e,
+        };
+        if (purged) |r| {
             if (r.err) |err| {
                 try ctx.err.print("  kept {f} (delete failed: {s})\n", .{ display.of(r.path, context.paths.home), @errorName(err) });
             } else {
@@ -123,7 +130,13 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 fn forgetRecords(ctx: *app.Ctx, st: *mox.state.Draft) !bool {
     try st.forgetEverything();
     if (!try state_cli.commit(ctx, st, .{ .skip_gc = true })) return false;
-    try st.stripHistory();
+    st.stripHistory() catch |e| switch (e) {
+        error.ReadersLockFailed => {
+            try state_cli.printReadersFailure(ctx);
+            return false;
+        },
+        else => return e,
+    };
     return true;
 }
 

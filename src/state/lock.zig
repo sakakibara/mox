@@ -342,14 +342,23 @@ pub fn excludeReaders(io: Io, path: []const u8, store: []const u8, mode: Mode) e
     return .{ .held = .{ .io = io, .file = file, .counted = false } };
 }
 
+pub const Failure = struct { path: []const u8, err: anyerror };
+
+/// Why the last step that waits for the readers could not take their lock.
+pub var exclusive_failure: ?Failure = null;
+
 /// The readers lock at `path` held exclusive for a step that must not skip,
-/// waiting for the readers; null when there is no store.
+/// waiting for the readers; null when there is no store. When it cannot be
+/// taken, `exclusive_failure` says why.
 pub fn waitExclusive(io: Io, path: []const u8, store: []const u8, wait: ?Wait) !?Readers {
     return switch (try excludeReaders(io, path, store, .{ .wait = wait })) {
         .held => |r| r,
         .no_store => null,
         .busy => unreachable,
-        .failed => |e| e,
+        .failed => |e| {
+            exclusive_failure = .{ .path = path, .err = e };
+            return error.ReadersLockFailed;
+        },
     };
 }
 

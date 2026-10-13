@@ -195,6 +195,13 @@ fn readersFailure(arena: std.mem.Allocator, path: []const u8, e: anyerror) !Open
     };
 }
 
+/// Why a step that waits for the readers could not take their lock, as a
+/// reader is told; null when none failed.
+pub fn exclusiveFailure(arena: std.mem.Allocator) !?Opened {
+    const f = lock.exclusive_failure orelse return null;
+    return try readersFailure(arena, f.path, f.err);
+}
+
 /// Release the readers lock a command's reads took, at the command's end.
 pub fn releaseReaders() void {
     if (held_readers) |r| r.release();

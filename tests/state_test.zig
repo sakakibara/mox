@@ -1248,6 +1248,42 @@ test "readers: uninstall --purge-snapshots and doctor --fix wait for a running r
     }
 }
 
+test "readers: a step that waits for the readers and cannot take their lock names the file and what to do" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const Step = enum { uninstall, purge, doctor_fix, repair };
+    for ([_]Step{ .uninstall, .purge, .doctor_fix, .repair }) |step| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try testutil.gitTracked(io, a, h.repo);
+        switch (step) {
+            .doctor_fix => try Io.Dir.cwd().writeFile(io, .{ .sub_path = try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{try currentId(h)}) }), .data = "{ torn" }),
+            .repair => try writeRepo(io, &tmp, "state/v2/current", "not an id\n"),
+            .uninstall, .purge => {},
+        }
+        mox.state.lock.forced_exclusive_failure = error.Unexpected;
+        defer mox.state.lock.forced_exclusive_failure = null;
+        const r = switch (step) {
+            .uninstall => try h.run(&.{ "mox", "uninstall" }),
+            .purge => try h.run(&.{ "mox", "uninstall", "--purge-snapshots" }),
+            .doctor_fix, .repair => try h.run(&.{ "mox", "doctor", "--fix" }),
+        };
+        if (!contains(r.err, "it must be a file you own") or contains(r.err, "error: Unexpected") or r.rc != 2) {
+            std.debug.print("{s}: rc {d}\n{s}\n", .{ @tagName(step), r.rc, r.err });
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(contains(r.err, try statePath(h, &.{"readers.lock"})));
+    }
+}
+
 test "readers: the readers lock is in the state directory, next to mox.lock, outside v2/" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
