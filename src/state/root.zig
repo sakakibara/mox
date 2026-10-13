@@ -38,6 +38,8 @@ pub const Opened = union(enum) {
     ready: Ready,
     /// The command must not run; the message says why.
     refused: []const u8,
+    /// The readers lock cannot be taken: the errno, by name.
+    unsupported: []const u8,
 };
 
 pub const Ready = struct {
@@ -58,6 +60,12 @@ fn nonEmptyDir(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
 /// Load the state for a command: recovery, then the draft.
 pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
     const store = try Store.init(arena, opts.state_dir);
+
+    if (!opts.writes) holdReaders(io, store) catch |e| switch (e) {
+        error.FileLocksUnsupported => return .{ .unsupported = "ENOTSUP" },
+        error.SystemResources => return .{ .unsupported = "ENOLCK" },
+        else => return e,
+    };
     var report: recovery.Report = .{};
     var loaded = try recovery.loadCurrent(arena, io, store, &report);
     if (report.newer) |v| return .{ .refused = try std.fmt.allocPrint(arena, "mox: state written by a newer mox (v{d}); upgrade mox to use {s}\n", .{ v, opts.state_dir }) };
@@ -138,10 +146,29 @@ pub fn quarantineUnreadable(arena: std.mem.Allocator, io: Io, store: Store, repo
     for (inv.unreadable) |gid| try recovery.quarantine(arena, io, store, try store.genPath(arena, gid), report);
 }
 
+/// The readers lock this process holds for the command it runs.
+var held_readers: ?lock.Readers = null;
+
+/// Hold the readers lock until `releaseReaders`, so no generation or blob the
+/// command reads is pruned or collected under it. Nothing to hold before the
+/// store exists.
+fn holdReaders(io: Io, store: Store) !void {
+    if (held_readers != null or !exists(io, store.v2)) return;
+    held_readers = try lock.holdReaders(io, store.readers);
+}
+
+/// Release the readers lock a command's reads took, at the command's end.
+pub fn releaseReaders() void {
+    if (held_readers) |r| r.release();
+    held_readers = null;
+}
+
 /// Whether this repo and HOME expect a private layer, read without the lock,
 /// a dead run's journal included.
 pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !bool {
     const store = try Store.init(arena, state_dir);
+    const readers: ?lock.Readers = if (exists(io, store.v2)) try lock.holdReaders(io, store.readers) else null;
+    defer if (readers) |r| r.release();
     var report: recovery.Report = .{};
     const loaded = try recovery.loadCurrent(arena, io, store, &report);
     if (report.newer != null or report.exhausted) return false;

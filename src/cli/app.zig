@@ -355,7 +355,12 @@ pub fn envOf(ctx: *Ctx) Env {
 
 pub const Ctx = MoxCli.Ctx;
 pub const Command = MoxCli.Command;
-pub const run = MoxCli.run;
+/// Run one command. The readers lock its state reads took is released when it
+/// returns, as a process's exit would release it.
+pub fn run(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8, commands: []const Command, out: *std.Io.Writer, err: *std.Io.Writer) anyerror!u8 {
+    defer mox.state.releaseReaders();
+    return MoxCli.run(alloc, io, argv, commands, out, err);
+}
 pub const command = MoxCli.command;
 
 /// Writes `fmt` (caller supplies its own "mox <cmd>: " / "usage: " prefix)

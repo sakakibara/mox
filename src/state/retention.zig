@@ -7,6 +7,7 @@ const generation = @import("generation.zig");
 const draft_mod = @import("draft.zig");
 const recovery = @import("recovery.zig");
 const id_mod = @import("id.zig");
+const lock = @import("lock.zig");
 
 const Generation = generation.Generation;
 const Store = draft_mod.Store;
@@ -68,8 +69,12 @@ fn isRollback(g: Generation) bool {
     return g.kind == .rollback or g.run_kind == .rollback;
 }
 
-/// Prune, drop empty generations, and collect unreferenced blobs.
+/// Prune, drop empty generations, and collect unreferenced blobs, unless a
+/// reader holds the readers lock: then nothing is deleted, and the next
+/// commit catches up.
 pub fn afterCommit(arena: std.mem.Allocator, io: Io, store: Store, prune_keep: ?usize, gc: bool) !void {
+    const excl = lock.excludeReaders(io, store.readers) orelse return;
+    defer excl.release();
     var inv = try inventory(arena, io, store);
     const cur = recovery.parseCurrent(try recovery.readCurrent(arena, io, store));
     var protect = std.StringHashMap(void).init(arena);
@@ -108,6 +113,8 @@ pub fn stripRecords(arena: std.mem.Allocator, io: Io, store: Store) !void {
         try recovery.writeGeneration(arena, io, store, g);
     }
     if (inv.unreadable.len > 0) return;
+    const excl = lock.excludeReaders(io, store.readers) orelse return;
+    defer excl.release();
     try collect(arena, io, store);
 }
 
@@ -273,4 +280,30 @@ test "afterCommit: the generation current was before this commit keeps its blobs
     try afterCommit(a, io, store, 1, true);
     try std.testing.expect(try recovery.readGeneration(a, io, store, g1.id, null) == null);
     try std.testing.expect(try blob.get(a, io, store.blobs, old) == null);
+}
+
+test "afterCommit: while a reader holds the readers lock nothing is pruned or collected, and that is no error; without one, it is" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const store = try Store.init(a, try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "state" }));
+    const blob = @import("blob.zig");
+    const loose = try blob.put(a, io, store.blobs, "loose");
+    try recovery.writeGeneration(a, io, store, .{ .id = "20260101T000000Z", .kind = .apply, .run_kind = .apply });
+    try recovery.writeGeneration(a, io, store, .{ .id = "20260101T000001Z", .parent = "20260101T000000Z", .kind = .apply, .run_kind = .apply });
+    try recovery.writeGeneration(a, io, store, .{ .id = "20260101T000002Z", .parent = "20260101T000001Z", .kind = .apply, .run_kind = .apply });
+    try @import("durable.zig").writeFile(io, store.current, "20260101T000002Z 20260101T000001Z\n");
+
+    const reader = try lock.holdReaders(io, store.readers);
+    try afterCommit(a, io, store, 1, true);
+    try std.testing.expect(try recovery.readGeneration(a, io, store, "20260101T000000Z", null) != null);
+    try std.testing.expect(try blob.get(a, io, store.blobs, loose) != null);
+    reader.release();
+
+    try afterCommit(a, io, store, 1, true);
+    try std.testing.expect(try recovery.readGeneration(a, io, store, "20260101T000000Z", null) == null);
+    try std.testing.expect(try blob.get(a, io, store.blobs, loose) == null);
 }

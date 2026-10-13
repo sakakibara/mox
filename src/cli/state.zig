@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const app = @import("app.zig");
+const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
 const state = mox.state;
 
@@ -40,6 +41,10 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
     switch (opened) {
         .refused => |why| {
             try ctx.err.writeAll(why);
+            return null;
+        },
+        .unsupported => |errno| {
+            try lock_mod.printUnsupported(ctx, errno);
             return null;
         },
         .ready => |r| {

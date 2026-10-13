@@ -763,3 +763,53 @@ test "state: mv and export run the start checks, refusing a state a newer mox wr
     try std.testing.expectEqual(@as(u8, 2), ex.rc);
     try std.testing.expect(contains(ex.err, "state written by a newer mox (v3)"));
 }
+
+fn generationIds(h: Harness) ![]const []const u8 {
+    const inv = try mox.state.retention.inventory(h.a, h.io, try mox.state.Store.init(h.a, h.state));
+    var out: std.ArrayList([]const u8) = .empty;
+    for (inv.gens) |l| try out.append(h.a, l.id);
+    return out.items;
+}
+
+fn hasId(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |i| if (std.mem.eql(u8, i, id)) return true;
+    return false;
+}
+
+test "readers: a reader holding its lock across commits keeps the generation and blobs it reads, silently; once it is gone, the next commit collects them" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_SNAPSHOT_RETENTION", .value = "1" }});
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const read_id = try currentId(h);
+
+    // Another mox reading: its readers lock, and the generation it loaded.
+    const store = try mox.state.Store.init(a, h.state);
+    const held = try mox.state.lock.holdReaders(io, store.readers);
+    var released = false;
+    defer if (!released) held.release();
+    const reader = (try mox.state.open(a, io, .{ .state_dir = h.state, .repo_dir = h.repo, .home = h.home, .writes = false, .locked = false })).ready.draft;
+    mox.state.releaseReaders();
+    for ([_][]const u8{ "v3\n", "v4\n" }) |v| {
+        try writeRepo(io, &tmp, "repo/src/.zshrc", v);
+        const r = try h.run(&.{ "mox", "apply" });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(!contains(r.err, "reader") and !contains(r.err, "warning"));
+    }
+    try std.testing.expect(hasId(try generationIds(h), read_id));
+    try std.testing.expectEqualStrings("v2\n", (try reader.readContent(try h.liveOf(".zshrc"))).?);
+
+    held.release();
+    released = true;
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v5\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(!hasId(try generationIds(h), read_id));
+    try std.testing.expect((try reader.readContent(try h.liveOf(".zshrc"))) == null);
+}

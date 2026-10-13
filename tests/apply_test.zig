@@ -7938,6 +7938,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/state/id.zig", "claimFrom", 1 },
         .{ "src/state/journal.zig", "begin", 1 },
         .{ "src/state/lock.zig", "acquire", 2 },
+        .{ "src/state/lock.zig", "openReaders", 1 },
         .{ "src/state/lock.zig", "release", 1 },
         .{ "src/state/recovery.zig", "commit", 3 },
         .{ "src/state/recovery.zig", "recover", 7 },

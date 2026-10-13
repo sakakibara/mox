@@ -34,6 +34,7 @@ pub const Store = struct {
     quarantine: []const u8,
     trash: []const u8,
     current: []const u8,
+    readers: []const u8,
 
     pub fn init(arena: std.mem.Allocator, state_dir: []const u8) !Store {
         const v2 = try std.fs.path.join(arena, &.{ state_dir, store_dir_name });
@@ -46,6 +47,7 @@ pub const Store = struct {
             .quarantine = try std.fs.path.join(arena, &.{ v2, "quarantine" }),
             .trash = try std.fs.path.join(arena, &.{ state_dir, "trash" }),
             .current = try std.fs.path.join(arena, &.{ v2, "current" }),
+            .readers = try std.fs.path.join(arena, &.{ v2, lock.readers_name }),
         };
     }
 
@@ -97,8 +99,6 @@ pub const Draft = struct {
     run_id: ?[]const u8 = null,
     changed: bool = false,
     committed: bool = false,
-    /// A reader re-read `current` after finding a blob gone.
-    reread: bool = false,
 
     // Reads.
 
@@ -127,29 +127,7 @@ pub const Draft = struct {
     pub fn readContent(d: *Draft, live: []const u8) !?[]const u8 {
         const f = d.fileRecord(live) orelse return null;
         const h = f.cache_blob orelse return null;
-        if (try blob.get(d.arena, d.io, d.store.blobs, h)) |bytes| return bytes;
-        if (try d.reloadOnce()) return d.readContent(live);
-        return null;
-    }
-
-    /// For a reader that found a blob gone: when `current` moved since the
-    /// load, a commit may have collected it, so load `current` again, once.
-    fn reloadOnce(d: *Draft) !bool {
-        if (d.writable or d.reread) return false;
-        d.reread = true;
-        const recovery = @import("recovery.zig");
-        if (std.mem.eql(u8, try recovery.readCurrent(d.arena, d.io, d.store), d.base)) return false;
-        var report: recovery.Report = .{};
-        const start = try recovery.loadCurrent(d.arena, d.io, d.store, &report);
-        if (report.newer != null or report.exhausted) return false;
-        const at = try recovery.recover(d.arena, d.io, d.store, start, .{ .writes = false, .unlocked = true }, &report);
-        var gen: Generation = if (at.gen) |g| try g.clone(d.arena) else .{ .id = "", .kind = d.run_kind, .run_kind = d.run_kind };
-        gen.displaced = .empty;
-        d.gen = gen;
-        d.base = at.base;
-        d.loaded = if (at.gen) |g| g.id else null;
-        d.unwritten = report.unwritten.items;
-        return true;
+        return blob.get(d.arena, d.io, d.store.blobs, h);
     }
 
     /// The owned record of `live`. One whose canonical text is missing or
@@ -172,8 +150,6 @@ pub const Draft = struct {
         };
         if (try blob.get(d.arena, d.io, d.store.blobs, h)) |bytes| {
             rec.canonical = bytes;
-        } else if (try d.reloadOnce()) {
-            return d.readOwned(live);
         } else rec.canonical_missing = try blob.pathOf(d.arena, d.store.blobs, h);
         return rec;
     }
@@ -232,10 +208,7 @@ pub const Draft = struct {
     /// The provenance kept for `live`, or null when none or malformed.
     pub fn provenance(d: *Draft, live: []const u8) !?prov_map.Map {
         const h = d.provenanceBlob(live) orelse return null;
-        const bytes = (try blob.get(d.arena, d.io, d.store.blobs, h)) orelse {
-            if (try d.reloadOnce()) return d.provenance(live);
-            return null;
-        };
+        const bytes = (try blob.get(d.arena, d.io, d.store.blobs, h)) orelse return null;
         return prov_map.deserialize(d.arena, bytes) catch null;
     }
 
@@ -966,32 +939,4 @@ test "draft: a change equal to what is held is not a change, and the journal is 
     try testing.expect(d.changed);
     const j = try Io.Dir.cwd().readFileAlloc(io, d.jnl.?.path, a, .unlimited);
     try testing.expect(std.mem.indexOf(u8, j, "expects_private") != null);
-}
-
-test "draft: a reader whose blob a later commit collected re-reads current once" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const recovery = @import("recovery.zig");
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    const store = try Store.init(a, try std.fs.path.join(a, &.{ root, "state" }));
-    var g1: Generation = .{ .id = "20260101T000000Z", .kind = .apply, .run_kind = .apply };
-    try g1.paths.put(a, "/h/f", .{ .part = applied.contentHashHex("part"), .kind = .file, .file = .{ .sha256 = applied.contentHashHex("one\n"), .cache_blob = try blob.put(a, io, store.blobs, "one\n") } });
-    try recovery.writeGeneration(a, io, store, g1);
-    try durable.writeFile(io, store.current, "20260101T000000Z\n");
-    const d = try testDraft(a, io, store.state_dir);
-    d.writable = false;
-    d.gen = try g1.clone(a);
-    d.base = "20260101T000000Z\n";
-    d.loaded = g1.id;
-
-    var g2: Generation = .{ .id = "20260101T000001Z", .parent = g1.id, .kind = .apply, .run_kind = .apply };
-    try g2.paths.put(a, "/h/f", .{ .part = applied.contentHashHex("part"), .kind = .file, .file = .{ .sha256 = applied.contentHashHex("two\n"), .cache_blob = try blob.put(a, io, store.blobs, "two\n") } });
-    try recovery.writeGeneration(a, io, store, g2);
-    try durable.writeFile(io, store.current, "20260101T000001Z 20260101T000000Z\n");
-    try Io.Dir.cwd().deleteFile(io, try blob.pathOf(a, store.blobs, applied.contentHashHex("one\n")));
-    try testing.expectEqualStrings("two\n", (try d.readContent("/h/f")).?);
 }

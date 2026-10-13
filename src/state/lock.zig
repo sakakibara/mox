@@ -191,6 +191,55 @@ fn unlockFile(io: Io, file: Io.File) void {
     file.unlock(io);
 }
 
+/// The file under `v2/` that readers hold shared while they read, and that
+/// pruning and GC, the only steps that delete generations or blobs, take
+/// exclusive. Never unlinked.
+pub const readers_name = "readers.lock";
+
+pub const Readers = struct {
+    io: Io,
+    file: Io.File,
+
+    pub fn release(self: Readers) void {
+        unlockFile(self.io, self.file);
+        self.file.close(self.io);
+    }
+};
+
+fn openReaders(io: Io, path: []const u8) !Io.File {
+    return Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = @import("durable.zig").privateFile() });
+}
+
+/// Hold the readers lock at `path` shared, waiting while pruning or GC holds
+/// it exclusive.
+pub fn holdReaders(io: Io, path: []const u8) !Readers {
+    const file = try openReaders(io, path);
+    errdefer file.close(io);
+    if (is_windows) {
+        var ov = winOverlapped();
+        if (!LockFileEx(file.handle, 0, 0, 1, 0, &ov).toBool()) return switch (windows.GetLastError()) {
+            .NOT_SUPPORTED => error.FileLocksUnsupported,
+            else => error.Unexpected,
+        };
+    } else try file.lock(io, .shared);
+    return .{ .io = io, .file = file };
+}
+
+/// The readers lock at `path` held exclusive, or null while any reader holds
+/// it or it cannot be taken.
+pub fn excludeReaders(io: Io, path: []const u8) ?Readers {
+    const file = openReaders(io, path) catch return null;
+    const got = if (is_windows) blk: {
+        var ov = winOverlapped();
+        break :blk LockFileEx(file.handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov).toBool();
+    } else file.tryLock(io, .exclusive) catch false;
+    if (!got) {
+        file.close(io);
+        return null;
+    }
+    return .{ .io = io, .file = file };
+}
+
 /// The id of this boot: `/proc/sys/kernel/random/boot_id` on Linux,
 /// `kern.bootsessionuuid` on macOS, `boot-<seconds>` from the tick count on
 /// Windows.

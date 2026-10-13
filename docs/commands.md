@@ -1142,10 +1142,11 @@ targets cannot be re-patched.
 apply that displaced or removed something prunes the oldest of the rest,
 ordering same-second snapshots by their `-N` suffix. The current state is
 never pruned, so a clock that moved backwards loses nothing, and the state
-that was current before the run is kept through it, so another mox still
-reading it finds what it names; the next pruning run counts it like any
-other. A value that
-is not an integer warns and the default stands.
+that was current before the run is kept through it, as the one a
+`current` that cannot be read falls back to; the next pruning run counts
+it like any other. Pruning waits for no reader: while another mox reads the
+state, the run prunes nothing and the next one catches up. A value that is
+not an integer warns and the default stands.
 
 ## The state directory
 
@@ -1155,9 +1156,14 @@ uninstall -- writes one generation: every record, the provenance of each
 file, each generator's produced set, the private-layer and tombstone notes,
 and what the run displaced, its content kept by hash in `v2/blobs/`. The
 run makes it current by rewriting `v2/current` last, so another mox sees
-the state from before the run or after it, never a half. A run that is
-interrupted -- killed, Ctrl-C, a crash, a power loss -- leaves its changes
-in a journal under `v2/pending/`; the next command that takes the lock
+the state from before the run or after it, never a half. A command that
+reads the state without writing it -- `status`, `diff`, `mox snapshot`,
+`export`, `doctor` without a fix, a dry run -- holds `v2/readers.lock`
+shared until it exits; while one does, a run that commits deletes no
+generation and no blob in `v2/blobs/`, and the next run catches up. A
+reader never holds up a run that writes. A run that is interrupted --
+killed, Ctrl-C, a crash, a power loss -- leaves its changes in a journal
+under `v2/pending/`; the next command that takes the lock
 recovers them, and `status`, `diff` and `mox snapshot` read them as
 recovered at once. Recovered runs are listed by `mox doctor`. A journal
 that cannot be recovered, because the state changed under it or its run's
