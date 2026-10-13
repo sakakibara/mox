@@ -8029,6 +8029,75 @@ fn countMentions(a: std.mem.Allocator, text: []const u8, name: []const u8, found
     }
 }
 
+/// The lines, outside test blocks and comments, that read one of
+/// `names` without `builtin.is_test` on the same line; a declaration
+/// `pub var <name>` and the functions `helpers` names, which only tests
+/// call, are not reads.
+fn unguardedSeams(a: std.mem.Allocator, text: []const u8, names: []const []const u8, helpers: []const []const u8) ![]const usize {
+    var out: std.ArrayList(usize) = .empty;
+    var func: []const u8 = "(top)";
+    var test_depth: ?i64 = null;
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        n += 1;
+        if (test_depth == null and (std.mem.startsWith(u8, line, "test ") or std.mem.startsWith(u8, line, "test{"))) test_depth = 0;
+        if (test_depth) |*d| {
+            d.* += braceBalance(try codeOf(a, std.mem.trim(u8, line, " \t\r")));
+            if (d.* <= 0) test_depth = null;
+            continue;
+        }
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (fnName(t)) |f| func = f;
+        const code = try codeOf(a, t);
+        if (std.mem.indexOf(u8, code, "builtin.is_test") != null) continue;
+        const helper = for (helpers) |h| {
+            if (std.mem.eql(u8, h, func)) break true;
+        } else false;
+        if (helper) continue;
+        for (names) |name| {
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, code, from, name)) |at| : (from = at + name.len) {
+                const end = at + name.len;
+                if (at > 0 and (std.ascii.isAlphanumeric(code[at - 1]) or code[at - 1] == '_')) continue;
+                if (end < code.len and (std.ascii.isAlphanumeric(code[end]) or code[end] == '_')) continue;
+                if (std.mem.startsWith(u8, code, "pub var ")) continue;
+                try out.append(a, n);
+            }
+        }
+    }
+    return out.items;
+}
+
+test "apply: every test override is read only in a test build" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const names = [_][]const u8{
+        "environ_override",       "stdin_override",     "cwd_override",           "package_runner_override",
+        "brew_prefixes_override", "elevation_override", "admin_refresh_override", "stall_override",
+        "stall_out_override",
+    };
+    var src = Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    };
+    defer src.close(io);
+    var bad = false;
+    var walker = try src.walk(a);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const text = try entry.dir.readFileAlloc(io, entry.basename, a, .limited(16 * 1024 * 1024));
+        for (try unguardedSeams(a, text, &names, &.{"runUpgrade"})) |line| {
+            std.debug.print("\nsrc/{s}:{d}: a test override read outside a test build\n", .{ entry.path, line });
+            bad = true;
+        }
+    }
+    try std.testing.expect(!bad);
+}
+
 test "apply: the primitive scanner sees past a one-line test and counts every variant" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

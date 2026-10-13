@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const apply_cmd = @import("apply.zig");
 const app = @import("app.zig");
@@ -310,7 +311,7 @@ fn findDimension(dims: []const mox.machine.dimensions.Dimension, name: []const u
 fn askRun(ctx: *app.Ctx, a: cli.Args(AskSpec)) anyerror!u8 {
     if (try apply_cmd.attributesFailure(ctx, "mox facts ask")) return 2;
     const context = ctx.context.?;
-    const scripted_input = app.stdin_override;
+    const scripted_input = if (builtin.is_test) app.stdin_override else null;
     if (scripted_input == null and !tty.isInteractive(0)) {
         try ctx.err.writeAll("mox facts ask: refusing -- not a terminal (no stdin to interview from)\n");
         return 1;

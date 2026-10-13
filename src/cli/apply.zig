@@ -212,7 +212,7 @@ fn applyPass(
 
     // The facts interview below reads scripted stdin (a test) or a real
     // terminal; apply itself never prompts, so nothing else touches this.
-    const scripted_input = app.stdin_override;
+    const scripted_input = if (builtin.is_test) app.stdin_override else null;
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader: std.Io.File.Reader = .initStreaming(.stdin(), ctx.io, &stdin_buf);
     const shared_stdin: *std.Io.Reader = scripted_input orelse &stdin_reader.interface;
@@ -1044,7 +1044,7 @@ fn bootstrapBackends(
                     try failed_names.append(ctx.alloc, b.backend);
                     continue;
                 }
-                keepalive.start(ctx.io, mox.packages.admin.refresh_interval_ms, app.admin_refresh_override orelse mox.packages.admin.sudo_refresh);
+                keepalive.start(ctx.io, mox.packages.admin.refresh_interval_ms, (if (builtin.is_test) app.admin_refresh_override else null) orelse mox.packages.admin.sudo_refresh);
             },
         };
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {

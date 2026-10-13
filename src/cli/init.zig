@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const app = @import("app.zig");
 const apply = @import("apply.zig");
@@ -115,7 +116,7 @@ fn runClone(ctx: *app.Ctx, url: []const u8, clone_fn: CloneFn, apply_now: bool, 
         const hold: clt.Hold = .{
             .io = ctx.io,
             .keepalive = keepalive,
-            .refresh = app.admin_refresh_override orelse mox.packages.admin.sudo_refresh,
+            .refresh = (if (builtin.is_test) app.admin_refresh_override else null) orelse mox.packages.admin.sudo_refresh,
         };
         if (try clt.ensure(ctx.alloc, on_path.runner(), ctx.out, app.elevation(), hold)) |why| {
             try ctx.err.print("mox init: {s}\n", .{why});

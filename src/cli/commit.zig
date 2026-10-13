@@ -1342,7 +1342,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         only_stale = stale_live.items.len > 0 and direct.items.len == 0 and leaf_targets.items.len == 0;
     }
 
-    const scripted_input = app.stdin_override;
+    const scripted_input = if (builtin.is_test) app.stdin_override else null;
     // Strict CI: rc 2 for a prompt that WOULD have been needed. That is a fact
     // about the hunks, not about the terminal, so strict mode walks the
     // prompting path off a TTY too (`prompt.ask` aborts there instead of

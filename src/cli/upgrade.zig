@@ -160,7 +160,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 /// A scripted stdin (the test harness) or a real TTY drives the interactive
 /// path; a non-interactive run without `--yes` declines rather than block.
 fn confirm(ctx: *app.Ctx, io: Io, alloc: std.mem.Allocator, tag: []const u8) !bool {
-    const scripted = app.stdin_override;
+    const scripted = if (builtin.is_test) app.stdin_override else null;
     const interactive = scripted != null or tty.isInteractive(0);
     const mode: prompt.Mode = if (interactive) .interactive else .report_only;
 

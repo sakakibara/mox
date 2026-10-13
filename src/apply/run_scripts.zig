@@ -997,9 +997,9 @@ fn runOne(
     var notice_file: Io.File.Writer = .initStreaming(.stderr(), io, &notice_buf);
     var watch: stall.Watch = .{
         .io = io,
-        .config = stall_override orelse .{},
+        .config = (if (builtin.is_test) stall_override else null) orelse .{},
         .label = try std.fmt.allocPrint(arena, "mox apply: {s}", .{path}),
-        .out = stall_out_override orelse &notice_file.interface,
+        .out = (if (builtin.is_test) stall_out_override else null) orelse &notice_file.interface,
     };
     var watcher: ?Io.Future(Io.Cancelable!void) = io.concurrent(stall.Watch.run, .{&watch}) catch |e| switch (e) {
         error.ConcurrencyUnavailable => null,

@@ -81,7 +81,7 @@ pub var admin_refresh_override: ?mox.packages.admin.Refresh = null;
 
 /// How a step needing administrator access may get it on this run.
 pub fn elevation() mox.packages.admin.Elevation {
-    return elevation_override orelse mox.packages.admin.elevation(mox.packages.exec.isRoot(), tty.isInteractive(0));
+    return (if (builtin.is_test) elevation_override else null) orelse mox.packages.admin.elevation(mox.packages.exec.isRoot(), tty.isInteractive(0));
 }
 
 /// The marker mox exports into every plugin's environment, carrying how many
@@ -156,7 +156,7 @@ pub const PackageBackends = struct {
     }
 
     pub fn runner(self: *PackageBackends) mox.packages.exec.Runner {
-        return package_runner_override orelse self.proc.runner();
+        return (if (builtin.is_test) package_runner_override else null) orelse self.proc.runner();
     }
 
     /// `scratch_dir` stages a manager's own export file and a plugin's stdin;
@@ -197,7 +197,9 @@ pub const PackageBackends = struct {
         mox.packages.exec.sweepScratch(io, arena, scratch_dir);
         const r = self.runner();
         self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir, .err = err, .probe_budget_ms = if (self.proc.timeout_ms <= 0) -1 else self.proc.timeout_ms };
-        if (brew_prefixes_override) |p| self.brew.prefixes = p;
+        if (builtin.is_test) if (brew_prefixes_override) |p| {
+            self.brew.prefixes = p;
+        };
         self.apt = .{ .manager = .apt, .runner = r, .err = err };
         self.dnf = .{ .manager = .dnf, .runner = r, .err = err };
         self.pacman = .{ .manager = .pacman, .runner = r, .err = err };
@@ -224,7 +226,7 @@ pub const PackageBackends = struct {
         // Read from the environment mox itself inherited, not from `env`:
         // `env` is what children get, and `packageEnv` has already put this
         // run's own marker in it.
-        const nested = packagesDepth(arena, environ_override orelse Env.current()) > 0;
+        const nested = packagesDepth(arena, (if (builtin.is_test) environ_override else null) orelse Env.current()) > 0;
         if (discover_plugins and nested) {
             try notes.append(arena, "no plugin is discovered: this mox runs under one (" ++
                 packages_depth_var ++ " is set); the built-in backends stay");
@@ -274,14 +276,14 @@ pub const PackageBackends = struct {
 /// rather than being passed in. On a `paths_mod.resolve` failure, `diag`
 /// carries a message and the error propagates.
 pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) anyerror!Context {
-    const env: Env = environ_override orelse Env.current();
+    const env: Env = (if (builtin.is_test) environ_override else null) orelse Env.current();
     const resolved = paths_mod.resolve(alloc, env) catch |err| {
         diag.message = std.fmt.allocPrint(alloc, "failed to resolve mox paths: {s}", .{@errorName(err)}) catch "";
         return err;
     };
     // An unreadable cwd is not a startup failure: only a relative path
     // argument needs one, and every command that takes none runs regardless.
-    const cwd: ?[]const u8 = cwd_override orelse (std.process.currentPathAlloc(io, alloc) catch null);
+    const cwd: ?[]const u8 = (if (builtin.is_test) cwd_override else null) orelse (std.process.currentPathAlloc(io, alloc) catch null);
     const paths = if (cwd) |c| try paths_mod.absoluteState(alloc, resolved, c) else resolved;
     if (mox.state.id.takes_test_clock) {
         mox.state.id.test_clock = if (env.get(alloc, "MOX_TEST_CLOCK")) |v| std.fmt.parseInt(u64, v, 10) catch null else null;
@@ -351,7 +353,7 @@ pub const MoxCli = cli.App(.{
 /// when a caller (the test harness) supplied one via `environ_override`.
 pub fn envOf(ctx: *Ctx) Env {
     if (ctx.context) |c| return c.env;
-    return environ_override orelse Env.current();
+    return (if (builtin.is_test) environ_override else null) orelse Env.current();
 }
 
 pub const Ctx = MoxCli.Ctx;
