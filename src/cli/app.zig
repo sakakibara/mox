@@ -284,7 +284,7 @@ pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) 
     // An unreadable cwd is not a startup failure: only a relative path
     // argument needs one, and every command that takes none runs regardless.
     const cwd: ?[]const u8 = (if (builtin.is_test) cwd_override else null) orelse (std.process.currentPathAlloc(io, alloc) catch null);
-    const paths = if (cwd) |c| try paths_mod.absoluteState(alloc, resolved, c) else resolved;
+    const paths = if (cwd) |c| try paths_mod.absolutePaths(alloc, resolved, c) else resolved;
     if (mox.state.id.takes_test_clock) {
         mox.state.id.test_clock = if (env.get(alloc, "MOX_TEST_CLOCK")) |v| std.fmt.parseInt(u64, v, 10) catch null else null;
     }

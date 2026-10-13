@@ -241,7 +241,9 @@ All notable changes to mox are documented here. The format follows
 
 ### Fixed
 - A relative `MOX_STATE_DIR` is resolved against the current directory once,
-  at startup, so the commands it prints work from anywhere.
+  at startup, so the commands it prints work from anywhere. A relative
+  `MOX_REPO` is resolved the same way, so every step of a run, and the
+  scripts it runs, name the repo by one absolute path.
 - A secret in a generator's `into` path -- a `<secret:...>` capture, or a row
   field holding one -- is a compose error naming the capture's column, never
   a file name holding the secret.
