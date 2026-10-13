@@ -80,22 +80,24 @@ pub const Dirs = struct {
     taken: []const []const u8 = &.{},
 };
 
-/// What claims the id.
+/// What claims the id: its journal, or its trash directory.
 pub const Claim = enum { journal, trash };
 
-/// An id of this second past every one already in `gen/`, `pending/`,
-/// `trash/` and `quarantine/`, claimed by exclusive creation of its journal or
-/// of its trash directory. Past, not only free: a dropped generation frees
-/// its id, and taking it again would put this run before ones made after it.
+/// An id past every one already in `gen/`, `pending/`, `trash/` and
+/// `quarantine/` and every one `taken` names, claimed by exclusive creation
+/// of its journal or of its trash directory. Past, not only free: a dropped
+/// generation frees its id, and taking it again would put this run before
+/// ones made after it.
 pub fn claim(arena: std.mem.Allocator, io: Io, dirs: Dirs, how: Claim) ![]const u8 {
     return claimFrom(arena, io, dirs, how, idNow(io));
 }
 
-/// `claim`, with `base` as the second.
-pub fn claimFrom(arena: std.mem.Allocator, io: Io, dirs: Dirs, how: Claim, base: [id_len]u8) ![]const u8 {
-    var n = (try newestOf(io, dirs, &base)) + 1;
-    while (true) : (n += 1) {
-        const candidate = if (n == 1) try arena.dupe(u8, &base) else try std.fmt.allocPrint(arena, "{s}-{d}", .{ &base, n });
+/// `claim`, with `now` as the second. A clock behind the newest id there is
+/// takes that id's second with the next suffix.
+pub fn claimFrom(arena: std.mem.Allocator, io: Io, dirs: Dirs, how: Claim, now: [id_len]u8) ![]const u8 {
+    var start = try next(arena, io, dirs, now);
+    while (true) : (start.n += 1) {
+        const candidate = if (start.n == 1) try arena.dupe(u8, start.base) else try std.fmt.allocPrint(arena, "{s}-{d}", .{ start.base, start.n });
         switch (how) {
             .journal => {
                 try durable.makeDir(io, dirs.pending);
@@ -119,26 +121,32 @@ pub fn claimFrom(arena: std.mem.Allocator, io: Io, dirs: Dirs, how: Claim, base:
     }
 }
 
-/// The highest suffix any entry of the four directories has for the second
-/// `base`, the plain id counting as 1; 0 when none has it.
-fn newestOf(io: Io, dirs: Dirs, base: []const u8) !u64 {
-    var newest: u64 = 0;
+const Start = struct { base: []const u8, n: u64 };
+
+/// The first id `claimFrom` tries: `now` when it is past every id there is,
+/// else the newest one's second with the next suffix.
+fn next(arena: std.mem.Allocator, io: Io, dirs: Dirs, now: [id_len]u8) !Start {
+    const newest = try newestOf(arena, io, dirs) orelse return .{ .base = try arena.dupe(u8, &now), .n = 1 };
+    const sp = split(newest);
+    if (std.mem.order(u8, sp.base, &now) == .lt) return .{ .base = try arena.dupe(u8, &now), .n = 1 };
+    return .{ .base = sp.base, .n = sp.n + 1 };
+}
+
+/// The newest id `taken` names or any entry of the four directories has.
+fn newestOf(arena: std.mem.Allocator, io: Io, dirs: Dirs) !?[]const u8 {
+    var newest: ?[]const u8 = null;
     for (dirs.taken) |t| {
-        const sp = split(t);
-        if (std.mem.eql(u8, sp.base, base)) newest = @max(newest, sp.n);
+        if (isId(t) and (newest == null or older({}, newest.?, t))) newest = t;
     }
     for ([_][]const u8{ dirs.gen, dirs.pending, dirs.trash, dirs.quarantine }) |dir_path| {
         var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch continue;
         defer dir.close(io);
         var it = dir.iterate();
         while (try it.next(io)) |e| {
-            if (!std.mem.startsWith(u8, e.name, base)) continue;
-            const end = std.mem.indexOfScalarPos(u8, e.name, base.len, '.') orelse e.name.len;
+            const end = if (e.name.len > id_len) std.mem.indexOfScalarPos(u8, e.name, id_len, '.') orelse e.name.len else e.name.len;
             const name = e.name[0..end];
             if (!isId(name)) continue;
-            const sp = split(name);
-            if (!std.mem.eql(u8, sp.base, base)) continue;
-            newest = @max(newest, sp.n);
+            if (newest == null or older({}, newest.?, name)) newest = try arena.dupe(u8, name);
         }
     }
     return newest;
@@ -185,6 +193,28 @@ test "claim: an id is past every one taken in any of the four directories" {
     // An id freed by a dropped generation is not taken again.
     try tmp.dir.deleteFile(io, "gen/20260710T081500Z.json");
     try std.testing.expectEqualStrings("20260710T081500Z-6", try claimFrom(a, io, dirs, .journal, base));
+}
+
+test "claim: under a clock behind the newest id taken, the id still sorts after it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var dirs: Dirs = .{
+        .gen = try std.fs.path.join(a, &.{ root, "gen" }),
+        .pending = try std.fs.path.join(a, &.{ root, "pending" }),
+        .quarantine = try std.fs.path.join(a, &.{ root, "quarantine" }),
+        .trash = try std.fs.path.join(a, &.{ root, "trash" }),
+    };
+    try tmp.dir.createDirPath(io, "gen");
+    try tmp.dir.writeFile(io, .{ .sub_path = "gen/20260710T081500Z-3.json", .data = "" });
+    const behind = formatId(1700000000);
+    try std.testing.expectEqualStrings("20260710T081500Z-4", try claimFrom(a, io, dirs, .journal, behind));
+    dirs.taken = &.{"20990101T000000Z"};
+    try std.testing.expectEqualStrings("20990101T000000Z-2", try claimFrom(a, io, dirs, .trash, behind));
 }
 
 test "claim: a journal's exclusive create is flushed into pending/" {

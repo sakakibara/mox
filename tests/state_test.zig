@@ -636,7 +636,7 @@ test "retention: under a clock that moved backwards, the new generation is kept"
     _ = try h.run(&.{ "mox", "apply" });
     const ids = try testutil.snapshotIds(h);
     try std.testing.expectEqual(@as(usize, 2), ids.len);
-    try std.testing.expect(try testutil.snapshotHolds(h, ids[0], ".zshrc", "v2\n"));
+    try std.testing.expect(try testutil.snapshotHolds(h, ids[1], ".zshrc", "v2\n"));
 }
 
 test "uninstall: records and flags are forgotten, the history is kept, and the records' blobs go" {
@@ -812,4 +812,64 @@ test "readers: a reader holding its lock across commits keeps the generation and
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect(!hasId(try generationIds(h), read_id));
     try std.testing.expect((try reader.readContent(try h.liveOf(".zshrc"))) == null);
+}
+
+fn trashIds(h: Harness) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var d = Io.Dir.cwd().openDir(h.io, try statePath(h, &.{"trash"}), .{ .iterate = true }) catch return out.items;
+    defer d.close(h.io);
+    var it = d.iterate();
+    while (try it.next(h.io)) |e| try out.append(h.a, try h.a.dupe(u8, e.name));
+    return out.items;
+}
+
+fn withClock(h: *Harness, secs: []const u8) !void {
+    const m = try h.a.create(std.process.Environ.Map);
+    m.* = try h.env.createMap(h.a);
+    try m.put("MOX_TEST_CLOCK", secs);
+    h.env = .{ .map = m };
+}
+
+test "ids: under a clock that moved backwards, a run's generation and trash still sort after every id there is" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_CLOCK", .value = "1783671300" }});
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try writeRepo(io, &tmp, "repo/src/.other", "o\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const first = try currentId(h);
+    try withClock(&h, "1700000000");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const second = try currentId(h);
+    try std.testing.expect(mox.state.id.older({}, first, second));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "remove", ".other" })).rc);
+    const removed = try currentId(h);
+    try std.testing.expect(mox.state.id.older({}, second, removed));
+    for (try trashIds(h)) |t| try std.testing.expect(mox.state.id.older({}, second, t));
+}
+
+test "ids: mv's trash sorts after the id current names, though that generation's file is gone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_CLOCK", .value = "1783671300" }});
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try withClock(&h, "1783671400");
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const named = try currentId(h);
+    try Io.Dir.cwd().deleteFile(io, try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{named}) }));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "mv", ".zshrc", ".zshrc2" })).rc);
+    const trash = try trashIds(h);
+    try std.testing.expectEqual(@as(usize, 1), trash.len);
+    try std.testing.expect(mox.state.id.older({}, named, trash[0]));
 }

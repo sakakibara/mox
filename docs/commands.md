@@ -207,7 +207,8 @@ longer managed.
 
 Stop managing a file and keep its live file on every machine: move its
 source (base + `.d/`) into `<state dir>/trash/<timestamp>/` recoverably
-(the timestamp carries a `-N` suffix when that second is already taken),
+(the timestamp carries a `-N` suffix when that second is already taken,
+and continues from the newest one there when the clock is behind it),
 and leave a tombstone, `released = true`, in `.mox/attributes.toml` in
 place of its entry. Every machine's apply then forgets the path's records
 and leaves its file alone; a released generator's leaves stay too,

@@ -148,8 +148,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 
     // Snapshot first: back the source (base + .d) into the trash so the move
     // is recoverable if anything goes wrong.
-    const store = try mox.state.Store.init(ctx.alloc, context.paths.state_dir);
-    const id = try mox.state.id.claim(ctx.alloc, ctx.io, store.idDirs(), .trash);
+    const id = try mox.state.claimTrashId(ctx.alloc, ctx.io, context.paths.state_dir);
     const trash = try fileops.trashRoot(ctx.alloc, context.paths.state_dir, id);
     if (file.has_base and file.source_base_abs.len > 0) {
         const dst = try std.fs.path.join(ctx.alloc, &.{ trash, file.source_base_path });

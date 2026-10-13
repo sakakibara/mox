@@ -132,6 +132,12 @@ pub fn isHistory(name: []const u8) bool {
 
 pub const Deleted = struct { path: []const u8, err: ?anyerror = null };
 
+/// Claim an id for a run that trashes without a journal, as a journal's id
+/// is claimed.
+pub fn claimTrashId(arena: std.mem.Allocator, io: Io, state_dir: []const u8) ![]const u8 {
+    return draft.claimId(arena, io, try Store.init(arena, state_dir), .trash);
+}
+
 /// Delete the history, `v2/`, whatever state it is in: no generation needs
 /// to be readable.
 pub fn purgeHistory(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !?Deleted {
