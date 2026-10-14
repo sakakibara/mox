@@ -487,6 +487,19 @@ pub fn foreignReader(io: Io, path: []const u8) !Readers {
     return .{ .io = io, .file = file, .counted = false };
 }
 
+/// The kernel lock on an open `mox.lock`, taken on the range another mox
+/// locks, which leaves the holder line readable. Tests only.
+pub fn lockAsHolder(io: Io, file: Io.File) Io.File.LockError!bool {
+    if (!builtin.is_test) @compileError("a test seam");
+    return tryLockFile(io, file);
+}
+
+/// Release a lock `lockAsHolder` took. Tests only.
+pub fn unlockAsHolder(io: Io, file: Io.File) void {
+    if (!builtin.is_test) @compileError("a test seam");
+    unlockFile(io, file);
+}
+
 /// Whether any process holds the readers lock at `path`, judged as another
 /// process would. Tests only.
 pub fn readersHeld(io: Io, path: []const u8) bool {

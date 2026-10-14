@@ -52,7 +52,7 @@ const HeldLock = struct {
         try testutil.markState(h);
         const path = try statePath(h, &.{"mox.lock"});
         const f = try Io.Dir.cwd().createFile(h.io, path, .{ .read = true, .truncate = false });
-        if (!try f.tryLock(h.io, .exclusive)) return error.LockTaken;
+        if (!try mox.state.lock.lockAsHolder(h.io, f)) return error.LockTaken;
         const line = try std.fmt.allocPrint(h.a, "{d} - 00000000-0000-0000-0000-000000000000 {s}\n", .{ pid(), command });
         try f.writePositionalAll(h.io, line, 0);
         try f.setLength(h.io, line.len);
@@ -60,7 +60,7 @@ const HeldLock = struct {
     }
 
     fn drop(l: HeldLock) void {
-        l.file.unlock(l.io);
+        mox.state.lock.unlockAsHolder(l.io, l.file);
         l.file.close(l.io);
     }
 };
