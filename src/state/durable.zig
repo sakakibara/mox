@@ -24,7 +24,9 @@ pub fn syncFile(io: Io, file: Io.File) !void {
 pub fn syncDir(io: Io, dir_path: []const u8) !void {
     if (builtin.is_test) if (synced) |log| log.append(std.testing.allocator, std.testing.allocator.dupe(u8, dir_path) catch unreachable) catch unreachable;
     if (is_windows) return;
-    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{});
+    // Linux opens a directory not opened for iteration with O_PATH, whose
+    // descriptor fsync rejects.
+    var dir = try Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
     const f: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
     try syncFile(io, f);
