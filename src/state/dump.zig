@@ -15,7 +15,6 @@ const blob = @import("blob.zig");
 const draft = @import("draft.zig");
 const recovery = @import("recovery.zig");
 const retention = @import("retention.zig");
-const prov_map = @import("../provenance/map.zig");
 
 const Hex = [applied.hash_hex_len]u8;
 
@@ -125,12 +124,12 @@ pub fn load(arena: std.mem.Allocator, io: Io, opts: Options) !Dump {
         if (e.owned) |o| p.owned = .{ .mode = o.mode, .own_paths = o.own_paths, .secret_paths = o.secret_paths };
         if (e.link) |l| p.link = .{ .target = l.target, .rolled_back = l.rolled_back };
         if (e.file) |f| if (f.provenance_blob) |h| {
-            p.provenance = try withoutDigests(arena, try blob.get(arena, io, store.blobs, h));
+            p.provenance = try blob.get(arena, io, store.blobs, h);
         };
     }
     for (g.residue.keys(), g.residue.values()) |k, h| {
         const p = try pathAt(arena, &paths, k);
-        if (p.provenance == null) p.provenance = try withoutDigests(arena, try blob.get(arena, io, store.blobs, h));
+        if (p.provenance == null) p.provenance = try blob.get(arena, io, store.blobs, h);
     }
     const path_list = paths.values();
     std.mem.sort(Path, path_list, {}, struct {
@@ -260,12 +259,3 @@ pub const verbatim = struct {
         return text;
     }
 }{};
-
-/// Provenance bytes as they read without their secret-value digests, which
-/// depend on this state's key.
-fn withoutDigests(arena: std.mem.Allocator, bytes: ?[]const u8) !?[]const u8 {
-    const b = bytes orelse return null;
-    const m = prov_map.deserialize(arena, b) catch return b;
-    if (m.secret_windows == null) return b;
-    return try prov_map.serialize(arena, m.live_path, m.segments, null);
-}

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const json = @import("json");
+const shapes_mod = @import("shapes.zig");
 
 const Io = std.Io;
 
@@ -59,119 +60,20 @@ pub const Segment = struct {
 pub const Map = struct {
     live_path: []const u8,
     segments: []const Segment,
-    /// The digests of the secret values the file was written with, when the
-    /// map was written with them.
-    secret_windows: ?SecretWindows = null,
+    /// The shapes of the lines a secret was written into, or null when the map
+    /// has secret segments but was written without them.
+    shapes: ?[]const Shape = null,
 
-    /// The digests of the secret values the file was written with, or null
-    /// when the map has secret segments but was written without them.
-    pub fn secretWindows(m: Map) ?SecretWindows {
-        if (m.secret_windows) |w| return w;
-        if (!hasSecret(m.segments)) return .{ .key_id = null, .sets = &.{} };
+    /// The secret line shapes, or null when the map names secret lines it
+    /// recorded none for.
+    pub fn secretShapes(m: Map) ?[]const Shape {
+        if (m.shapes) |s| return s;
+        if (!hasSecret(m.segments)) return &.{};
         return null;
     }
 };
 
-pub const key_len = 32;
-pub const Digest = [2 * std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8;
-
-/// A line of a secret value shorter than this is not looked for.
-pub const min_fragment = 4;
-/// The longest window of a value's line that is digested.
-pub const max_window = 8;
-
-/// The digests of every `k`-byte window of the value lines whose window
-/// length is `k`. Sorted, without repeats.
-pub const WindowSet = struct {
-    k: u32,
-    digests: []const Digest,
-
-    fn has(s: WindowSet, d: Digest) bool {
-        var lo: usize = 0;
-        var hi: usize = s.digests.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, &s.digests[mid], &d)) {
-                .eq => return true,
-                .lt => lo = mid + 1,
-                .gt => hi = mid,
-            }
-        }
-        return false;
-    }
-};
-
-/// Keyed digests of short windows of secret values, so a line holding one
-/// is recognized wherever it sits and however it was edited around the
-/// value, without the value being kept.
-pub const SecretWindows = struct {
-    /// Which key made them; null when there are none.
-    key_id: ?Digest,
-    /// One set per window length, ascending.
-    sets: []const WindowSet,
-
-    /// Whether `line` holds a window these digests name.
-    pub fn matches(w: SecretWindows, key: *const [key_len]u8, line: []const u8) bool {
-        for (w.sets) |s| {
-            if (line.len < s.k) continue;
-            var i: usize = 0;
-            while (i + s.k <= line.len) : (i += 1) {
-                if (s.has(windowDigest(key, line[i .. i + s.k]))) return true;
-            }
-        }
-        return false;
-    }
-};
-
-/// HMAC-SHA256 of `bytes` under `key`, as hex.
-pub fn windowDigest(key: *const [key_len]u8, bytes: []const u8) Digest {
-    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, bytes, key);
-    return std.fmt.bytesToHex(mac, .lower);
-}
-
-/// The name of `key` that digests record, which says nothing of the key.
-pub fn keyId(key: *const [key_len]u8) Digest {
-    return windowDigest(key, "mox secret-lines key");
-}
-
-/// The window digests of `values` under `key`, together with those of
-/// `with`, which `key` made too. Each value is split at newlines; a line of
-/// length L shorter than `min_fragment` is skipped, and every window of
-/// min(`max_window`, L) bytes of the others is digested.
-pub fn windowsOf(arena: std.mem.Allocator, key: *const [key_len]u8, values: []const []const u8, with: ?SecretWindows) !SecretWindows {
-    var by_k: [max_window + 1]std.ArrayList(Digest) = @splat(.empty);
-    if (with) |w| for (w.sets) |s| {
-        if (s.k > max_window) continue;
-        try by_k[s.k].appendSlice(arena, s.digests);
-    };
-    for (values) |v| {
-        var it = std.mem.splitScalar(u8, v, '\n');
-        while (it.next()) |frag| {
-            if (frag.len < min_fragment) continue;
-            const k = @min(max_window, frag.len);
-            var i: usize = 0;
-            while (i + k <= frag.len) : (i += 1) try by_k[k].append(arena, windowDigest(key, frag[i .. i + k]));
-        }
-    }
-    var sets: std.ArrayList(WindowSet) = .empty;
-    for (&by_k, 0..) |*list, k| {
-        if (list.items.len == 0) continue;
-        std.mem.sort(Digest, list.items, {}, struct {
-            fn lt(_: void, x: Digest, y: Digest) bool {
-                return std.mem.order(u8, &x, &y) == .lt;
-            }
-        }.lt);
-        var n: usize = 0;
-        for (list.items) |d| {
-            if (n > 0 and std.mem.eql(u8, &list.items[n - 1], &d)) continue;
-            list.items[n] = d;
-            n += 1;
-        }
-        try sets.append(arena, .{ .k = @intCast(k), .digests = list.items[0..n] });
-    }
-    return .{ .key_id = if (sets.items.len > 0) keyId(key) else null, .sets = sets.items };
-}
+pub const Shape = shapes_mod.Shape;
 
 /// Return the single segment fully containing the output-line range
 /// `[a_start, a_start + a_len)`. A zero-length range (pure insertion) is
@@ -259,52 +161,18 @@ pub fn hasSecret(segments: []const Segment) bool {
     return false;
 }
 
-/// Placeholder written over a secret's output lines in a redacted snapshot.
+/// What a secret's bytes are replaced with wherever mox shows or keeps a
+/// line that held one.
 pub const secret_redaction = "<mox:redacted-secret>";
 
-/// Return a copy of `content` with every line covered by a `.secret` segment
-/// replaced by `secret_redaction`, so a snapshot of secret-bearing content
-/// never stores the resolved plaintext. When no secret segment is present the
-/// input is returned unchanged (no allocation). Line indices follow the same
-/// logical-line rule as `lineCount` (a single trailing newline adds no line).
-pub fn redactSecretLines(arena: std.mem.Allocator, content: []const u8, segments: []const Segment) ![]const u8 {
-    if (!hasSecret(segments)) return content;
-
-    const total = lineCount(content);
-    const redacted = try arena.alloc(bool, total);
-    @memset(redacted, false);
-    for (segments) |s| {
-        if (s.origin != .secret) continue;
-        var i: u32 = s.out_start;
-        while (i < s.out_start + s.out_len and i < total) : (i += 1) redacted[i] = true;
-    }
-
-    var out: std.ArrayList(u8) = .empty;
-    const trailing_nl = content.len > 0 and content[content.len - 1] == '\n';
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    var idx: u32 = 0;
-    var first = true;
-    while (lines.next()) |line| {
-        // The empty final segment after a trailing newline is not a line.
-        if (lines.peek() == null and line.len == 0 and trailing_nl) break;
-        if (!first) try out.append(arena, '\n');
-        first = false;
-        if (idx < total and redacted[idx]) {
-            try out.appendSlice(arena, secret_redaction);
-        } else {
-            try out.appendSlice(arena, line);
-        }
-        idx += 1;
-    }
-    if (trailing_nl) try out.append(arena, '\n');
-    return out.toOwnedSlice(arena);
-}
+/// What diff prints for a live line it cannot tell holds no secret.
+pub const line_redaction = "<mox:redacted-line>";
 
 const version: i128 = 1;
 
 /// Serialize a provenance map to versioned JSON bytes (arena-owned).
-/// `secret_windows` is written only when a segment is a secret.
-pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []const Segment, secret_windows: ?SecretWindows) ![]u8 {
+/// `secret_shapes` is written only when a segment is a secret.
+pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []const Segment, secret_shapes: ?[]const Shape) ![]u8 {
     const seg_values = try arena.alloc(json.Value, segments.len);
     for (segments, 0..) |seg, i| seg_values[i] = try segmentToJson(arena, seg);
 
@@ -312,20 +180,14 @@ pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []co
     try root.put(arena, "v", .{ .integer = version });
     try root.put(arena, "live_path", .{ .string = live_path });
     try root.put(arena, "segments", .{ .array = seg_values });
-    if (secret_windows) |w| if (hasSecret(segments)) {
-        const sets = try arena.alloc(json.Value, w.sets.len);
-        for (w.sets, sets) |set, *out| {
-            const digests = try arena.alloc(json.Value, set.digests.len);
-            for (set.digests, 0..) |*d, i| digests[i] = .{ .string = d };
-            var so: json.ObjectMap = .empty;
-            try so.put(arena, "k", .{ .integer = set.k });
-            try so.put(arena, "digests", .{ .array = digests });
-            out.* = .{ .object = so };
+    if (secret_shapes) |all| if (hasSecret(segments)) {
+        const arr = try arena.alloc(json.Value, all.len);
+        for (all, arr) |shape, *out| {
+            const pieces = try arena.alloc(json.Value, shape.pieces.len);
+            for (shape.pieces, pieces) |p, *o| o.* = .{ .string = p };
+            out.* = .{ .array = pieces };
         }
-        var obj: json.ObjectMap = .empty;
-        try obj.put(arena, "key", if (w.key_id) |*k| .{ .string = k } else .null);
-        try obj.put(arena, "sets", .{ .array = sets });
-        try root.put(arena, "secret_windows", .{ .object = obj });
+        try root.put(arena, "secret_shapes", .{ .array = arr });
     };
 
     var aw: Io.Writer.Allocating = .init(arena);
@@ -387,37 +249,20 @@ pub fn deserialize(arena: std.mem.Allocator, bytes: []const u8) ParseError!Map {
 
     var out = try arena.alloc(Segment, segs_v.array.len);
     for (segs_v.array, 0..) |sv, i| out[i] = try segmentFromJson(arena, sv);
-    return .{ .live_path = try arena.dupe(u8, live), .segments = out, .secret_windows = try secretWindowsFromJson(arena, v.get("secret_windows")) };
+    return .{ .live_path = try arena.dupe(u8, live), .segments = out, .shapes = try shapesFromJson(arena, v.get("secret_shapes")) };
 }
 
-fn secretWindowsFromJson(arena: std.mem.Allocator, v: ?json.Value) ParseError!?SecretWindows {
+fn shapesFromJson(arena: std.mem.Allocator, v: ?json.Value) ParseError!?[]const Shape {
     const val = v orelse return null;
-    if (val != .object) return error.InvalidProvenance;
-    const key: ?Digest = if (val.get("key")) |k| switch (k) {
-        .null => null,
-        .string => |str| try digestOf(str),
-        else => return error.InvalidProvenance,
-    } else return error.InvalidProvenance;
-    const sv = val.get("sets") orelse return error.InvalidProvenance;
-    if (sv != .array) return error.InvalidProvenance;
-    const sets = try arena.alloc(WindowSet, sv.array.len);
-    for (sv.array, sets) |set, *out| {
-        if (set != .object) return error.InvalidProvenance;
-        const k = intOf(set.get("k")) orelse return error.InvalidProvenance;
-        if (k == 0 or k > max_window) return error.InvalidProvenance;
-        const ds = set.get("digests") orelse return error.InvalidProvenance;
-        if (ds != .array) return error.InvalidProvenance;
-        const digests = try arena.alloc(Digest, ds.array.len);
-        for (ds.array, digests) |d, *o| o.* = try digestOf(stringOf(d) orelse return error.InvalidProvenance);
-        out.* = .{ .k = @intCast(k), .digests = digests };
+    if (val != .array) return error.InvalidProvenance;
+    const out = try arena.alloc(Shape, val.array.len);
+    for (val.array, out) |sv, *o| {
+        if (sv != .array or sv.array.len < 2) return error.InvalidProvenance;
+        const pieces = try arena.alloc([]const u8, sv.array.len);
+        for (sv.array, pieces) |pv, *p| p.* = try arena.dupe(u8, stringOf(pv) orelse return error.InvalidProvenance);
+        o.* = .{ .pieces = pieces };
     }
-    return .{ .key_id = key, .sets = sets };
-}
-
-fn digestOf(s: []const u8) ParseError!Digest {
-    if (s.len != @sizeOf(Digest)) return error.InvalidProvenance;
-    for (s) |c| if (!std.ascii.isHex(c)) return error.InvalidProvenance;
-    return s[0..@sizeOf(Digest)].*;
+    return out;
 }
 
 fn segmentFromJson(arena: std.mem.Allocator, sv: json.Value) ParseError!Segment {
@@ -484,27 +329,6 @@ test "hasSecret: detects a secret segment" {
     };
     try testing.expect(hasSecret(&with));
     try testing.expect(!hasSecret(&without));
-}
-
-test "redactSecretLines: blanks secret lines, keeps the rest, preserves trailing newline" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const content = "export FOO=bar\nsupersecret\nexport BAZ=qux\n";
-    const segs = [_]Segment{
-        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
-        .{ .out_start = 1, .out_len = 1, .origin = .secret },
-        .{ .out_start = 2, .out_len = 1, .origin = .{ .base = .{ .line = 3 } } },
-    };
-    const out = try redactSecretLines(a, content, &segs);
-    try testing.expectEqualStrings("export FOO=bar\n" ++ secret_redaction ++ "\nexport BAZ=qux\n", out);
-    // "supersecret" must not survive anywhere.
-    try testing.expect(std.mem.indexOf(u8, out, "supersecret") == null);
-
-    // With no secret segment the input is returned as-is.
-    const clean = [_]Segment{.{ .out_start = 0, .out_len = 3, .origin = .{ .base = .{ .line = 1 } } }};
-    try testing.expectEqualStrings(content, try redactSecretLines(a, content, &clean));
 }
 
 test "covering: finds fully-contained range, rejects straddling" {
@@ -588,32 +412,18 @@ test "serialize/deserialize round-trip preserves every origin kind" {
     try testing.expect(parsed.segments[6].origin == .private);
 }
 
-test "windowsOf: a line holding a window of a value is found, edited around it, under the key that made it" {
+test "serialize/deserialize: secret shapes round-trip, and a map with secret lines written without them names none" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const key: [key_len]u8 = @splat(7);
     const segs = [_]Segment{
         .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
         .{ .out_start = 1, .out_len = 1, .origin = .secret },
     };
-    const w = try windowsOf(a, &key, &.{ "tok-4c1d-SECRET", "abc", "first-AAAA\nqz7k1" }, null);
-    try testing.expect(w.matches(&key, "export T=tok-4c1d-SECRET # x"));
-    try testing.expect(w.matches(&key, "..1d-SECRE.."));
-    try testing.expect(!w.matches(&key, "...d-SECRE..."));
-    try testing.expect(w.matches(&key, "pin qz7k1."));
-    try testing.expect(!w.matches(&key, "pin qz7k"));
-    try testing.expect(!w.matches(&key, "abc"));
-    try testing.expect(!w.matches(&key, "token=other"));
-    const other: [key_len]u8 = @splat(8);
-    try testing.expect(!w.matches(&other, "tok-4c1d-SECRET"));
-    const back = try deserialize(a, try serialize(a, "/h/f", &segs, w));
-    try testing.expect(back.secretWindows().?.matches(&key, "tok-4c1d-SECRET"));
-    try testing.expectEqual(keyId(&key), back.secretWindows().?.key_id.?);
-    const merged = try windowsOf(a, &key, &.{"zzzz-yyyy"}, back.secretWindows().?);
-    try testing.expect(merged.matches(&key, "tok-4c1d-SECRET"));
-    try testing.expect(merged.matches(&key, "zzzz-yyyy"));
-    // Written without them: unknown, unless no segment is a secret.
-    try testing.expect((try deserialize(a, try serialize(a, "/h/f", &segs, null))).secretWindows() == null);
-    try testing.expectEqual(@as(usize, 0), (try deserialize(a, try serialize(a, "/h/f", segs[0..1], null))).secretWindows().?.sets.len);
+    const shapes = [_]Shape{.{ .pieces = &.{ "token=", " # c" } }};
+    const back = try deserialize(a, try serialize(a, "/h/f", &segs, &shapes));
+    try testing.expectEqual(@as(usize, 1), back.secretShapes().?.len);
+    try testing.expectEqualStrings(" # c", back.secretShapes().?[0].pieces[1]);
+    try testing.expect((try deserialize(a, try serialize(a, "/h/f", &segs, null))).secretShapes() == null);
+    try testing.expectEqual(@as(usize, 0), (try deserialize(a, try serialize(a, "/h/f", segs[0..1], null))).secretShapes().?.len);
 }

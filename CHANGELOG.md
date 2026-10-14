@@ -93,21 +93,20 @@ All notable changes to mox are documented here. The format follows
 - A command that only reads the state (`status`, `diff`, `mox snapshot`,
   `export`, `doctor`) can now be refused, with exit 2, when `readers.lock`
   cannot be opened, naming the file and what to do.
-- `mox diff` masks a live line that holds a secret value wherever the line
-  now sits and however it was edited around the value: apply records keyed
-  digests of short windows of each secret value it resolved, under a key
-  kept in `v2/secret-lines.key`, and never the value, and diff also looks
-  for the values its own render resolves. A live file that may hold a
-  secret is not shown when neither says which values it holds -- its
-  provenance is missing, records none, or records them under another key,
-  and the current render does not reproduce what the last apply wrote; diff
-  says so and that `mox apply` (or `mox apply --overwrite <path>` for a file
-  with edits) records what it needs. A `secret-lines.key` that cannot be
-  read stops, with a message naming it, only the commands that use it: diff
-  when it masks a file whose provenance records digests, and apply, commit
-  and `doctor --rebuild-provenance` (or `--fix`), which record them; every
-  other command runs as it would. mox makes a new key only where none
-  exists.
+- `mox diff` masks a secret in a live line wherever the line now sits:
+  apply records, in the file's provenance, the shape of each line it wrote
+  a secret into -- the text of the line around the secret -- and nothing
+  derived from the value. A live line with a recorded shape is printed with
+  the secret's place shown as `<mox:redacted-secret>`, and every value the
+  current render resolves is masked wherever it occurs, as written and
+  JSON-escaped, TOML- or YAML-quoted. When a shape matches no live line, a
+  secret line was edited beyond it, and every live line diff cannot tell
+  apart from the composed output's lines that hold no secret is printed as
+  `<mox:redacted-line>`. A live file that may hold a secret and whose
+  provenance is missing or records no shapes is masked by the current
+  render's shapes when that render reproduces what the last apply wrote, and
+  is otherwise not shown; diff says so and that `mox apply` (or `mox apply
+  --overwrite <path>` for a file with edits) records what it needs.
 - An owned target whose record lost its canonical text is an `ERROR` in
   `status`, `diff`, `commit` and `apply`, naming the missing blob, or "no
   canonical blob recorded", and the remedy `mox apply --overwrite <path>`,
@@ -290,6 +289,12 @@ All notable changes to mox are documented here. The format follows
   release's history.
 
 ### Fixed
+- A snapshot of a file mox wrote a secret into masks the secret by the
+  shape of its line, wherever the line has moved, and masks every value the
+  run resolved wherever it occurs; any other line is kept as it is. It used
+  to mask the lines at the places the last apply wrote secrets to, so a
+  secret line the user had moved was kept in clear and the line now in its
+  place was masked.
 - A relative `MOX_STATE_DIR` is resolved against the current directory once,
   at startup, so the commands it prints work from anywhere. It is joined to
   the current directory as the system resolves it, keeping a `..`, which

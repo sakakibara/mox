@@ -191,7 +191,7 @@ fn applyPass(
         .exit => |rc| return rc,
     };
     defer lk.release();
-    const st = (try state_cli.open(ctx, .{ .run_kind = .apply, .writes = !dry_run, .locked = true, .records_secrets = !dry_run })) orelse return 2;
+    const st = (try state_cli.open(ctx, .{ .run_kind = .apply, .writes = !dry_run, .locked = true })) orelse return 2;
     // Every exit after the first write commits what the run did.
     defer _ = state_cli.commit(ctx, st, .{}) catch false;
     if (!dry_run and try mox.private.layer.holdsSource(ctx.alloc, ctx.io, context.paths.private_dir)) try st.notePrivate();
@@ -2295,7 +2295,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
                 if (!contains_secret) {
                     try st.recordContent(in.live_path, in.bytes);
                 }
-                try st.persistProvenance(in.live_path, in.prov_items);
+                try st.persistProvenance(in.live_path, in.bytes, in.prov_items);
             }
             try ctx.out.print("  unchanged {s}\n", .{shown});
             return;
@@ -2339,7 +2339,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
         if (!contains_secret) {
             try st.recordContent(in.live_path, in.bytes);
         }
-        try st.persistProvenance(in.live_path, in.prov_items);
+        try st.persistProvenance(in.live_path, in.bytes, in.prov_items);
     }
     counts.ok += 1;
     try ctx.out.print("  {s} {s}\n", .{ if (in.create_once) "seeded" else "wrote", shown });
@@ -2927,13 +2927,10 @@ fn generatedParentEscapes(io: std.Io, base_dir: []const u8, live_path: []const u
     return false;
 }
 
-/// The prior live content to snapshot before an overwrite, with any secret
-/// lines redacted using the last-persisted provenance for this path. mox only
-/// authored a secret line where it recorded provenance, so an absent or
-/// non-secret provenance leaves the content unchanged.
+/// The prior live content to snapshot before an overwrite, its secrets
+/// masked as `Draft.redactPrior` says.
 fn redactedPriorContent(st: *State, live_path: []const u8, content: []const u8) ![]const u8 {
-    const prior = (try st.provenance(live_path)) orelse return content;
-    return mox.provenance.map.redactSecretLines(st.arena, content, prior.segments);
+    return st.redactPrior(live_path, content);
 }
 
 /// True when the live path's CURRENT content still equals `initial` (the copy

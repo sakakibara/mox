@@ -1012,7 +1012,7 @@ test "compose catB: a directiveless file's inline secret marks only its own line
 
     // Redacting the composed output must blank ONLY the token line; the two
     // non-secret lines must survive verbatim -- what snapshot/rollback relies on.
-    const redacted = try mox.provenance.map.redactSecretLines(a, out.?, prov.items);
+    const redacted = try redactedByShapes(a, out.?, prov.items, &cache);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "endpoint = https://example.test") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "retries = 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "hunter2") == null);
@@ -1063,7 +1063,7 @@ test "compose catB: an included fragment's inline secret marks only its own line
     try std.testing.expect(out != null);
     try std.testing.expect(std.mem.indexOf(u8, out.?, "api = hunter2") != null);
 
-    const redacted = try mox.provenance.map.redactSecretLines(a, out.?, prov.items);
+    const redacted = try redactedByShapes(a, out.?, prov.items, &cache);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "plain_before = keepme") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "plain_after = alsokeep") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "# top") != null);
@@ -3306,7 +3306,7 @@ test "compose catA toml: an inline secret marks only its own line" {
     const out = (try mox.compose.catA.compose(a, io, tree.files[0], &bindings_r, &m_state, .{ .env = Env{ .map = &map }, .cache = &cache }, &prov, null)).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "api_key = \"hunter2\"") != null);
 
-    const redacted = try mox.provenance.map.redactSecretLines(a, out, prov.items);
+    const redacted = try redactedByShapes(a, out, prov.items, &cache);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "theme = \"dark\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "port = 8080") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "hunter2") == null);
@@ -3487,7 +3487,7 @@ test "compose catB: a nested inline secret marks only its own line" {
     )).?;
     try std.testing.expect(std.mem.indexOf(u8, out, "token = hunter2") != null);
 
-    const redacted = try mox.provenance.map.redactSecretLines(a, out, prov.items);
+    const redacted = try redactedByShapes(a, out, prov.items, &cache);
     // Only the token line is redacted; the row's other lines survive.
     try std.testing.expect(std.mem.indexOf(u8, redacted, "[svc api]") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "plain = api") != null);
@@ -4094,7 +4094,7 @@ test "generator: an inline secret in a produced file redacts only its own line a
     try std.testing.expect(std.mem.indexOf(u8, o.content, "token = hunter2") != null);
     try std.testing.expect(o.contains_secret);
 
-    const redacted = try mox.provenance.map.redactSecretLines(a, o.content, o.prov);
+    const redacted = try redactedByShapes(a, o.content, o.prov, &cache);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "email = me@a.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, "hunter2") == null);
     try std.testing.expect(std.mem.indexOf(u8, redacted, mox.provenance.map.secret_redaction) != null);
@@ -5748,4 +5748,10 @@ test "compose catA json: off the resolving path a secret capture stays its place
     const m_state = dataTestMachine();
     const out = (try mox.compose.composeFile(a, io, tree.files[0], &b_r, &m_state, null)).?;
     try std.testing.expectEqualStrings("{\"t\": \"<SECRET:cmd:printf \\\"%s\\\" ok>\", \"o\": \"linux\"}\n", out);
+}
+
+/// `out` as a snapshot keeps it, by the shapes of its secret lines.
+fn redactedByShapes(a: std.mem.Allocator, out: []const u8, prov: []const mox.provenance.map.Segment, cache: *const mox.secret.cache.Cache) ![]const u8 {
+    const sh = mox.provenance.shapes;
+    return sh.redact(a, out, try sh.shapesOf(a, out, prov, try cache.values(a)), &.{});
 }

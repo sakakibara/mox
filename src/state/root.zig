@@ -175,7 +175,7 @@ fn isTemp(name: []const u8) bool {
 }
 
 fn storeEntry(e: @import("../source/dirent.zig").Entry) bool {
-    for ([_][]const u8{ "gen", "blobs", "pending", "quarantine", "current", draft.secret_key_name, "cleanup-deferred" }) |n| if (std.mem.eql(u8, e.name, n)) return true;
+    for ([_][]const u8{ "gen", "blobs", "pending", "quarantine", "current", "cleanup-deferred" }) |n| if (std.mem.eql(u8, e.name, n)) return true;
     return isTemp(e.name);
 }
 

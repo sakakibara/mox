@@ -333,9 +333,12 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   echoes the value; an empty `<secret:>` is rejected up front. A resolved
   secret never reaches disk or the terminal: its value is kept out of the
   content mox keeps of what it applied and of what it displaced, and `mox
-  diff` redacts any hunk touching a secret line. (Redaction of a secret you
-  have since removed relies on that file's stored provenance; when it is
-  missing, diff does not show that file's live content at all.)
+  diff` masks it on both sides. mox stores nothing derived from the value:
+  apply records only the shape of each line it wrote one into, the text
+  around the secret, and masks a live or displaced line that has that shape
+  at the secret's place (see `mox diff` in commands.md). Masking a secret
+  you have since removed relies on that file's stored provenance; when it
+  is missing, diff does not show that file's live content at all.
   A live file that resolves an `op://` or `pass://` secret is applied at mode
   0600 automatically (dedicated secret managers hold only secrets, so this is
   never a false positive), unless `.mox/attributes.toml` sets an explicit mode.

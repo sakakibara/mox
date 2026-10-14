@@ -7932,7 +7932,6 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/source/axes.zig", "writeFile", 2 },
         .{ "src/source/ignore/load.zig", "stripConditional", 1 },
         .{ "src/state/blob.zig", "put", 1 },
-        .{ "src/state/draft.zig", "makeSecretKey", 1 },
         .{ "src/state/durable.zig", "moveAside", 1 },
         .{ "src/state/durable.zig", "moveWindows", 1 },
         .{ "src/state/durable.zig", "renameNoReplace", 3 },

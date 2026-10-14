@@ -24,7 +24,6 @@ const live_remove = @import("live_remove.zig");
 const removable = @import("removable.zig");
 const parent_link = @import("parent_link.zig");
 const write = @import("write.zig");
-const prov_map = @import("../provenance/root.zig").map;
 const source_path = @import("../source/path.zig");
 const ignore_match = @import("../source/ignore/match.zig");
 const state = @import("../state/root.zig");
@@ -330,7 +329,7 @@ fn actOnLeaf(
     switch (found) {
         .link => |target| try finishLeaf(arena, io, opts, live_path, .{ .link = target }, null, stdout, stderr, result),
         // The snapshot keeps the content with secret lines redacted.
-        .file => |content| try finishLeaf(arena, io, opts, live_path, .{ .file = try redactedContent(arena, opts.st, live_path, content) }, content, stdout, stderr, result),
+        .file => |content| try finishLeaf(arena, io, opts, live_path, .{ .file = try redactedContent(opts.st, live_path, content) }, content, stdout, stderr, result),
     }
 }
 
@@ -370,11 +369,8 @@ fn forgetRecords(st: *state.Draft, live_path: []const u8) !void {
     try st.forgetProvenance(live_path);
 }
 
-/// `content` with any secret line redacted using the last-persisted provenance
-/// for `live_path`. A generated leaf may hold a resolved secret; its cleartext
-/// must not be copied into a snapshot. An absent/non-secret provenance leaves
-/// the content unchanged.
-fn redactedContent(arena: std.mem.Allocator, st: *state.Draft, live_path: []const u8, content: []const u8) ![]const u8 {
-    const prior = (try st.provenance(live_path)) orelse return content;
-    return prov_map.redactSecretLines(arena, content, prior.segments);
+/// `content` as a snapshot keeps it: a generated leaf may hold a resolved
+/// secret, whose cleartext must not be copied into a snapshot.
+fn redactedContent(st: *state.Draft, live_path: []const u8, content: []const u8) ![]const u8 {
+    return st.redactPrior(live_path, content);
 }

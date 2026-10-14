@@ -1191,7 +1191,7 @@ fn commitRun(
         .exit => |rc| return rc,
     };
     defer lk.release();
-    const st = (try state_cli.open(ctx, .{ .run_kind = .commit, .writes = !dry_run, .locked = true, .records_secrets = !dry_run })) orelse return 2;
+    const st = (try state_cli.open(ctx, .{ .run_kind = .commit, .writes = !dry_run, .locked = true })) orelse return 2;
     return state_cli.finish(ctx, st, .{}, commitOpened(ctx, st, sty, dry_run, yes, abort_on_prompt, paths, package_rows));
 }
 
@@ -2389,7 +2389,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         }
         try st.record(gc.leaf_live_path, r.live, gc.gen_file.source_base_path);
         if (!r.secret) try st.recordContent(gc.leaf_live_path, r.live);
-        try st.persistProvenance(gc.leaf_live_path, r.prov);
+        try st.persistProvenance(gc.leaf_live_path, r.live, r.prov);
         try ctx.out.print("  committed {f}\n", .{display.of(gc.leaf_live_path, m_state.home)});
         committed_count += 1;
     }
@@ -2434,7 +2434,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
                     if (!mox.provenance.map.hasSecret(r.prov)) {
                         try st.recordContent(file.live_path, r.live);
                     }
-                    try st.persistProvenance(file.live_path, r.prov);
+                    try st.persistProvenance(file.live_path, r.composed, r.prov);
                 }
                 try ctx.out.print("  committed {f}\n", .{display.of(file.live_path, m_state.home)});
                 committed_count += 1;

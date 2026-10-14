@@ -9,6 +9,7 @@ const Io = std.Io;
 const json = @import("json");
 const applied = @import("../apply/applied.zig");
 const prov_map = @import("../provenance/map.zig");
+const prov_shapes = @import("../provenance/shapes.zig");
 const source_path = @import("../source/path.zig");
 const generation = @import("generation.zig");
 const blob = @import("blob.zig");
@@ -26,33 +27,20 @@ const PathEntry = generation.PathEntry;
 /// The directory under the state directory that holds the store.
 pub const store_dir_name = "v2";
 
-/// The key secret-value digests are made with: 32 random bytes, 0600,
-/// created by the first run that records a secret value.
-pub const secret_key_name = "secret-lines.key";
+/// The most a provenance blob holds, half the blob read limit, so every
+/// one written is read back.
+pub const max_provenance_bytes: usize = 32 * 1024 * 1024;
 
-pub const KeyError = error{ SecretKeyUnreadable, SecretKeyMalformed, OutOfMemory };
-
-/// The key at `store`, or null when there is none. Any other failure to
-/// read it is an error: a key is made only where none exists.
-pub fn readSecretKey(arena: std.mem.Allocator, io: Io, store: Store) KeyError!?[prov_map.key_len]u8 {
-    const bytes = Io.Dir.cwd().readFileAlloc(io, store.secret_key, arena, .limited(prov_map.key_len + 1)) catch |e| switch (e) {
-        error.FileNotFound => return null,
-        error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return error.SecretKeyMalformed,
-        else => return error.SecretKeyUnreadable,
-    };
-    if (bytes.len != prov_map.key_len) return error.SecretKeyMalformed;
-    return bytes[0..prov_map.key_len].*;
-}
-
-/// Why the key at `store` cannot be used, or null when it can or is absent.
-pub fn secretKeyProblemAt(arena: std.mem.Allocator, io: Io, store: Store) !?[]const u8 {
-    const why = if (readSecretKey(arena, io, store)) |_| return null else |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.SecretKeyMalformed => "it is not a 32-byte key",
-        error.SecretKeyUnreadable => "it cannot be read",
-    };
-    return try std.fmt.allocPrint(arena, "{s}: {s}; it is the key diff masks secret values with, so mox never replaces it: make it readable by this user, or move it aside so the next apply makes a new one\n", .{ store.secret_key, why });
+/// The provenance of a secret-bearing `content`, or, when that would be
+/// longer than `cap`, one that names every line a secret line of the
+/// whole-line shape: diff then masks every live line, and a snapshot every
+/// line, of the file.
+pub fn boundedProvenance(arena: std.mem.Allocator, live: []const u8, content: []const u8, segments: []const prov_map.Segment, shapes: []const prov_map.Shape, cap: usize) ![]u8 {
+    const full = try prov_map.serialize(arena, live, segments, shapes);
+    if (full.len <= cap) return full;
+    const n = prov_map.lineCount(content);
+    const coarse = [_]prov_map.Segment{.{ .out_start = 0, .out_len = @max(n, 1), .origin = .secret }};
+    return prov_map.serialize(arena, live, &coarse, &.{prov_shapes.whole_line});
 }
 
 pub const Store = struct {
@@ -65,7 +53,6 @@ pub const Store = struct {
     trash: []const u8,
     current: []const u8,
     readers: []const u8,
-    secret_key: []const u8,
     /// What a commit's cleanup a reader kept from running would have done.
     deferred: []const u8,
 
@@ -81,7 +68,6 @@ pub const Store = struct {
             .trash = try std.fs.path.join(arena, &.{ state_dir, "trash" }),
             .current = try std.fs.path.join(arena, &.{ v2, "current" }),
             .readers = try std.fs.path.join(arena, &.{ state_dir, lock.readers_name }),
-            .secret_key = try std.fs.path.join(arena, &.{ v2, secret_key_name }),
             .deferred = try std.fs.path.join(arena, &.{ v2, "cleanup-deferred" }),
         };
     }
@@ -144,10 +130,9 @@ pub const Draft = struct {
     run_id: ?[]const u8 = null,
     changed: bool = false,
     committed: bool = false,
-    /// The secret-value key, once read or made.
-    secret_key: ?[prov_map.key_len]u8 = null,
-    /// The secret values this run resolved, which a provenance with a
-    /// secret segment records the digests of.
+    /// The secret values this run resolved: a provenance with a secret
+    /// segment finds its slots by them, and stored prior content is masked
+    /// with them.
     secrets: ?*const secret_cache.Cache = null,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
@@ -264,6 +249,25 @@ pub const Draft = struct {
         const h = d.provenanceBlob(live) orelse return null;
         const bytes = (try blob.get(d.arena, d.io, d.store.blobs, h)) orelse return null;
         return prov_map.deserialize(d.arena, bytes) catch null;
+    }
+
+    /// `content`, what was at `live` before this run replaces it, as a
+    /// snapshot keeps it: every line that matches a shape of a line the last
+    /// apply wrote a secret into is masked at its slots, and every value this
+    /// run resolved is masked wherever it occurs. Any other line is kept as it
+    /// is. A provenance written without shapes gives the shapes found in
+    /// `content` while it is still what that apply wrote, and the whole-line
+    /// shape once it is not.
+    pub fn redactPrior(d: *Draft, live: []const u8, content: []const u8) ![]const u8 {
+        const values = if (d.secrets) |c| try c.values(d.arena) else &.{};
+        const forms = try prov_shapes.writtenForms(d.arena, values);
+        const shapes: []const prov_map.Shape = if (try d.provenance(live)) |m| m.secretShapes() orelse blk: {
+            const f = d.fileRecord(live);
+            if (f != null and std.mem.eql(u8, &f.?.sha256, &applied.contentHashHex(content)))
+                break :blk try prov_shapes.shapesOf(d.arena, content, m.segments, values);
+            break :blk &.{prov_shapes.whole_line};
+        } else &.{};
+        return prov_shapes.redact(d.arena, content, shapes, forms);
     }
 
     /// The generator at `gen_live`'s produced set.
@@ -406,40 +410,23 @@ pub const Draft = struct {
         try d.setPath(live, e);
     }
 
-    /// Keep `segments` as where each line of the bytes written to `live`
-    /// came from, with the digests of the secret values this run
-    /// resolved when a segment is a secret.
-    pub fn persistProvenance(d: *Draft, live: []const u8, segments: []const prov_map.Segment) !void {
-        const h = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, segments));
-        try d.persistProvenanceBlob(live, h);
+    /// Keep `segments` as where each line of `content`, the bytes written
+    /// to `live`, came from, with the shapes of its secret lines when a
+    /// segment is a secret.
+    /// A provenance with no secret segment that would be longer than
+    /// `max_provenance_bytes` is not kept: `live` then has none.
+    pub fn persistProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) !void {
+        const bytes = (try d.serializeProvenance(live, content, segments)) orelse return d.forgetProvenance(live);
+        try d.persistProvenanceBlob(live, try blob.put(d.arena, d.io, d.store.blobs, bytes));
     }
 
-    fn serializeProvenance(d: *Draft, live: []const u8, segments: []const prov_map.Segment) ![]u8 {
-        if (!prov_map.hasSecret(segments)) return prov_map.serialize(d.arena, live, segments, null);
-        const values = (d.secrets orelse return error.SecretValuesUnknown).values(d.arena);
-        const key = try d.makeSecretKey();
-        return prov_map.serialize(d.arena, live, segments, try prov_map.windowsOf(d.arena, &key, try values, null));
-    }
-
-    /// The secret-value key, made when there is none.
-    fn makeSecretKey(d: *Draft) ![prov_map.key_len]u8 {
-        if (try d.secretKey()) |k| return k;
-        var k: [prov_map.key_len]u8 = undefined;
-        try d.io.randomSecure(&k);
-        try durable.writeFile(d.io, d.store.secret_key, &k);
-        d.secret_key = k;
-        return k;
-    }
-
-    /// The secret-value key, when there is one.
-    pub fn secretKey(d: *Draft) KeyError!?[prov_map.key_len]u8 {
-        if (d.secret_key == null) d.secret_key = try readSecretKey(d.arena, d.io, d.store);
-        return d.secret_key;
-    }
-
-    /// Why this state's secret-value key cannot be used, if it cannot.
-    pub fn secretKeyProblem(d: *Draft) !?[]const u8 {
-        return secretKeyProblemAt(d.arena, d.io, d.store);
+    fn serializeProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) !?[]u8 {
+        if (!prov_map.hasSecret(segments)) {
+            const bytes = try prov_map.serialize(d.arena, live, segments, null);
+            return if (bytes.len <= max_provenance_bytes) bytes else null;
+        }
+        const values = try (d.secrets orelse return error.SecretValuesUnknown).values(d.arena);
+        return try boundedProvenance(d.arena, live, content, segments, try prov_shapes.shapesOf(d.arena, content, segments, values), max_provenance_bytes);
     }
 
     pub fn persistProvenanceBlob(d: *Draft, live: []const u8, h: Hex) !void {
@@ -459,8 +446,9 @@ pub const Draft = struct {
     pub fn rebuildFile(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment, secret: bool) !void {
         var e = d.entry(live) orelse return;
         if (e.kind != .file) return;
+        const bytes = try d.serializeProvenance(live, content, segments);
         e.file.?.cache_blob = if (secret) null else try blob.put(d.arena, d.io, d.store.blobs, content);
-        e.file.?.provenance_blob = try blob.put(d.arena, d.io, d.store.blobs, try d.serializeProvenance(live, segments));
+        e.file.?.provenance_blob = if (bytes) |b| try blob.put(d.arena, d.io, d.store.blobs, b) else null;
         try d.setPath(live, e);
         try d.clearResidue(live);
     }
@@ -1032,4 +1020,28 @@ test "draft: a change equal to what is held is not a change, and the journal is 
     try testing.expect(d.changed);
     const j = try Io.Dir.cwd().readFileAlloc(io, d.jnl.?.path, a, .unlimited);
     try testing.expect(std.mem.indexOf(u8, j, "expects_private") != null);
+}
+
+test "boundedProvenance: one longer than the cap becomes a whole-file secret of the whole-line shape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var segs: std.ArrayList(prov_map.Segment) = .empty;
+    var content: std.ArrayList(u8) = .empty;
+    var i: u32 = 0;
+    while (i < 2000) : (i += 1) {
+        try segs.append(a, .{ .out_start = i, .out_len = 1, .origin = if (i % 2 == 0) .secret else .{ .base = .{ .line = i + 1 } } });
+        try content.appendSlice(a, if (i % 2 == 0) "token=v\n" else "plain\n");
+    }
+    const shapes = try prov_shapes.shapesOf(a, content.items, segs.items, &.{"v"});
+    const full = try prov_map.serialize(a, "/h/f", segs.items, shapes);
+    const cap = full.len - 1;
+    const bounded = try boundedProvenance(a, "/h/f", content.items, segs.items, shapes, cap);
+    try std.testing.expect(bounded.len <= cap);
+    const m = try prov_map.deserialize(a, bounded);
+    try std.testing.expectEqual(@as(usize, 1), m.segments.len);
+    try std.testing.expectEqual(@as(u32, 2000), m.segments[0].out_len);
+    try std.testing.expect(m.segments[0].origin == .secret);
+    try std.testing.expect(m.secretShapes().?[0].wholeLine());
+    try std.testing.expectEqualStrings(full, try boundedProvenance(a, "/h/f", content.items, segs.items, shapes, full.len));
 }

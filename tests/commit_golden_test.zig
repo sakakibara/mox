@@ -1333,7 +1333,7 @@ test "commit golden: a loop row edited beside a row whose data value resolves a 
         \\part 0 expects-private no
         \\path {~/.exports}
         \\  file 7128997af61f937c0e69ef1d0627e5ce9c27596971727bab41cce7ba6609eec7 cache none
-        \\  provenance aa1d0b2afb890e362f6cb79a18416eab8625b826210e6d215ec4c59528a0b1ef
+        \\  provenance d90846cf54a5d4baf5b4c2f309b84416842d17beff4fe4183a7076ceb88356d7
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1435,7 +1435,7 @@ test "commit golden: a loop row edited in a file that resolves a secret" {
         \\part 0 expects-private no
         \\path {~/.abbrs}
         \\  file 4f0c77cb7fa7df587c833d082580d74d7ef38d52bfa651e4f52aed83bc2f8af1 cache none
-        \\  provenance 14389aecb957f8da35d81b1f160ea7c8291c4b422dfe39ca6703f034409e1dba
+        \\  provenance 6d526105869eaf14e0b745b9de23db7e6f4b47562d4687085a9bef1ee504f3fe
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
