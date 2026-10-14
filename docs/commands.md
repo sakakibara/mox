@@ -781,10 +781,11 @@ whole, as each middle line of a value of several lines is, matches every
 line. When some shape matches no live line, a secret line was changed beyond
 its shape and its value may be anywhere: every live line that matches no
 shape and is not a line of the composed output that holds no secret is
-printed as `<mox:redacted-line>`. Every value the file's current render
-wrote is masked on both sides wherever it occurs, as it is written and in
-each form mox writes it in (JSON-escaped, TOML- and YAML-quoted, and each
-line of a value of several lines). The composed side is masked at the secrets its own
+printed as `<mox:redacted-line>`. Every value the current render of any
+managed file resolves (diff renders them all before it prints) is masked
+on both sides wherever it occurs, as it is written and in each form mox
+writes it in (JSON-escaped, TOML- and YAML-quoted, and each line of a
+value of several lines). The composed side is masked at the secrets its own
 render placed. A live file that may hold a resolved secret (its source
 resolves one, its record was written for one, or its provenance names one)
 whose provenance is missing or records no shapes is masked by this render's

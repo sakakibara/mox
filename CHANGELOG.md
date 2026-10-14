@@ -110,8 +110,8 @@ All notable changes to mox are documented here. The format follows
   a secret into -- the text of the line around the secret -- and nothing
   derived from the value. A live line with a recorded shape is printed with
   the secret's place shown as `<mox:redacted-secret>`, and every value the
-  file's current render wrote is masked wherever it occurs, as written and
-  JSON-escaped, TOML- or YAML-quoted. When a shape matches no live line, a
+  current render of any managed file resolves is masked wherever it
+  occurs, as written and JSON-escaped, TOML- or YAML-quoted. When a shape matches no live line, a
   secret line was edited beyond it, and every live line diff cannot tell
   apart from the composed output's lines that hold no secret is printed as
   `<mox:redacted-line>`. A live file that may hold a secret and whose

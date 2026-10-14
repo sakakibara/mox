@@ -2044,15 +2044,88 @@ test "apply and diff: a secret of 200000 lines is recorded and masked within a b
     const many = try std.fs.path.join(a, &.{ h.root, "many" });
     var value: std.ArrayList(u8) = .empty;
     for (0..200_000) |i| try value.appendSlice(a, if (i % 2 == 0) "x\n" else "y\n");
+    try value.appendSlice(a, "zzUNIQUEzz");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = many, .data = value.items });
     try writeRepo(io, &tmp, "repo/src/many.txt", try std.fmt.allocPrint(a, "k: <secret:file://{s}>\n", .{many}));
-    const start = Io.Clock.awake.now(io);
+    var watch = try Watchdog.start(io, 60);
+    defer watch.stop();
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("many.txt"), .data = "edited\n" });
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "diff" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("many.txt"), .data = "edited\nzzUNIQUEzz\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "zzUNIQUEzz"));
+    try std.testing.expect(!contains(d.out, "edited"));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
-    const secs = start.durationTo(Io.Clock.awake.now(io)).toSeconds();
-    try std.testing.expect(secs < 60);
+    try std.testing.expect(!try stateHolds(h, "zzUNIQUEzz"));
+}
+
+test "diff: a value another file resolves is masked in every file, a file composing nothing included" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "SHAREDSECRET1" }});
+    try writeRepo(io, &tmp, "repo/src/z.cfg", "a=1\nz=1\n");
+    try writeRepo(io, &tmp, "repo/src/a.cfg", "tok=<secret:env:MOX_TEST_TOKEN>\n");
+    try writeRepo(io, &tmp, "repo/src/y.cfg", "y=1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("z.cfg"), .data = "a=1\nexport TOKEN=SHAREDSECRET1\nz=1\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("y.cfg"), .data = "y=1\ncopy=SHAREDSECRET1\n" });
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf("y.cfg"));
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "SHAREDSECRET1"));
+    try std.testing.expect(contains(d.out, "-export TOKEN=" ++ redacted_secret ++ "\n"));
+}
+
+/// Fails the test run, rather than letting it hang, when the test does not
+/// stop it within `seconds`.
+const Watchdog = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(io: Io, seconds: u64) !*Watchdog {
+        const w = try std.heap.page_allocator.create(Watchdog);
+        w.* = .{};
+        w.thread = try std.Thread.spawn(.{}, run, .{ w, io, seconds });
+        return w;
+    }
+
+    fn run(w: *Watchdog, io: Io, seconds: u64) void {
+        const started = Io.Clock.awake.now(io);
+        while (!w.done.load(.acquire)) {
+            if (started.durationTo(Io.Clock.awake.now(io)).toSeconds() >= seconds) {
+                std.debug.print("watchdog: the test did not finish within {d} s\n", .{seconds});
+                std.process.abort();
+            }
+            io.sleep(.fromMilliseconds(50), .awake) catch {};
+        }
+    }
+
+    fn stop(w: *Watchdog) void {
+        w.done.store(true, .release);
+        w.thread.join();
+        std.heap.page_allocator.destroy(w);
+    }
+};
+
+test "apply: a file mox wrote a secret into, replaced by a symlink, is kept masked in the snapshot" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "LINKEDSECRET" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntok=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".cfg"));
+    try tmp.dir.symLink(io, "/nonexistent-target", "repo/src/.cfg", .{});
+    _ = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expect(!try stateHolds(h, "LINKEDSECRET"));
 }
 
 test "uninstall: a state directory holding nothing mox made is refused, and nothing in it is followed, created or removed" {
