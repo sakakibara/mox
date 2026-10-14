@@ -745,6 +745,7 @@ fn preparePackages(
         ctx.alloc,
         ctx.io,
         context.paths.state_dir,
+        context.paths.state_origin,
         context.paths.home,
         env,
         context.paths.repo_dir,

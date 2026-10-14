@@ -1,5 +1,5 @@
-//! How a command opens the state: recovery, and every line it says, printed
-//! the same way for every command.
+//! How a command opens the state: the directory's acceptance, recovery, and
+//! every line those say, printed the same way for every command.
 
 const std = @import("std");
 const app = @import("app.zig");
@@ -30,6 +30,7 @@ pub fn openWithReport(ctx: *app.Ctx, o: Open) !?Opened {
     const context = ctx.context.?;
     const opened = state.open(ctx.alloc, ctx.io, .{
         .state_dir = context.paths.state_dir,
+        .origin = context.paths.state_origin,
         .repo_dir = context.paths.repo_dir,
         .home = context.paths.home,
         .run_kind = o.run_kind,

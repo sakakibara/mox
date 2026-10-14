@@ -1233,6 +1233,7 @@ fn applyPackages(
         ctx.alloc,
         ctx.io,
         context.paths.state_dir,
+        context.paths.state_origin,
         context.paths.home,
         pkg_env,
         context.paths.repo_dir,
@@ -1917,7 +1918,7 @@ const StaleInput = struct {
 /// anything.
 pub fn privateRefusal(ctx: *app.Ctx, cmd: []const u8) !bool {
     const context = ctx.context orelse return false;
-    switch (try mox.state.expectsPrivate(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.repo_dir, context.paths.home)) {
+    switch (try mox.state.expectsPrivate(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.state_origin, context.paths.repo_dir, context.paths.home)) {
         .expects => |e| if (!e) return false,
         .refused => |why| {
             try ctx.err.writeAll(why);

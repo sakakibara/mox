@@ -3187,7 +3187,7 @@ test "add: refuses while another live process holds the lock" {
     try writeRepo(io, &tmp, "home/notes.txt", "n\n");
 
     // A live process (this test) already holds the lock.
-    const held = try mox.state.lock.acquire(a, io, h.state, "apply");
+    const held = try mox.state.lock.acquire(a, io, h.state, .explicit, "apply");
     defer held.acquired.release();
 
     const r = try h.run(&.{ "mox", "add", "notes.txt" });

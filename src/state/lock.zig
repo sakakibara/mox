@@ -85,9 +85,9 @@ pub fn isBootId(s: []const u8) bool {
 
 /// Take the lock under `state_dir` for `command`, once the directory is
 /// accepted as mox's and marked.
-pub fn acquire(arena: std.mem.Allocator, io: Io, state_dir: []const u8, command: []const u8) !Outcome {
+pub fn acquire(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: marker.Origin, command: []const u8) !Outcome {
     const path = try std.fs.path.join(arena, &.{ state_dir, lock_name });
-    switch (try marker.acceptForWrite(arena, io, state_dir)) {
+    switch (try marker.acceptForWrite(arena, io, state_dir, origin)) {
         .refused => |why| return .{ .refused = why },
         .accepted => {},
     }
@@ -648,13 +648,13 @@ test "lock: a held lock refuses with the holder; the file is never empty while l
     const a = arena_state.allocator();
     const sd = try tmpState(a, io, &tmp);
 
-    const first = try acquire(a, io, sd, "apply");
+    const first = try acquire(a, io, sd, .explicit, "apply");
     try testing.expect(first == .acquired);
     const line = try tmp.dir.readFileAlloc(io, lock_name, a, .limited(4096));
     try testing.expect(std.mem.endsWith(u8, line, " apply\n"));
     try testing.expect(parseHolder(line) != null);
 
-    const second = try acquire(a, io, sd, "commit");
+    const second = try acquire(a, io, sd, .explicit, "commit");
     try testing.expect(second == .held);
     try testing.expectEqual(selfPid(), second.held.pid);
     try testing.expectEqualStrings("apply", second.held.command);
@@ -662,7 +662,7 @@ test "lock: a held lock refuses with the holder; the file is never empty while l
 
     first.acquired.release();
     try testing.expectEqualStrings("", try tmp.dir.readFileAlloc(io, lock_name, a, .limited(4096)));
-    const third = try acquire(a, io, sd, "commit");
+    const third = try acquire(a, io, sd, .explicit, "commit");
     try testing.expect(third == .acquired);
     third.acquired.release();
 }
@@ -678,7 +678,7 @@ test "lock: a filesystem that cannot lock fails closed, naming the errno" {
     for ([_]struct { Io.File.LockError, []const u8 }{ .{ error.FileLocksUnsupported, "ENOTSUP" }, .{ error.SystemResources, "ENOLCK" } }) |c| {
         forced_failure = c[0];
         defer forced_failure = null;
-        const got = try acquire(a, io, sd, "apply");
+        const got = try acquire(a, io, sd, .explicit, "apply");
         try testing.expectEqualStrings(c[1], got.unsupported);
     }
 }
@@ -711,7 +711,7 @@ test "lock: a lock file no process holds does not refuse, empty or holding the l
     const sd = try tmpState(a, io, &tmp);
     for ([_][]const u8{ "", try std.fmt.allocPrint(a, "{s} apply\n", .{try holderStamp(a, io, selfPid())}) }) |content| {
         try tmp.dir.writeFile(io, .{ .sub_path = lock_name, .data = content });
-        const got = try acquire(a, io, sd, "apply");
+        const got = try acquire(a, io, sd, .explicit, "apply");
         try testing.expect(got == .acquired);
         got.acquired.release();
     }
@@ -732,7 +732,7 @@ test "lock: a held kernel lock refuses, whatever its line holds" {
         defer holder.close(io);
         try testing.expect(try holder.tryLock(io, .exclusive));
         defer holder.unlock(io);
-        const got = try acquire(a, io, sd, "apply");
+        const got = try acquire(a, io, sd, .explicit, "apply");
         try testing.expect(got == .held);
         try testing.expectEqual(@as(Pid, 0), got.held.pid);
     }

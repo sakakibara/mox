@@ -1091,7 +1091,7 @@ test "apply: refuses while another live process holds the lock" {
 
     // A live process (this test) already holds the lock.
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
-    const held = try mox.state.lock.acquire(a, io, state, "apply");
+    const held = try mox.state.lock.acquire(a, io, state, .explicit, "apply");
     defer held.acquired.release();
 
     // apply is the command that installs packages and writes live files, so
@@ -1123,7 +1123,7 @@ test "facts interview: persist is guarded by the command lock" {
 
     // A live process (this test) already holds the lock.
     const state = try std.fs.path.join(a, &.{ std.fs.path.dirname(c.repo).?, "state" });
-    const held = try mox.state.lock.acquire(a, io, state, "apply");
+    const held = try mox.state.lock.acquire(a, io, state, .explicit, "apply");
     defer held.acquired.release();
 
     // The interview flow (which would persist the unbound fact) must refuse

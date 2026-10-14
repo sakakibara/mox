@@ -994,7 +994,7 @@ test "readers: a reader holding its lock across commits keeps the generation and
     const held = try mox.state.lock.foreignReader(io, store.readers);
     var released = false;
     defer if (!released) held.release();
-    const reader = (try mox.state.open(a, io, .{ .state_dir = h.state, .repo_dir = h.repo, .home = h.home, .writes = false, .locked = false })).ready.draft;
+    const reader = (try mox.state.open(a, io, .{ .state_dir = h.state, .origin = .explicit, .repo_dir = h.repo, .home = h.home, .writes = false, .locked = false })).ready.draft;
     mox.state.releaseReaders();
     for ([_][]const u8{ "v3\n", "v4\n" }) |v| {
         try writeRepo(io, &tmp, "repo/src/.zshrc", v);
@@ -2248,6 +2248,8 @@ test "state directory: one that holds no marker is refused by every command, and
         try std.testing.expectEqual(@as(u8, 2), r.rc);
         try std.testing.expect(contains(r.err, try std.fmt.allocPrint(a, "{s} is not a mox state directory", .{h.state})));
         try std.testing.expect(contains(r.err, "point MOX_STATE_DIR at a dedicated directory"));
+        try std.testing.expect(contains(r.err, try std.fmt.allocPrint(a, "  sh:         (umask 077 && printf 'mox state 1\\n' > '{s}/.mox-state')\n", .{h.state})));
+        try std.testing.expect(contains(r.err, try std.fmt.allocPrint(a, "  PowerShell: [IO.File]::WriteAllText('{s}/.mox-state', \"mox state 1`n\")\n", .{h.state})));
         const now = try namesIn(a, io, h.state);
         try std.testing.expectEqual(names.len, now.len);
         for (names, now) |x, y| try std.testing.expectEqualStrings(x, y);
@@ -2325,6 +2327,75 @@ test "state directory: a fresh state, an absent or empty one, gets the marker on
     try std.testing.expectEqual(@as(u8, 0), (try p.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("private\n", try read(io, a, try p.liveOf(".p")));
     try std.testing.expect(exists(io, try statePath(p, &.{".mox-state"})));
+}
+
+/// `h` with no `MOX_STATE_DIR`: the state directory is mox's default,
+/// `$XDG_STATE_HOME/mox`, with `XDG_STATE_HOME` under the test's root.
+fn withDefaultState(h: Harness) !Harness {
+    const m = try h.a.create(std.process.Environ.Map);
+    m.* = try h.env.createMap(h.a);
+    _ = m.swapRemove("MOX_STATE_DIR");
+    const xdg = try std.fs.path.join(h.a, &.{ h.root, "xdg-state" });
+    try m.put("XDG_STATE_HOME", xdg);
+    var out = h;
+    out.env = .{ .map = m };
+    out.state = try std.fs.path.join(h.a, &.{ xdg, "mox" });
+    return out;
+}
+
+test "state directory: one holding only lock files and OS files is fresh under MOX_STATE_DIR, and the default path is mox's whatever it holds" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    for ([_][]const u8{ "mox.lock", "readers.lock", "readers.gate", ".DS_Store" }) |n| try writeRepo(io, &tmp, try std.fs.path.join(a, &.{ "state", n }), "");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
+    try std.testing.expect(exists(io, try statePath(h, &.{".mox-state"})));
+
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const d = try withDefaultState(try setup(a, io, &tmp2));
+    try writeRepo(io, &tmp2, "repo/src/.zshrc", "v1\n");
+    try writeRepo(io, &tmp2, "xdg-state/mox/notes.txt", "mine\n");
+    try writeRepo(io, &tmp2, "xdg-state/mox/bin/user-script", "#!/bin/sh\n");
+    const st = try d.run(&.{ "mox", "status" });
+    try std.testing.expect(st.rc != 2);
+    try std.testing.expect(!contains(st.err, "is not a mox state directory"));
+    try std.testing.expect(!exists(io, try statePath(d, &.{".mox-state"})));
+    try std.testing.expectEqual(@as(u8, 0), (try d.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try d.liveOf(".zshrc")));
+    try std.testing.expectEqualStrings("mox state 1\n", try read(io, a, try statePath(d, &.{".mox-state"})));
+    try std.testing.expectEqualStrings("mine\n", try read(io, a, try statePath(d, &.{"notes.txt"})));
+}
+
+test "state directory: a marker a newer mox wrote is refused, at the default path too" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |default| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var h = try setup(a, io, &tmp);
+        if (default) h = try withDefaultState(h);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try Io.Dir.cwd().createDirPath(io, h.state);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try statePath(h, &.{".mox-state"}), .data = "mox state 2\n" });
+        for ([_][]const []const u8{ &.{ "mox", "status" }, &.{ "mox", "apply" } }) |argv| {
+            const r = try h.run(argv);
+            try std.testing.expectEqual(@as(u8, 2), r.rc);
+            try std.testing.expect(contains(r.err, "newer mox"));
+        }
+        try std.testing.expect(!exists(io, try h.liveOf(".zshrc")));
+        try std.testing.expectEqualStrings("mox state 2\n", try read(io, a, try statePath(h, &.{".mox-state"})));
+    }
 }
 
 test "state directory: a full uninstall removes the marker last, and one that keeps mox's entries keeps it" {

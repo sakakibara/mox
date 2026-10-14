@@ -25,6 +25,8 @@ pub const Hex = generation.Hex;
 
 pub const Options = struct {
     state_dir: []const u8,
+    /// Where `state_dir` came from, which decides what it is accepted with.
+    origin: marker.Origin,
     repo_dir: []const u8,
     home: []const u8,
     run_kind: generation.Kind = .apply,
@@ -65,7 +67,7 @@ fn nonEmptyDir(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
 /// Load the state for a command: the state directory accepted as mox's,
 /// then recovery and the draft.
 pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
-    switch (try marker.accept(arena, io, opts.state_dir)) {
+    switch (try marker.accept(arena, io, opts.state_dir, opts.origin)) {
         .refused => |why| return .{ .refused = why },
         .accepted => |k| if (k == .fresh and opts.writes) try marker.mark(arena, io, opts.state_dir),
     }
@@ -270,8 +272,8 @@ pub const Expectation = union(enum) {
 
 /// Whether this repo and HOME expect a private layer, read without the lock,
 /// a dead run's journal included.
-pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, repo_dir: []const u8, home: []const u8) !Expectation {
-    switch (try marker.accept(arena, io, state_dir)) {
+pub fn expectsPrivate(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: marker.Origin, repo_dir: []const u8, home: []const u8) !Expectation {
+    switch (try marker.accept(arena, io, state_dir, origin)) {
         .refused => |why| return .{ .refused = why },
         .accepted => {},
     }

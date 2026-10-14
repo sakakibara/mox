@@ -112,7 +112,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     const purge_private = a.purge_private;
 
     // Before the lock, which creates its file there.
-    switch (try mox.state.marker.accept(ctx.alloc, ctx.io, context.paths.state_dir)) {
+    switch (try mox.state.marker.accept(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.state_origin)) {
         .refused => |why| {
             try ctx.err.writeAll(why);
             return 2;

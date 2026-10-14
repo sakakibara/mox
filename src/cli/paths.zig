@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const env_mod = @import("env");
 const trigger_state = @import("../trigger/state.zig");
 const Env = env_mod.Env;
+const Origin = @import("../state/marker.zig").Origin;
 const dirs = env_mod.dirs;
 
 pub const Paths = struct {
@@ -14,6 +15,9 @@ pub const Paths = struct {
     home_named: bool,
     repo_dir: []const u8,
     state_dir: []const u8,
+    /// `.explicit` when `MOX_STATE_DIR` named the state directory, `.default`
+    /// when mox chose it.
+    state_origin: Origin,
     private_dir: []const u8,
     triggers_path: []const u8,
     facts_path: []const u8,
@@ -74,8 +78,9 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
         break :blk try std.fs.path.join(arena, &.{ base, "mox", "dotfiles" });
     };
 
+    const explicit_state = env.get(arena, "MOX_STATE_DIR");
     const state_dir = blk: {
-        if (env.get(arena, "MOX_STATE_DIR")) |v| break :blk v;
+        if (explicit_state) |v| break :blk v;
         const base = try dirs.baseDirIn(arena, env, os_tag, .state, home);
         break :blk try std.fs.path.join(arena, &.{ base, "mox" });
     };
@@ -91,6 +96,7 @@ pub fn resolveFrom(arena: std.mem.Allocator, env: Env, os_tag: std.Target.Os.Tag
         .home_named = home_named,
         .repo_dir = repo_dir,
         .state_dir = state_dir,
+        .state_origin = if (explicit_state == null) .default else .explicit,
         .private_dir = private_dir,
         .triggers_path = triggers_path,
         .facts_path = facts_path,

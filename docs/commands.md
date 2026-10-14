@@ -24,15 +24,28 @@ exist is refused.
 The state directory says it is mox's. mox writes `<state dir>/.mox-state`,
 one line naming the format (`mox state 1`), 0600, when it creates the
 directory. Every command but `version`, help, `upgrade`, `path`, `git`,
-`secret`, `data` and `edit` first checks the directory, and uses it only
-when it is absent, empty, or holds nothing but the private layer and the
-lock files (mox creates it, with the marker, when it first writes; a command
-that only reads finds an empty state and creates nothing), or when it holds
-the marker. Any other directory is refused, exit 2, before anything in it is
-read or changed: `mox: <dir> is not a mox state directory: it holds no
-.mox-state marker, so mox leaves it as it is; point MOX_STATE_DIR at a
-dedicated directory`. So a `MOX_STATE_DIR` that names a home or another
-directory by mistake is left as it is.
+`secret`, `data` and `edit` first checks the directory. The default path,
+used when `MOX_STATE_DIR` is not set, is mox's whatever it holds. A
+directory `MOX_STATE_DIR` names is used only when it is absent, or holds
+nothing but the private layer, the lock files (`mox.lock`, `readers.lock`,
+`readers.gate`) and the files a file browser leaves (`.DS_Store`,
+`Thumbs.db`, `desktop.ini`); or when it holds the marker. mox creates the
+state directory, with the marker, when it first writes; a command that only
+reads an absent one finds an empty state and creates nothing. Any other
+directory is refused, exit 2, before anything in it is read or changed, with
+both ways out:
+
+```
+mox: <dir> is not a mox state directory: it holds no .mox-state marker, so mox leaves it as it is; point MOX_STATE_DIR at a dedicated directory, or, if it is a mox state, mark it as one:
+  sh:         (umask 077 && printf 'mox state 1\n' > '<dir>/.mox-state')
+  PowerShell: [IO.File]::WriteAllText('<dir>/.mox-state', "mox state 1`n")
+```
+
+So a `MOX_STATE_DIR` that names a home or another directory by mistake is
+left as it is. Only `mox state 1` is the marker; a `.mox-state` naming a
+higher number is a newer mox's, and every command refuses it, at the
+default path too: `mox: state written by a newer mox (.mox-state says mox
+state <n>); upgrade mox to use <dir>`.
 
 Mutating commands (`add`, `apply`, `commit`, `mv`, `publish`, `remove`,
 `rollback`, `uninstall`, `update`, `private retire`, `facts set`, `facts
@@ -1403,12 +1416,13 @@ so each is mox's only while it is a directory holding nothing but what mox
 puts there: in `bin/` the link to (on Windows, the copy of) the running
 `mox`, in `tmp/` the package managers' per-process scratch files, and in
 `trash/` the directories named by run id. `v2/` is mox's only while it holds
-nothing but the entries mox makes in it. One holding anything else is kept
-whole and listed with the first entry mox did not make. A directory that is
-not a mox state directory (see the top of this page) is refused, exit 2,
-before anything is created, followed or removed in it; an absent or empty
-one has no state to remove. The marker, `.mox-state`, is removed last, once
-the directory holds nothing else of mox's but the lock files, so an
+nothing but the entries mox makes in it. One holding anything else, beyond
+the files a file browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`),
+is kept whole and listed with the first entry mox did not make. A directory
+that is not a mox state directory (see the top of this page) is refused,
+exit 2, before anything is created, followed or removed in it; an absent or
+empty one has no state to remove. The marker, `.mox-state`, is removed last,
+once the directory holds nothing else of mox's but the lock files, so an
 uninstall that stopped partway leaves a directory the next run still takes
 for mox's; while anything of mox's is kept (the history, trash, the private
 layer) the marker is kept and listed. The user's source repo is never

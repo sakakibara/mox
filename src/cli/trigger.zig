@@ -8,7 +8,7 @@ const mox = @import("../root.zig");
 /// a script's checks go to the run's pending records, which apply keeps only
 /// when the script exits 0; run by hand, they go straight to the state file.
 fn loadState(ctx: *app.Ctx, context: app.Context) !?mox.trigger.state.State {
-    switch (try mox.state.marker.acceptForWrite(ctx.alloc, ctx.io, context.paths.state_dir)) {
+    switch (try mox.state.marker.acceptForWrite(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.state_origin)) {
         .refused => |why| {
             try ctx.err.writeAll(why);
             return null;

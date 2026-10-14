@@ -27,7 +27,7 @@ pub const Taken = union(enum) {
 /// not mox's. On success the caller owns the returned Lock and must
 /// `release()` it (typically via `defer`).
 pub fn acquireForCommand(ctx: *app.Ctx, command: []const u8, busy: u8) !Taken {
-    switch (try state_lock.acquire(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, command)) {
+    switch (try state_lock.acquire(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, ctx.context.?.paths.state_origin, command)) {
         .acquired => |l| return .{ .lock = l },
         .held => |h| {
             try printHeld(ctx, h);

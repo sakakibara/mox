@@ -232,7 +232,7 @@ const OnPath = struct {
 
 fn initFresh(ctx: *app.Ctx) !u8 {
     const context = ctx.context.?;
-    switch (try mox.state.marker.acceptForWrite(ctx.alloc, ctx.io, context.paths.state_dir)) {
+    switch (try mox.state.marker.acceptForWrite(ctx.alloc, ctx.io, context.paths.state_dir, context.paths.state_origin)) {
         .refused => |why| {
             try ctx.err.writeAll(why);
             return 2;

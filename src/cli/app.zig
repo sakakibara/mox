@@ -177,6 +177,7 @@ pub const PackageBackends = struct {
         arena: std.mem.Allocator,
         io: std.Io,
         scratch_dir: []const u8,
+        state_origin: mox.state.marker.Origin,
         home: []const u8,
         env: ?*const std.process.Environ.Map,
         repo_dir: []const u8,
@@ -185,7 +186,7 @@ pub const PackageBackends = struct {
         err: *std.Io.Writer,
         diag: ?*mox.packages.manifest.Diag,
     ) !mox.packages.backend.Registry {
-        switch (try mox.state.marker.acceptForWrite(arena, io, scratch_dir)) {
+        switch (try mox.state.marker.acceptForWrite(arena, io, scratch_dir, state_origin)) {
             .refused => |why| {
                 try err.writeAll(why);
                 return error.NotStateDirectory;
@@ -534,7 +535,7 @@ test "PackageBackends.registry: a not-runnable twin of a built-in leaves the bui
     var err_w = std.Io.Writer.fixed(&err_buf);
 
     var pkg: PackageBackends = .{};
-    const reg = try pkg.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    const reg = try pkg.registry(a, io, state, .explicit, "/home/x", null, repo, true, &out_w, &err_w, null);
     const b = reg.find("winget").?;
     try std.testing.expect(b.ctx == @as(*anyopaque, @ptrCast(&pkg.winget)));
     try std.testing.expectEqual(@as(usize, 7), reg.backends.len);
@@ -605,7 +606,7 @@ test "PackageBackends.registry: a mox running under a plugin discovers none, and
     defer environ_override = saved;
 
     var pkg: PackageBackends = .{};
-    const reg = try pkg.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    const reg = try pkg.registry(a, io, state, .explicit, "/home/x", null, repo, true, &out_w, &err_w, null);
     try std.testing.expectEqual(@as(usize, 7), reg.backends.len);
     try std.testing.expectEqual(@as(usize, 0), pkg.plugins.len);
     try std.testing.expect(reg.find("macports") == null);
@@ -620,7 +621,7 @@ test "PackageBackends.registry: a mox running under a plugin discovers none, and
     // the mox the plugin itself called.
     try map.put(packages_depth_var, "0");
     var hand_set: PackageBackends = .{};
-    const hand_set_reg = try hand_set.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    const hand_set_reg = try hand_set.registry(a, io, state, .explicit, "/home/x", null, repo, true, &out_w, &err_w, null);
     try std.testing.expectEqual(@as(usize, 0), hand_set.plugins.len);
     try std.testing.expect(hand_set_reg.find("macports") == null);
     try std.testing.expectEqualStrings(
@@ -665,7 +666,7 @@ test "PackageBackends.registry: a plugin that empties the marker still has the m
     defer environ_override = saved;
 
     var pkg: PackageBackends = .{};
-    const reg = try pkg.registry(a, io, state, "/home/x", null, repo, true, &out_w, &err_w, null);
+    const reg = try pkg.registry(a, io, state, .explicit, "/home/x", null, repo, true, &out_w, &err_w, null);
     try std.testing.expectEqual(@as(usize, 0), pkg.plugins.len);
     try std.testing.expect(reg.find("macports") == null);
     try std.testing.expectEqualStrings(
