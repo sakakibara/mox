@@ -612,9 +612,8 @@ fn interpolate(
         first = false;
         const exp = try interp.expandTracked(arena, line, null, ctx);
         if (exp.secret) secret_seen = true;
-        // A capture is always within a line, so exp.bytes has no newline: one
-        // output line per input line, aligned 1:1 with this flag.
-        try line_secret.append(arena, exp.secret);
+        // A value of several lines fills an output line for each of them.
+        try line_secret.appendNTimes(arena, exp.secret, std.mem.count(u8, exp.bytes, "\n") + 1);
         try out.appendSlice(arena, exp.bytes);
     }
     const result = try out.toOwnedSlice(arena);

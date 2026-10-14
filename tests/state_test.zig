@@ -1900,6 +1900,26 @@ test "diff: a secret line edited beyond its shape leaves no unrecognized live li
     try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
 }
 
+test "diff and apply: a secret of several lines in a TOML file is masked on every line it fills, once rotated" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    const pem = try std.fs.path.join(a, &.{ h.root, "pem" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = pem, .data = "AAAA1111\nBBBB2222\nCCCC3333" });
+    try writeRepo(io, &tmp, "repo/src/c.toml", try std.fmt.allocPrint(a, "name = \"x\"\nkey = \"\"\"<secret:file://{s}>\"\"\"\nend = 1\n", .{pem}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = pem, .data = "DDDD4444\nEEEE5555" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    for ([_][]const u8{ "AAAA", "BBBB", "CCCC", "DDDD", "EEEE" }) |s| try std.testing.expect(!contains(d.out, s));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    for ([_][]const u8{ "AAAA1111", "BBBB2222", "CCCC3333", "DDDD4444", "EEEE5555" }) |s| try std.testing.expect(!try stateHolds(h, s));
+}
+
 test "uninstall: a state directory holding nothing mox made is refused, and nothing in it is followed, created or removed" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;

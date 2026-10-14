@@ -295,6 +295,9 @@ All notable changes to mox are documented here. The format follows
   to mask the lines at the places the last apply wrote secrets to, so a
   secret line the user had moved was kept in clear and the line now in its
   place was masked.
+- A value of several lines resolved into a TOML, YAML, INI or gitconfig
+  file marks every line it fills as a secret line; only its first line was
+  marked, and each later line's mark was shifted onto the lines after it.
 - A relative `MOX_STATE_DIR` is resolved against the current directory once,
   at startup, so the commands it prints work from anywhere. It is joined to
   the current directory as the system resolves it, keeping a `..`, which
