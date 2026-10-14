@@ -110,12 +110,57 @@ pub fn absolutePaths(arena: std.mem.Allocator, p: Paths, cwd: []const u8, why: *
 fn absolutePathsFor(arena: std.mem.Allocator, p: Paths, cwd: []const u8, os_tag: std.Target.Os.Tag, why: *?[]const u8) !Paths {
     var out = p;
     out.repo_dir = try underCwd(arena, cwd, p.repo_dir, os_tag, "MOX_REPO", why);
-    const state_dir = try underCwd(arena, cwd, p.state_dir, os_tag, "MOX_STATE_DIR", why);
+    const state_dir = try withoutDots(arena, try underCwd(arena, cwd, p.state_dir, os_tag, "MOX_STATE_DIR", why), os_tag);
     if (state_dir.ptr == p.state_dir.ptr) return out;
+    return withStateDir(arena, out, state_dir);
+}
+
+fn withStateDir(arena: std.mem.Allocator, p: Paths, state_dir: []const u8) !Paths {
+    var out = p;
     out.state_dir = state_dir;
-    out.private_dir = try std.fs.path.join(arena, &.{ out.state_dir, "private" });
-    out.triggers_path = try std.fs.path.join(arena, &.{ out.state_dir, trigger_state.state_basename });
+    out.private_dir = try std.fs.path.join(arena, &.{ state_dir, "private" });
+    out.triggers_path = try std.fs.path.join(arena, &.{ state_dir, trigger_state.state_basename });
     return out;
+}
+
+/// `p` with a state directory whose last component is `..` replaced by the
+/// real path it names, which must exist: the directory's siblings, and the
+/// paths under it, then name the directory itself.
+pub fn realStateDir(arena: std.mem.Allocator, io: std.Io, p: Paths, why: *?[]const u8) !Paths {
+    if (!std.mem.eql(u8, std.fs.path.basename(p.state_dir), "..")) return p;
+    const real = std.Io.Dir.cwd().realPathFileAlloc(io, p.state_dir, arena) catch |e| {
+        why.* = if (e == error.FileNotFound)
+            try std.fmt.allocPrint(arena, "MOX_STATE_DIR is {s}, which ends in `..` and does not exist; set it to an existing directory", .{p.state_dir})
+        else
+            try std.fmt.allocPrint(arena, "MOX_STATE_DIR is {s}, which ends in `..`, and its real path cannot be read ({s})", .{ p.state_dir, @errorName(e) });
+        return if (e == error.FileNotFound) error.StateDirNotFound else e;
+    };
+    return withStateDir(arena, p, real);
+}
+
+/// An absolute `path` without its `.` segments and repeated separators, or
+/// `path` itself when it has none or is not absolute.
+fn withoutDots(arena: std.mem.Allocator, path: []const u8, os_tag: std.Target.Os.Tag) ![]const u8 {
+    if (os_tag == .windows) return switch (std.fs.path.getWin32PathType(u8, path)) {
+        .drive_absolute, .unc_absolute => dropDots(.windows, arena, path),
+        else => path,
+    };
+    if (!std.fs.path.isAbsolutePosix(path)) return path;
+    return dropDots(.posix, arena, path);
+}
+
+fn dropDots(comptime kind: std.fs.path.PathType, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const sep: u8 = if (kind == .windows) '\\' else '/';
+    var it = std.fs.path.ComponentIterator(kind, u8).init(path);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, it.root() orelse return path);
+    while (it.next()) |c| {
+        if (std.mem.eql(u8, c.name, ".")) continue;
+        if (!kind.isSep(u8, out.items[out.items.len - 1])) try out.append(arena, sep);
+        try out.appendSlice(arena, c.name);
+    }
+    if (std.mem.eql(u8, out.items, path)) return path;
+    return out.items;
 }
 
 /// `path` as the kernel resolves it from `cwd`: an absolute path as given,
@@ -195,6 +240,63 @@ test "underCwd: joins as the kernel resolves, keeping `..` and dropping only `.`
         try std.testing.expect(std.mem.indexOf(u8, why.?, "MOX_REPO is ") != null);
         try std.testing.expect(std.mem.indexOf(u8, why.?, "absolute path") != null);
     }
+}
+
+test "absolutePaths: a state directory's `.` segments are dropped, absolute or relative, and a final `..` is kept for realStateDir" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { os: std.Target.Os.Tag, cwd: []const u8, in: []const u8, want: []const u8 }{
+        .{ .os = .linux, .cwd = "/w", .in = "/x/state/.", .want = "/x/state" },
+        .{ .os = .linux, .cwd = "/w", .in = "/x/./state/./", .want = "/x/state" },
+        .{ .os = .linux, .cwd = "/w", .in = "/x/state/..", .want = "/x/state/.." },
+        .{ .os = .linux, .cwd = "/w", .in = "/x/state/./..", .want = "/x/state/.." },
+        .{ .os = .linux, .cwd = "/w", .in = "..", .want = "/w/.." },
+        .{ .os = .linux, .cwd = "/", .in = "/.", .want = "/" },
+        .{ .os = .windows, .cwd = "C:\\w", .in = "C:\\x\\state\\.", .want = "C:\\x\\state" },
+        .{ .os = .windows, .cwd = "C:\\w", .in = "C:\\x\\.\\state\\..", .want = "C:\\x\\state\\.." },
+        .{ .os = .windows, .cwd = "C:\\w", .in = "\\\\srv\\share\\st\\.", .want = "\\\\srv\\share\\st" },
+    };
+    for (cases) |c| {
+        var m = std.process.Environ.Map.init(a);
+        try m.put(if (c.os == .windows) "USERPROFILE" else "HOME", if (c.os == .windows) "C:\\Users\\alice" else "/home/alice");
+        try m.put("MOX_STATE_DIR", c.in);
+        var why: ?[]const u8 = null;
+        const p = try absolutePathsFor(a, try resolveFrom(a, Env{ .map = &m }, c.os), c.cwd, c.os, &why);
+        try std.testing.expectEqualStrings(c.want, p.state_dir);
+        try expectJoined(a, &.{ c.want, "private" }, p.private_dir);
+    }
+}
+
+test "realStateDir: a state directory ending in `..` is its real path, which must exist" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try tmp.dir.createDirPath(io, "real/inner");
+    try tmp.dir.symLink(io, try std.fs.path.join(a, &.{ root, "real", "inner" }), "lnk", .{ .is_directory = true });
+    var m = std.process.Environ.Map.init(a);
+    try m.put("HOME", "/home/alice");
+    try m.put("MOX_STATE_DIR", "lnk/..");
+    var why: ?[]const u8 = null;
+    const p = try realStateDir(a, io, try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), root, &why), &why);
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ root, "real" }), p.state_dir);
+    try expectJoined(a, &.{ root, "real", "private" }, p.private_dir);
+    try expectJoined(a, &.{ root, "real", trigger_state.state_basename }, p.triggers_path);
+
+    try m.put("MOX_STATE_DIR", "lnk/../absent");
+    const kept = try realStateDir(a, io, try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), root, &why), &why);
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ root, "lnk", "..", "absent" }), kept.state_dir);
+
+    try m.put("MOX_STATE_DIR", try std.fs.path.join(a, &.{ root, "missing", ".." }));
+    why = null;
+    try std.testing.expectError(error.StateDirNotFound, realStateDir(a, io, try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), root, &why), &why));
+    try std.testing.expect(std.mem.indexOf(u8, why.?, "MOX_STATE_DIR is ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, why.?, "does not exist") != null);
 }
 
 test "resolve with Env{ .process = std.testing.environ }" {

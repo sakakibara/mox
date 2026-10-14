@@ -185,6 +185,25 @@ fn withState(h: Harness, state: []const u8) !Harness {
     return out;
 }
 
+test "state directory: one spelled ending in `.` or `..` is the directory it names" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    for ([_][]const u8{ "/.", "/private/.." }) |suffix| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const real = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=2\n");
+        try Io.Dir.cwd().createDirPath(io, try statePath(real, &.{"private"}));
+        const h = try withState(real, try std.mem.concat(a, u8, &.{ real.state, suffix }));
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try std.testing.expect(exists(io, try statePath(real, &.{ "v2", "current" })));
+        try std.testing.expect(exists(io, try statePath(real, &.{".mox-state"})));
+    }
+}
+
 var raced_state: []const u8 = "";
 
 test "ids: a run that trashed but changed no state keeps its id from the next run" {

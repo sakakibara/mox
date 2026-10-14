@@ -309,6 +309,10 @@ All notable changes to mox are documented here. The format follows
   name the repo by one absolute path. On Windows, a `MOX_STATE_DIR` or
   `MOX_REPO` relative to a drive's current directory (`C:x`) or to the
   current drive's root (`\x`) is refused, asking for an absolute path.
+- A `MOX_STATE_DIR` spelled with `.` segments or ending in `..`
+  (`/x/state/.`, `/x/state/..`) names the directory it resolves to: mox
+  drops the `.` segments and replaces a final `..` with the real path it
+  names, refusing one that does not exist.
 - A secret in a generator's `into` path -- a `<secret:...>` capture, or a row
   field holding one -- is a compose error naming the capture's column, never
   a file name holding the secret.

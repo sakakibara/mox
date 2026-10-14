@@ -293,10 +293,14 @@ pub fn loadContext(alloc: std.mem.Allocator, io: std.Io, diag: *cli.Diagnostic) 
     // argument needs one, and every command that takes none runs regardless.
     const cwd: ?[]const u8 = (if (builtin.is_test) cwd_override else null) orelse (std.process.currentPathAlloc(io, alloc) catch null);
     var why: ?[]const u8 = null;
-    const paths = if (cwd) |c| paths_mod.absolutePaths(alloc, resolved, c, &why) catch |err| {
+    const absolute = if (cwd) |c| paths_mod.absolutePaths(alloc, resolved, c, &why) catch |err| {
         diag.message = why orelse std.fmt.allocPrint(alloc, "failed to resolve mox paths: {s}", .{@errorName(err)}) catch "";
         return err;
     } else resolved;
+    const paths = paths_mod.realStateDir(alloc, io, absolute, &why) catch |err| {
+        diag.message = why orelse std.fmt.allocPrint(alloc, "failed to resolve mox paths: {s}", .{@errorName(err)}) catch "";
+        return err;
+    };
     if (mox.state.id.takes_test_clock) {
         mox.state.id.test_clock = if (env.get(alloc, "MOX_TEST_CLOCK")) |v| std.fmt.parseInt(u64, v, 10) catch null else null;
     }

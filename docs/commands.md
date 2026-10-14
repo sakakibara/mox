@@ -16,7 +16,10 @@ network folder. A relative `MOX_REPO` or `MOX_STATE_DIR` is joined to the
 current directory once, at startup, as the system resolves it: a `..` is
 kept, so it steps out of whatever a symlink before it names. On Windows, one
 relative to a drive's current directory (`C:x`) or to the current drive's
-root (`\x`) is refused, asking for an absolute path.
+root (`\x`) is refused, asking for an absolute path. The state directory's
+`.` segments are dropped, absolute or relative, and one whose last component
+is `..` is replaced by the real path it names; such a path that does not
+exist is refused.
 
 The state directory says it is mox's. mox writes `<state dir>/.mox-state`,
 one line naming the format (`mox state 1`), 0600, when it creates the
