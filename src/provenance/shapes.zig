@@ -9,10 +9,11 @@
 //! pieces is a whole-line secret.
 //!
 //! A line matches a shape when the pieces occur in it in order, each
-//! searched for left to right from where the one before ended. The slots
-//! are the spans between them; a slot after an empty first piece starts at
-//! the start of the line, and one before an empty last piece ends at its
-//! end. A whole-line shape matches every line.
+//! searched for left to right from where the one before ended, the last one
+//! at its last occurrence, so a value that holds the text after it is not
+//! cut short. The slots are the spans between them; a slot after an empty
+//! first piece starts at the start of the line, and one before an empty
+//! last piece ends at its end. A whole-line shape matches every line.
 
 const std = @import("std");
 const toml = @import("toml");
@@ -34,39 +35,89 @@ pub const whole_line: Shape = .{ .pieces = &.{ "", "" } };
 
 pub const Span = struct { start: usize, end: usize };
 
-/// Every form in which compose, or a partial target's writer, writes
-/// `values` into a file: as written, JSON-escaped, TOML- and YAML-quoted,
-/// and, for a value of several lines, each of its lines. Empty forms are
-/// left out; the longest come first.
-pub fn writtenForms(arena: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+/// The forms in which compose, or a partial target's writer, writes a set
+/// of values into a file: as written, JSON-escaped, and TOML- and
+/// YAML-quoted (`text`, longest first), and, for a form of several lines,
+/// its first and last lines, which share an output line with other text
+/// (also in `text`), and its other lines, which fill an output line alone
+/// (`lines`).
+pub const Forms = struct {
+    text: []const []const u8 = &.{},
+    lines: std.StringHashMapUnmanaged(void) = .empty,
+
+    pub const none: Forms = .{};
+};
+
+pub fn writtenForms(arena: std.mem.Allocator, values: []const []const u8) !Forms {
     var set: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var lines: std.StringHashMapUnmanaged(void) = .empty;
     for (values) |v| {
         if (v.len == 0) continue;
-        try addWithLines(arena, &set, v);
-        var js: std.ArrayList(u8) = .empty;
-        try json_interp.appendJsonString(arena, &js, v);
-        try addWithLines(arena, &set, js.items[1 .. js.items.len - 1]);
-        if (try tomlForm(arena, v)) |t| try addWithLines(arena, &set, t);
-        if (try yamlForm(arena, v)) |y| try addWithLines(arena, &set, y);
+        for (try formsOf(arena, v)) |f| try addForm(arena, &set, &lines, f);
     }
-    const out = try arena.dupe([]const u8, set.keys());
-    std.mem.sort([]const u8, out, {}, struct {
+    const text = try arena.dupe([]const u8, set.keys());
+    std.mem.sort([]const u8, text, {}, struct {
         fn longer(_: void, x: []const u8, y: []const u8) bool {
             return x.len > y.len;
         }
     }.longer);
-    return out;
+    return .{ .text = text, .lines = lines };
 }
 
-fn addWithLines(arena: std.mem.Allocator, set: *std.StringArrayHashMapUnmanaged(void), form: []const u8) !void {
+/// The whole forms of `v`: as written, JSON-escaped, TOML- and YAML-quoted.
+fn formsOf(arena: std.mem.Allocator, v: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.append(arena, v);
+    var js: std.ArrayList(u8) = .empty;
+    try json_interp.appendJsonString(arena, &js, v);
+    try out.append(arena, js.items[1 .. js.items.len - 1]);
+    if (try tomlForm(arena, v)) |t| try out.append(arena, t);
+    if (try yamlForm(arena, v)) |y| try out.append(arena, y);
+    return out.items;
+}
+
+fn addForm(arena: std.mem.Allocator, set: *std.StringArrayHashMapUnmanaged(void), lines: *std.StringHashMapUnmanaged(void), form: []const u8) !void {
     if (form.len == 0) return;
     try set.put(arena, form, {});
     if (std.mem.indexOfScalar(u8, form, '\n') == null) return;
-    var it = std.mem.splitScalar(u8, form, '\n');
-    while (it.next()) |line| {
-        const l = std.mem.trimEnd(u8, line, "\r");
-        if (l.len > 0) try set.put(arena, l, {});
+    const first = form[0..std.mem.indexOfScalar(u8, form, '\n').?];
+    const last = form[std.mem.lastIndexOfScalar(u8, form, '\n').? + 1 ..];
+    for ([_][]const u8{ first, last }) |l| {
+        const t = std.mem.trimEnd(u8, l, "\r");
+        if (t.len > 0) try set.put(arena, t, {});
     }
+    var it = std.mem.splitScalar(u8, form, '\n');
+    while (it.next()) |l| {
+        const t = std.mem.trimEnd(u8, l, "\r");
+        if (t.len > 0) try lines.put(arena, t, {});
+    }
+}
+
+/// The values of `values` this render wrote: those with a form in a line
+/// of `content` a `.secret` segment of `segments` covers.
+pub fn renderValues(arena: std.mem.Allocator, content: []const u8, segments: []const map.Segment, values: []const []const u8) ![]const []const u8 {
+    if (!map.hasSecret(segments) or values.len == 0) return &.{};
+    const lines = try splitLines(arena, content);
+    var text: std.ArrayList(u8) = .empty;
+    for (segments) |sg| {
+        if (sg.origin != .secret) continue;
+        var i: usize = sg.out_start;
+        while (i < @as(usize, sg.out_start) + sg.out_len and i < lines.len) : (i += 1) {
+            try text.appendSlice(arena, lines[i]);
+            try text.append(arena, '\n');
+        }
+    }
+    var out: std.ArrayList([]const u8) = .empty;
+    for (values) |v| {
+        if (v.len == 0) continue;
+        for (try formsOf(arena, v)) |f| {
+            if (f.len > 0 and std.mem.indexOf(u8, text.items, f) != null) {
+                try out.append(arena, v);
+                break;
+            }
+        }
+    }
+    return out.items;
 }
 
 /// `v` as TOML's encoder writes it as a string, without its quotes.
@@ -99,10 +150,15 @@ fn unquote(text: []const u8) []const u8 {
 }
 
 /// The spans of `line` that hold one of `forms`.
-pub fn formSpans(arena: std.mem.Allocator, line: []const u8, forms: []const []const u8, out: *std.ArrayList(Span)) !void {
+pub fn formSpans(arena: std.mem.Allocator, line: []const u8, forms: Forms, out: *std.ArrayList(Span)) !void {
+    if (forms.lines.contains(std.mem.trimEnd(u8, line, "\r"))) try out.append(arena, .{ .start = 0, .end = line.len });
+    try textSpans(arena, line, forms.text, out);
+}
+
+fn textSpans(arena: std.mem.Allocator, text: []const u8, forms: []const []const u8, out: *std.ArrayList(Span)) !void {
     for (forms) |f| {
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, line, i, f)) |at| {
+        while (std.mem.indexOfPos(u8, text, i, f)) |at| {
             try out.append(arena, .{ .start = at, .end = at + f.len });
             i = at + 1;
         }
@@ -125,7 +181,11 @@ pub fn match(arena: std.mem.Allocator, shape: Shape, line: []const u8, out: *std
             try out.append(arena, .{ .start = pos, .end = line.len });
             break;
         }
-        const at = std.mem.indexOfPos(u8, line, pos, piece) orelse {
+        const found = if (k == shape.pieces.len - 1)
+            (if (std.mem.lastIndexOf(u8, line, piece)) |at| (if (at >= pos) at else null) else null)
+        else
+            std.mem.indexOfPos(u8, line, pos, piece);
+        const at = found orelse {
             out.shrinkRetainingCapacity(mark);
             return false;
         };
@@ -165,13 +225,14 @@ pub fn mask(arena: std.mem.Allocator, line: []const u8, spans: []Span, marker: [
 
 /// Per output line of `lines`, the spans that hold a secret: null for a line
 /// no `.secret` segment covers. A run of secret lines is searched as one
-/// text for `forms`, so a value of several lines is found across them; a
-/// secret line in which none is found is a secret as a whole.
+/// text for the whole forms of `forms`, so a value of several lines is
+/// found across them; a secret line in which none is found is a secret as a
+/// whole.
 pub fn secretSpans(
     arena: std.mem.Allocator,
     lines: []const []const u8,
     segments: []const map.Segment,
-    forms: []const []const u8,
+    forms: Forms,
 ) ![]const ?[]Span {
     const out = try arena.alloc(?[]Span, lines.len);
     @memset(out, null);
@@ -198,13 +259,19 @@ pub fn secretSpans(
             try text.appendSlice(arena, l);
         }
         var found: std.ArrayList(Span) = .empty;
-        try formSpans(arena, text.items, forms, &found);
+        try textSpans(arena, text.items, forms.text, &found);
+        const merged = merge(found.items);
+        // Spans are disjoint and in order, and so are the lines: one pass.
+        var c: usize = 0;
         for (lines[i..j], starts, 0..) |l, start, k| {
+            const end = start + l.len;
+            while (c < merged.len and merged[c].end < start) c += 1;
             var spans: std.ArrayList(Span) = .empty;
-            for (found.items) |f| {
-                const lo = @max(f.start, start);
-                const hi = @min(f.end, start + l.len);
-                if (lo < hi or (lo == hi and f.start <= start and f.end >= start + l.len)) {
+            var x = c;
+            while (x < merged.len and merged[x].start <= end) : (x += 1) {
+                const lo = @max(merged[x].start, start);
+                const hi = @min(merged[x].end, end);
+                if (lo < hi or (lo == hi and merged[x].start <= start and merged[x].end >= end)) {
                     try spans.append(arena, .{ .start = lo - start, .end = hi - start });
                 }
             }
@@ -214,6 +281,26 @@ pub fn secretSpans(
         i = j;
     }
     return out;
+}
+
+/// `spans` sorted and with overlapping or touching ones joined, in place.
+fn merge(spans: []Span) []Span {
+    if (spans.len == 0) return spans;
+    std.mem.sort(Span, spans, {}, struct {
+        fn lt(_: void, x: Span, y: Span) bool {
+            return x.start < y.start;
+        }
+    }.lt);
+    var n: usize = 0;
+    for (spans) |sp| {
+        if (n > 0 and sp.start <= spans[n - 1].end) {
+            spans[n - 1].end = @max(spans[n - 1].end, sp.end);
+        } else {
+            spans[n] = sp;
+            n += 1;
+        }
+    }
+    return spans[0..n];
 }
 
 /// The shape of `line` with `spans` as its slots.
@@ -246,29 +333,34 @@ pub fn shapesOf(arena: std.mem.Allocator, content: []const u8, segments: []const
     const lines = try splitLines(arena, content);
     const spans = try secretSpans(arena, lines, segments, try writtenForms(arena, values));
     var out: std.ArrayList(Shape) = .empty;
+    var seen_keys: std.StringHashMapUnmanaged(void) = .empty;
     for (lines, spans) |l, sp| {
         // A shape is kept as JSON text, which holds only UTF-8.
         const s = if (std.unicode.utf8ValidateSlice(l)) try shapeOf(arena, l, sp orelse continue) else if (sp == null) continue else whole_line;
-        const seen = for (out.items) |o| {
-            if (sameShape(o, s)) break true;
-        } else false;
-        if (!seen) try out.append(arena, s);
+        const key = try shapeKey(arena, s);
+        if (seen_keys.contains(key)) continue;
+        try seen_keys.put(arena, key, {});
+        try out.append(arena, s);
     }
     return out.items;
 }
 
-fn sameShape(x: Shape, y: Shape) bool {
-    if (x.pieces.len != y.pieces.len) return false;
-    for (x.pieces, y.pieces) |p, q| if (!std.mem.eql(u8, p, q)) return false;
-    return true;
+/// A text naming `s` alone: its pieces, each with its length before it.
+fn shapeKey(arena: std.mem.Allocator, s: Shape) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s.pieces) |p| {
+        try out.print(arena, "{d}:", .{p.len});
+        try out.appendSlice(arena, p);
+    }
+    return out.items;
 }
 
 /// `content`, stored prior content of a file, with every line that matches
 /// one of `shapes` masked at its slots, and every one of `forms` masked
 /// wherever it occurs. A line that matches no shape and holds no form is
 /// kept as it is.
-pub fn redact(arena: std.mem.Allocator, content: []const u8, shapes: []const Shape, forms: []const []const u8) ![]const u8 {
-    if (shapes.len == 0 and forms.len == 0) return content;
+pub fn redact(arena: std.mem.Allocator, content: []const u8, shapes: []const Shape, forms: Forms) ![]const u8 {
+    if (shapes.len == 0 and forms.text.len == 0 and forms.lines.count() == 0) return content;
     var out: std.ArrayList(u8) = .empty;
     const trailing_nl = content.len > 0 and content[content.len - 1] == '\n';
     var changed = false;
@@ -305,6 +397,10 @@ test "match: pieces in order, slots between and around them" {
     try testing.expectEqual(@as(usize, 0), spans.items.len);
     try testing.expect(try match(a, whole_line, "anything", &spans));
     try testing.expectEqualStrings("<s>", try mask(a, "anything", spans.items, "<s>"));
+    spans.clearRetainingCapacity();
+    const pw: Shape = .{ .pieces = &.{ "pw=\"", "\"" } };
+    try testing.expect(try match(a, pw, "pw=\"ab\"cdLEAK\"", &spans));
+    try testing.expectEqualStrings("pw=\"<s>\"", try mask(a, "pw=\"ab\"cdLEAK\"", spans.items, "<s>"));
 }
 
 test "shapesOf: a value of several lines gives slot-only middle lines and keeps the text around it" {
@@ -354,19 +450,40 @@ test "redact: matching lines are masked at their slots, a value anywhere is mask
     try testing.expect((try redact(a, same, &shapes, forms)).ptr == same.ptr);
 }
 
-test "writtenForms: the raw, JSON, TOML and YAML forms, and each line of a value of several lines" {
+test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a form of several lines as text, its inner lines whole" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const forms = try writtenForms(a, &.{ "a\"b\\c", "l1\nl2", "" });
+    const forms = try writtenForms(a, &.{ "a\"b\\c", "l1\nmid\nl3", "" });
     var has_json = false;
-    var has_line = false;
-    for (forms) |f| {
+    var has_outer = false;
+    for (forms.text) |f| {
         if (std.mem.eql(u8, f, "a\\\"b\\\\c")) has_json = true;
-        if (std.mem.eql(u8, f, "l2")) has_line = true;
+        if (std.mem.eql(u8, f, "l3")) has_outer = true;
         try testing.expect(f.len > 0);
+        try testing.expect(!std.mem.eql(u8, f, "mid"));
     }
     try testing.expect(has_json);
-    try testing.expect(has_line);
-    for (forms[1..], forms[0 .. forms.len - 1]) |f, prev| try testing.expect(f.len <= prev.len);
+    try testing.expect(has_outer);
+    try testing.expect(forms.lines.contains("mid"));
+    for (forms.text[1..], forms.text[0 .. forms.text.len - 1]) |f, prev| try testing.expect(f.len <= prev.len);
+    var spans: std.ArrayList(Span) = .empty;
+    try formSpans(a, "mid", forms, &spans);
+    try testing.expectEqual(@as(usize, 1), spans.items.len);
+    spans.clearRetainingCapacity();
+    try formSpans(a, "amid", forms, &spans);
+    try testing.expectEqual(@as(usize, 0), spans.items.len);
+}
+
+test "renderValues: only the values a render wrote into its secret lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 1, .origin = .secret },
+    };
+    const got = try renderValues(a, "other\n{\"k\": \"x\\\"y\"}\n", &segs, &.{ "other", "x\"y", "absent" });
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("x\"y", got[0]);
 }

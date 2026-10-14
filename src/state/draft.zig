@@ -43,6 +43,12 @@ pub fn boundedProvenance(arena: std.mem.Allocator, live: []const u8, content: []
     return prov_map.serialize(arena, live, &coarse, &.{prov_shapes.whole_line});
 }
 
+/// A file as this run composed it: its bytes and their provenance.
+pub const Render = struct {
+    bytes: []const u8,
+    segments: []const prov_map.Segment,
+};
+
 pub const Store = struct {
     state_dir: []const u8,
     v2: []const u8,
@@ -252,21 +258,24 @@ pub const Draft = struct {
     }
 
     /// `content`, what was at `live` before this run replaces it, as a
-    /// snapshot keeps it: every line that matches a shape of a line the last
-    /// apply wrote a secret into is masked at its slots, and every value this
-    /// run resolved is masked wherever it occurs. Any other line is kept as it
-    /// is. A provenance written without shapes gives the shapes found in
-    /// `content` while it is still what that apply wrote, and the whole-line
-    /// shape once it is not.
-    pub fn redactPrior(d: *Draft, live: []const u8, content: []const u8) ![]const u8 {
-        const values = if (d.secrets) |c| try c.values(d.arena) else &.{};
+    /// snapshot keeps it. Every line that matches a shape of a line the last
+    /// apply wrote a secret into is masked at its slots, and, when this run
+    /// rendered the file anew (`render`), every value that render wrote is
+    /// masked wherever it occurs. Any other line is kept as it is. When the
+    /// provenance names secret lines but records no shapes, or is missing for
+    /// a record written for a secret, every line is masked: the values the
+    /// file was written with are not known.
+    pub fn redactPrior(d: *Draft, live: []const u8, content: []const u8, render: ?Render) ![]const u8 {
+        const all = if (d.secrets) |c| try c.values(d.arena) else &.{};
+        const values = if (render) |r| try prov_shapes.renderValues(d.arena, r.bytes, r.segments, all) else &.{};
         const forms = try prov_shapes.writtenForms(d.arena, values);
-        const shapes: []const prov_map.Shape = if (try d.provenance(live)) |m| m.secretShapes() orelse blk: {
-            const f = d.fileRecord(live);
-            if (f != null and std.mem.eql(u8, &f.?.sha256, &applied.contentHashHex(content)))
-                break :blk try prov_shapes.shapesOf(d.arena, content, m.segments, values);
-            break :blk &.{prov_shapes.whole_line};
-        } else &.{};
+        const whole: []const prov_map.Shape = &.{prov_shapes.whole_line};
+        const shapes: []const prov_map.Shape = if (try d.provenance(live)) |m|
+            m.secretShapes() orelse whole
+        else if (d.fileRecord(live)) |f|
+            (if (f.cache_blob == null) whole else &.{})
+        else
+            &.{};
         return prov_shapes.redact(d.arena, content, shapes, forms);
     }
 

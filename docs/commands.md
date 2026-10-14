@@ -757,17 +757,18 @@ A resolved secret is never printed. Apply records, in the file's provenance,
 the shape of each line it wrote a secret into: the text of the line around
 each secret, in order, and nothing derived from the value, not even its
 length. A live line in which a shape's pieces occur in order, each found left
-to right after the one before, is printed with the spans between and around
-them replaced by `<mox:redacted-secret>` (a span before the first piece or
-after the last runs to that end of the line). A line that was a secret
+to right after the one before and the last at its last occurrence, is
+printed with the spans between and around them replaced by
+`<mox:redacted-secret>` (a span before the first piece or after the last
+runs to that end of the line). A line that was a secret
 whole, as each middle line of a value of several lines is, matches every
 line. When some shape matches no live line, a secret line was changed beyond
 its shape and its value may be anywhere: every live line that matches no
 shape and is not a line of the composed output that holds no secret is
-printed as `<mox:redacted-line>`. Every value the current render resolves is
-masked on both sides wherever it occurs, as it is written and in each form
-mox writes it in (JSON-escaped, TOML- and YAML-quoted, and each line of a
-value of several lines). The composed side is masked at the secrets its own
+printed as `<mox:redacted-line>`. Every value the file's current render
+wrote is masked on both sides wherever it occurs, as it is written and in
+each form mox writes it in (JSON-escaped, TOML- and YAML-quoted, and each
+line of a value of several lines). The composed side is masked at the secrets its own
 render placed. A live file that may hold a resolved secret (its source
 resolves one, its record was written for one, or its provenance names one)
 whose provenance is missing or records no shapes is masked by this render's
@@ -776,27 +777,28 @@ otherwise not shown: stderr says so, and that `mox apply` records what diff
 needs, or, for a file with edits, `mox apply --overwrite <path>`, which
 writes it again and keeps the edits in a snapshot. What a snapshot keeps of
 content apply displaces is masked the same way, without the fail-closed
-rule: a line that matches a recorded shape is masked at its slots, every
-value the run resolved is masked wherever it occurs, and any other line is
-kept as it is, so rollback restores it; a provenance with no shapes masks it
-by the shapes found in the displaced content while that is still what the
-last apply wrote, and every line once it is not. A file whose source left
-the tree, which apply would remove, shows its live content on the removed
-side, and such a symlink the line `symlink -> <target>`, as does an unedited
-file of a generator that left the tree; a file that does not parse in its
-format is an `ERROR` line on stderr, as apply reports it. Read-only: it
-takes no writer lock, only the readers lock. A difference is not an error,
-so a run that completes exits 0 whether or not anything differs. An
-`attributes.toml`, the repo's or the private layer's, that is not valid TOML
-or cannot be read stops the run with exit 2, as it does in every command
-that reads attributes (add, apply, commit, doctor, edit, export, facts, mv,
-remove and status); rollback warns instead. A refusal exits 1: a path that
-is not managed, a head ownership declaration that does not parse, and an
-attributes entry that breaks the schema, with or without a source. A file's
-own `ERROR` that does not come from an attributes file -- a head directive
-on an unstructured target, one spelled with another file's comment marker, a
-mox directive in strict JSON, or a layer or output that does not parse -- is
-reported and the run still exits 0.
+rule, whatever displaces it (an overwrite, a removal, `mox remove --purge`):
+a line that matches a recorded shape is masked at its slots, every value the
+file's new render wrote is masked wherever it occurs, and any other line is
+kept as it is, so rollback restores it. A file whose provenance names secret
+lines but records no shapes, or is missing while its record was written for
+a secret, has every line masked. A file whose source left the tree, which
+apply would remove, shows its live content on the removed side, and such a
+symlink the line `symlink -> <target>`, as does an unedited file of a
+generator that left the tree; a file that does not parse in its format is an
+`ERROR` line on stderr, as apply reports it. Read-only: it takes no writer
+lock, only the readers lock. A difference is not an error, so a run that
+completes exits 0 whether or not anything differs. An `attributes.toml`, the
+repo's or the private layer's, that is not valid TOML or cannot be read
+stops the run with exit 2, as it does in every command that reads attributes
+(add, apply, commit, doctor, edit, export, facts, mv, remove and status);
+rollback warns instead. A refusal exits 1: a path that is not managed, a
+head ownership declaration that does not parse, and an attributes entry that
+breaks the schema, with or without a source. A file's own `ERROR` that does
+not come from an attributes file -- a head directive on an unstructured
+target, one spelled with another file's comment marker, a mox directive in
+strict JSON, or a layer or output that does not parse -- is reported and the
+run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |

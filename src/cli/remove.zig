@@ -177,7 +177,14 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
     // cache, symlink target, owned record) and its provenance: mox stopped
     // tracking it, and a stale record would make a later re-add at the same
     // path compare against state from the previous management era instead of
-    // going through first contact.
+    // going through first contact. A file --purge removes is read and its
+    // snapshot masked first, while the records that say where its secrets
+    // are still exist.
+    const purged: ?[]const u8 = if (purge and mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path) == .other)
+        Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch null
+    else
+        null;
+    const purged_kept: ?[]const u8 = if (purged) |b| try st.redactPrior(live_path, b, null) else null;
     try st.forget(live_path);
     try st.forgetProvenance(live_path);
 
@@ -256,6 +263,10 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
             },
             .symlink => |target| .{ .link = target },
             .other => blk: {
+                if (purged) |b| {
+                    expect = b;
+                    break :blk .{ .file = purged_kept.? };
+                }
                 const live = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
                     error.FileNotFound => {
                         try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});

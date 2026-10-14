@@ -170,10 +170,10 @@ fn shownLines(
 }
 
 /// The composed side as diff prints it: the secret slots this render's
-/// provenance names, and every form of every value this run resolved,
+/// provenance names, and every form of every value this render wrote,
 /// masked.
 const ComposedMask = struct {
-    forms: []const []const u8,
+    forms: shapes.Forms,
     spans: []const ?[]Span,
 
     fn show(m: ComposedMask, arena: std.mem.Allocator, i: usize, line: []const u8) anyerror![]const u8 {
@@ -186,12 +186,12 @@ const ComposedMask = struct {
 
 /// The live side as diff prints it. A line that matches a shape of a line
 /// the last apply wrote a secret into is masked at its slots, and every
-/// form of every value this run resolved is masked. When a shape matches
+/// form of every value this render wrote is masked. When a shape matches
 /// no live line, a secret line changed beyond it and its value may be
 /// anywhere: every line that matches no shape and is not a line of the
 /// composed output that holds no secret is replaced whole.
 const LiveMask = struct {
-    forms: []const []const u8,
+    forms: shapes.Forms,
     shapes: []const shapes.Shape,
     fail_closed: bool,
     clear: *const std.StringHashMapUnmanaged(void),
@@ -221,23 +221,22 @@ const LiveMask = struct {
     }
 };
 
-/// Every form of every secret value this run resolved so far.
-fn resolvedForms(st: *State, arena: std.mem.Allocator) ![]const []const u8 {
-    const values = if (st.secrets) |c| try c.values(arena) else &.{};
-    return shapes.writtenForms(arena, values);
+/// Every form of every secret value the render `bytes`, of provenance
+/// `segments`, wrote.
+fn renderForms(st: *State, arena: std.mem.Allocator, bytes: []const u8, segments: []const mox.provenance.map.Segment) !shapes.Forms {
+    const all = if (st.secrets) |c| try c.values(arena) else &.{};
+    return shapes.writtenForms(arena, try shapes.renderValues(arena, bytes, segments, all));
 }
 
 /// The composed side of a diff, masked.
-fn composedShown(arena: std.mem.Allocator, st: *State, lines: []const []const u8, hunks: []const Hunk, segments: []const mox.provenance.map.Segment) ![]const []const u8 {
-    const forms = try resolvedForms(st, arena);
+fn composedShown(arena: std.mem.Allocator, forms: shapes.Forms, lines: []const []const u8, hunks: []const Hunk, segments: []const mox.provenance.map.Segment) ![]const []const u8 {
     const m: ComposedMask = .{ .forms = forms, .spans = try shapes.secretSpans(arena, lines, segments, forms) };
     return shownLines(arena, lines, hunks, .composed, m, ComposedMask.show);
 }
 
-/// `lines`, every one of them, with every form of every value this run
-/// resolved masked.
-fn formsShown(arena: std.mem.Allocator, st: *State, lines: []const []const u8) ![]const []const u8 {
-    const m: ComposedMask = .{ .forms = try resolvedForms(st, arena), .spans = &.{} };
+/// `lines`, every one of them, with every one of `forms` masked.
+fn formsShown(arena: std.mem.Allocator, forms: shapes.Forms, lines: []const []const u8) ![]const []const u8 {
+    const m: ComposedMask = .{ .forms = forms, .spans = &.{} };
     const out = try arena.alloc([]const u8, lines.len);
     for (lines, out, 0..) |l, *o, i| o.* = try m.show(arena, i, l);
     return out;
@@ -518,7 +517,8 @@ fn diffLinkReplace(
         try ctx.out.print(" {f} | +{d} -{d}\n", .{ display.of(live_path, ctx.context.?.paths.home), s.added, s.removed });
         return;
     }
-    try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_lines, try composedShown(ctx.alloc, st, b_lines, hunks, prov_segments), hunks, sty));
+    const forms = try renderForms(st, ctx.alloc, composed_bytes, prov_segments);
+    try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_lines, try composedShown(ctx.alloc, forms, b_lines, hunks, prov_segments), hunks, sty));
 }
 
 /// Diff one composed result against its live file, printing the rendered hunks
@@ -574,13 +574,14 @@ fn diffOne(
             try ctx.err.print("mox diff: {f}: not shown: the live file may hold a resolved secret, and neither its provenance nor this render of its source says where; run `mox apply` to record it (for a file with edits, `mox apply --overwrite {f}` writes it again and keeps the edits in a snapshot)\n", .{ shown, shown });
             return;
         };
-        const b_shown = try composedShown(ctx.alloc, st, b_lines, hunks, prov_segments);
+        const forms = try renderForms(st, ctx.alloc, composed_bytes, prov_segments);
+        const b_shown = try composedShown(ctx.alloc, forms, b_lines, hunks, prov_segments);
         var clear: std.StringHashMapUnmanaged(void) = .empty;
-        for (b_lines, try shapes.secretSpans(ctx.alloc, b_lines, prov_segments, &.{})) |l, sp| {
+        for (b_lines, try shapes.secretSpans(ctx.alloc, b_lines, prov_segments, .none)) |l, sp| {
             if (sp == null) try clear.put(ctx.alloc, l, {});
         }
         const m: LiveMask = .{
-            .forms = try resolvedForms(st, ctx.alloc),
+            .forms = forms,
             .shapes = recorded,
             .fail_closed = try LiveMask.unmatched(ctx.alloc, recorded, a_lines),
             .clear = &clear,
@@ -763,7 +764,8 @@ fn diffPartial(
     if (stat_mode) {
         try ctx.out.print(" {f} | +{d} -{d}\n", .{ display.of(live_path, ctx.context.?.paths.home), s.added, s.removed });
     } else {
-        const rendered = try renderOwnedFile(ctx.alloc, live_path, try formsShown(ctx.alloc, st, a_lines), try formsShown(ctx.alloc, st, b_lines), hunks, sty);
+        const forms = try renderForms(st, ctx.alloc, composed_bytes, prov_segments);
+        const rendered = try renderOwnedFile(ctx.alloc, live_path, try formsShown(ctx.alloc, forms, a_lines), try formsShown(ctx.alloc, forms, b_lines), hunks, sty);
         try ctx.out.writeAll(rendered);
     }
 }

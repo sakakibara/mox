@@ -188,7 +188,7 @@ fn keepReplaced(arena: std.mem.Allocator, io: Io, st: *state.Draft, home: []cons
             if (write_mod.guardLiveRead(io, live) == .special) return;
             const bytes = try Io.Dir.cwd().readFileAlloc(io, live, arena, .limited(64 * 1024 * 1024));
             if (incoming) |in| if (std.mem.eql(u8, in, bytes)) return;
-            try st.save(home, live, try st.redactPrior(live, bytes));
+            try st.save(home, live, try st.redactPrior(live, bytes, null));
         },
     }
 }

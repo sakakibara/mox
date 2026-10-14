@@ -98,7 +98,7 @@ All notable changes to mox are documented here. The format follows
   a secret into -- the text of the line around the secret -- and nothing
   derived from the value. A live line with a recorded shape is printed with
   the secret's place shown as `<mox:redacted-secret>`, and every value the
-  current render resolves is masked wherever it occurs, as written and
+  file's current render wrote is masked wherever it occurs, as written and
   JSON-escaped, TOML- or YAML-quoted. When a shape matches no live line, a
   secret line was edited beyond it, and every live line diff cannot tell
   apart from the composed output's lines that hold no secret is printed as
@@ -291,10 +291,13 @@ All notable changes to mox are documented here. The format follows
 ### Fixed
 - A snapshot of a file mox wrote a secret into masks the secret by the
   shape of its line, wherever the line has moved, and masks every value the
-  run resolved wherever it occurs; any other line is kept as it is. It used
-  to mask the lines at the places the last apply wrote secrets to, so a
-  secret line the user had moved was kept in clear and the line now in its
-  place was masked.
+  file's new render wrote wherever it occurs; any other line is kept as it
+  is. It used to mask the lines at the places the last apply wrote secrets
+  to, so a secret line the user had moved was kept in clear and the line
+  now in its place was masked. A file whose provenance is missing, or
+  records no shapes, has every line of its snapshot masked.
+- `mox remove --purge` masks the secrets of the file it removes in its
+  snapshot; it kept them in clear.
 - A value of several lines resolved into a TOML, YAML, INI or gitconfig
   file marks every line it fills as a secret line; only its first line was
   marked, and each later line's mark was shifted onto the lines after it.

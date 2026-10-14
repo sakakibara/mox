@@ -1889,10 +1889,9 @@ fn omitFile(
         return;
     }
 
-    // Snapshot the prior content (secret lines redacted) before removing, and
+    // Snapshot the prior content (secrets masked) before removing, and
     // refuse if the snapshot cannot be taken -- symmetric with an overwrite.
-    const snap_content = try redactedPriorContent(st, live_path, live.?);
-    if (!try replaceLive(ctx, st, live_path, shown, .{ .file = snap_content }, live, counts, snapshotted)) return;
+    if (!try replaceLive(ctx, st, live_path, shown, .{ .file = live.? }, live, counts, snapshotted)) return;
     try st.forgetWholeFile(live_path);
     counts.removed += 1;
     try ctx.out.print("  removed {s} (composes to nothing)\n", .{shown});
@@ -2181,7 +2180,7 @@ fn removeStale(ctx: *app.Ctx, st: *State, c: mox.apply.stale.Candidate, in: Stal
     }
     const snap: mox.apply.live_remove.Snap, const expect: ?[]const u8 = switch (found) {
         .link => |target| .{ .{ .link = target }, null },
-        .file => |live| .{ .{ .file = try redactedPriorContent(st, c.live_path, live) }, live },
+        .file => |live| .{ .{ .file = live }, live },
     };
     if (!try replaceLive(ctx, st, c.live_path, shown, snap, expect, counts, snapshotted)) return;
     try forgetAll(st, c.live_path);
@@ -2311,7 +2310,7 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
     // About to replace existing content: snapshot it first (secret lines
     // redacted), and refuse the overwrite if the snapshot cannot be taken.
     if (disposition != .fresh_write) {
-        const snap_content = try redactedPriorContent(st, in.live_path, live.?);
+        const snap_content = try st.redactPrior(in.live_path, live.?, .{ .bytes = in.bytes, .segments = in.prov_items });
         st.save(context.paths.home, in.live_path, snap_content) catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             try ctx.err.flush();
@@ -2925,12 +2924,6 @@ fn generatedParentEscapes(io: std.Io, base_dir: []const u8, live_path: []const u
         if (st.kind == .sym_link) return true;
     }
     return false;
-}
-
-/// The prior live content to snapshot before an overwrite, its secrets
-/// masked as `Draft.redactPrior` says.
-fn redactedPriorContent(st: *State, live_path: []const u8, content: []const u8) ![]const u8 {
-    return st.redactPrior(live_path, content);
 }
 
 /// True when the live path's CURRENT content still equals `initial` (the copy

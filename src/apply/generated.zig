@@ -329,7 +329,7 @@ fn actOnLeaf(
     switch (found) {
         .link => |target| try finishLeaf(arena, io, opts, live_path, .{ .link = target }, null, stdout, stderr, result),
         // The snapshot keeps the content with secret lines redacted.
-        .file => |content| try finishLeaf(arena, io, opts, live_path, .{ .file = try redactedContent(opts.st, live_path, content) }, content, stdout, stderr, result),
+        .file => |content| try finishLeaf(arena, io, opts, live_path, .{ .file = content }, content, stdout, stderr, result),
     }
 }
 
@@ -367,10 +367,4 @@ fn tilde(arena: std.mem.Allocator, home: []const u8, path: []const u8) ![]const 
 fn forgetRecords(st: *state.Draft, live_path: []const u8) !void {
     try st.forget(live_path);
     try st.forgetProvenance(live_path);
-}
-
-/// `content` as a snapshot keeps it: a generated leaf may hold a resolved
-/// secret, whose cleartext must not be copied into a snapshot.
-fn redactedContent(st: *state.Draft, live_path: []const u8, content: []const u8) ![]const u8 {
-    return st.redactPrior(live_path, content);
 }

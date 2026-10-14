@@ -61,7 +61,7 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
     if (parent_link.through(io, c.home, live_path, c.links)) return .{ .left = parent_link.reason };
     if (c.dry_run) return .removed;
     const saved: anyerror!void = switch (snap) {
-        .file => |bytes| c.st.save(c.home, live_path, bytes),
+        .file => |bytes| if (c.st.redactPrior(live_path, bytes, null)) |kept| c.st.save(c.home, live_path, kept) else |e| e,
         .link => |target| c.st.saveSymlink(c.home, live_path, target),
         .tree => snapshot.saveTree(arena, io, c.st, c.home, live_path),
         .taken_tree, .taken_file, .special => {},

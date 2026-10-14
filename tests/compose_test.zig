@@ -5753,5 +5753,5 @@ test "compose catA json: off the resolving path a secret capture stays its place
 /// `out` as a snapshot keeps it, by the shapes of its secret lines.
 fn redactedByShapes(a: std.mem.Allocator, out: []const u8, prov: []const mox.provenance.map.Segment, cache: *const mox.secret.cache.Cache) ![]const u8 {
     const sh = mox.provenance.shapes;
-    return sh.redact(a, out, try sh.shapesOf(a, out, prov, try cache.values(a)), &.{});
+    return sh.redact(a, out, try sh.shapesOf(a, out, prov, try cache.values(a)), .none);
 }
