@@ -151,7 +151,7 @@ test "absolutePaths: a relative state directory, and every path under it, resolv
     defer arena.deinit();
     const a = arena.allocator();
     var m = std.process.Environ.Map.init(a);
-    try m.put("HOME", "/home/alice");
+    try m.put("HOME", if (builtin.os.tag == .windows) "C:\\Users\\alice" else "/home/alice");
     try m.put("MOX_STATE_DIR", ".");
     var why: ?[]const u8 = null;
     const p = try absolutePaths(a, try resolveFrom(a, Env{ .map = &m }, builtin.os.tag), if (builtin.os.tag == .windows) "C:\\w\\st" else "/w/st", &why);
