@@ -309,7 +309,8 @@ All notable changes to mox are documented here. The format follows
   now in its place was masked. A file whose provenance is missing, or
   records no shapes, has every line of its snapshot masked.
 - `mox remove --purge` masks the secrets of the file it removes in its
-  snapshot; it kept them in clear.
+  snapshot; it kept them in clear. A FIFO or device at the path is removed
+  without being opened; the run used to wait on it forever.
 - A value of several lines resolved into a TOML, YAML, INI or gitconfig
   file marks every line it fills as a secret line; only its first line was
   marked, and each later line's mark was shifted onto the lines after it.

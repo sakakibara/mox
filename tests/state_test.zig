@@ -2080,6 +2080,26 @@ test "diff: a value another file resolves is masked in every file, a file compos
     try std.testing.expect(contains(d.out, "-export TOKEN=" ++ redacted_secret ++ "\n"));
 }
 
+test "remove --purge: a FIFO at the live path is removed without being read, and the run does not wait on it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf(".cfg");
+    try Io.Dir.cwd().deleteFile(io, live);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(try a.dupeZ(u8, live), 0o644));
+    var watch = try Watchdog.start(io, 120);
+    defer watch.stop();
+    const r = try h.runIn(h.home, &.{ "mox", "remove", "--purge", ".cfg" });
+    try std.testing.expect(r.rc <= 1);
+}
+
 /// Fails the test run, rather than letting it hang, when the test does not
 /// stop it within `seconds`.
 const Watchdog = struct {

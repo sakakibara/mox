@@ -180,10 +180,14 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
     // going through first contact. A file --purge removes is read and its
     // snapshot masked first, while the records that say where its secrets
     // are still exist.
-    const purged: ?[]const u8 = if (purge and mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path) == .other)
-        Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch null
-    else
-        null;
+    // A FIFO or device is never opened: it would block, and holds nothing
+    // to keep.
+    const readable = purge and mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path) == .other and
+        mox.apply.write.guardLiveRead(ctx.io, live_path) == .readable;
+    const purged: ?[]const u8 = if (readable) Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| {
+        try ctx.err.print("mox remove: cannot read {f} to back it up, not deleting: {s}\n", .{ display.of(live_path, context.paths.home), @errorName(e) });
+        return 1;
+    } else null;
     const purged_kept: ?[]const u8 = if (purged) |b| try st.redactPrior(live_path, b, null) else null;
     try st.forget(live_path);
     try st.forgetProvenance(live_path);
@@ -267,6 +271,7 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
                     expect = b;
                     break :blk .{ .file = purged_kept.? };
                 }
+                if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) break :blk .special;
                 const live = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
                     error.FileNotFound => {
                         try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
