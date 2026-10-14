@@ -207,30 +207,28 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         if (!try forgetRecords(ctx, st.?)) return 2;
     }
 
-    try removeMarker(ctx, purge_private, &removed);
+    try removeMarker(ctx, &removed);
     try ctx.out.print("mox uninstall: removed {d} state entr(ies); source repo untouched\n", .{removed});
     return 0;
 }
 
-/// Remove the marker once the state directory holds nothing else of mox's
-/// but the lock files, so an uninstall that stopped partway leaves a
-/// directory the next run still takes for mox's.
-fn removeMarker(ctx: *app.Ctx, purge_private: bool, removed: *usize) !void {
+/// Remove the marker once the state directory holds nothing else but the
+/// lock files and OS files. While any other entry is kept, mox's or not,
+/// the marker stays, so an uninstall that stopped partway, or kept what it
+/// did not make, leaves a directory the next run still takes for mox's.
+fn removeMarker(ctx: *app.Ctx, removed: *usize) !void {
     const state_dir = ctx.context.?.paths.state_dir;
     const path = try std.fs.path.join(ctx.alloc, &.{ state_dir, mox.state.marker.marker_name });
     var left = false;
     var marked = false;
     for (try dirent.sortedPath(ctx.alloc, ctx.io, state_dir, .{ .iterate = true })) |e| {
-        switch (actionFor(e.name, purge_private)) {
-            .marker => marked = true,
-            .foreign => {},
-            .preserve => left = left or !isLockFile(e.name),
-            .remove, .prompt, .history => left = left or try notMoxs(ctx.alloc, ctx.io, state_dir, e) == null,
-        }
+        if (std.mem.eql(u8, e.name, mox.state.marker.marker_name)) {
+            marked = true;
+        } else if (!isLockFile(e.name) and !mox.state.marker.isOsFile(e)) left = true;
     }
     if (!marked) return;
     if (left) {
-        try ctx.out.print("  kept {f} (it marks the directory as mox's while mox's entries remain)\n", .{display.of(path, ctx.context.?.paths.home)});
+        try ctx.out.print("  kept {f} (it marks the directory as mox's while other entries remain)\n", .{display.of(path, ctx.context.?.paths.home)});
         return;
     }
     try removeEntry(ctx, path, removed);

@@ -77,7 +77,9 @@ All notable changes to mox are documented here. The format follows
   `bin/`, `tmp/`, `trash/` and `v2/` are removed only while they hold
   nothing but what mox puts there; one holding anything else is kept whole
   and listed with the first entry mox did not make. The marker goes last,
-  once nothing else of mox's is left.
+  once nothing but the lock files and the files a file browser leaves is
+  left; while uninstall keeps any other entry, mox's or not, it keeps the
+  marker.
 - The setup scripts' `<state dir>/bin` is refreshed by replacing only the
   running `mox` there. When it holds anything else, mox removes nothing,
   keeps the directory off `PATH` for that run and warns; it used to remove

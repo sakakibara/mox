@@ -2446,6 +2446,34 @@ test "uninstall: a directory named as an OS file inside v2/ or a store is the us
     try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds .DS_Store, which mox did not make)", .{try statePath(h, &.{"v2"})})));
 }
 
+test "state directory: uninstall keeps the marker while it keeps any entry, mox's or not, and removes it when only lock files and OS files are left" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const marker = try statePath(h, &.{".mox-state"});
+    for ([_][]const u8{ "notes.txt", "bin/user-script", "v2/.DS_Store/photo" }) |stray| {
+        try writeRepo(io, &tmp, try std.fs.path.join(a, &.{ "state", stray }), "mine\n");
+        const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots", "--purge-trash" });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(exists(io, marker));
+        try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s}", .{marker})));
+        try std.testing.expectEqualStrings("mine\n", try read(io, a, try statePath(h, &.{stray})));
+        try std.testing.expect(!contains((try h.run(&.{ "mox", "status" })).err, "is not a mox state directory"));
+        try Io.Dir.cwd().deleteTree(io, try statePath(h, &.{std.mem.sliceTo(stray, '/')}));
+    }
+    try writeRepo(io, &tmp, "state/.DS_Store", "x");
+    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots", "--purge-trash" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!exists(io, marker));
+}
+
 /// Readers that overlap one another, each its own holder as a separate mox
 /// would be: a new one every 100 ms holds the readers lock shared for
 /// 400 ms, taking it through the gate as mox's readers do, until `stop`.

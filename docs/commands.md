@@ -1422,11 +1422,11 @@ is kept whole and listed with the first entry mox did not make. A directory
 that is not a mox state directory (see the top of this page) is refused,
 exit 2, before anything is created, followed or removed in it; an absent or
 empty one has no state to remove. The marker, `.mox-state`, is removed last,
-once the directory holds nothing else of mox's but the lock files, so an
-uninstall that stopped partway leaves a directory the next run still takes
-for mox's; while anything of mox's is kept (the history, trash, the private
-layer) the marker is kept and listed. The user's source repo is never
-touched.
+once the directory holds nothing but the lock files and the files a file
+browser leaves; while any other entry is kept, mox's (the history, trash,
+the private layer) or not, the marker is kept and listed, so an uninstall
+that stopped partway, or kept what it did not make, leaves a directory the
+next run still takes for mox's. The user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |
