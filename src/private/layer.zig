@@ -227,6 +227,9 @@ pub fn holdsSource(arena: std.mem.Allocator, io: Io, private_dir: []const u8) !b
     defer dir.close(io);
     var walker = try dir.walk(arena);
     defer walker.deinit();
+    // deinit frees only memory: a directory the walk entered stays open, and
+    // on Windows an open one keeps the layer from being moved or removed.
+    defer while (walker.inner.stack.items.len > 0) walker.leave(io);
     while (walker.next(io) catch return false) |entry| {
         if (entry.kind == .directory) continue;
         if (junkPath(entry.path)) continue;
