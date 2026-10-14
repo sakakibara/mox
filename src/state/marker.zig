@@ -38,10 +38,11 @@ pub const Acceptance = union(enum) {
     refused: []const u8,
 };
 
-/// A file an operating system's file browser leaves in any directory it
-/// shows, which says nothing about whose the directory is.
-pub fn isOsFile(name: []const u8) bool {
-    for ([_][]const u8{ ".DS_Store", "Thumbs.db", "desktop.ini" }) |n| if (std.mem.eql(u8, name, n)) return true;
+/// A regular file an operating system's file browser leaves in any
+/// directory it shows, which says nothing about whose the directory is.
+pub fn isOsFile(e: dirent.Entry) bool {
+    if (e.kind != .file) return false;
+    for ([_][]const u8{ ".DS_Store", "Thumbs.db", "desktop.ini" }) |n| if (std.mem.eql(u8, e.name, n)) return true;
     return false;
 }
 
@@ -61,7 +62,7 @@ pub fn accept(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: O
     };
     if (origin == .default) return .{ .accepted = .fresh };
     for (entries) |e| {
-        if (std.mem.eql(u8, e.name, "private") or isLockFile(e.name) or isOsFile(e.name)) continue;
+        if (std.mem.eql(u8, e.name, "private") or isLockFile(e.name) or isOsFile(e)) continue;
         return .{ .refused = try refusal(arena, state_dir) };
     }
     return .{ .accepted = .fresh };
@@ -145,7 +146,7 @@ pub fn whyNotOwn(arena: std.mem.Allocator, io: Io, path: []const u8, own: *const
     var first: ?[]const u8 = null;
     var others: usize = 0;
     for (held) |h| {
-        if (own(h) or isOsFile(h.name)) continue;
+        if (own(h) or isOsFile(h)) continue;
         if (first == null) first = h.name else others += 1;
     }
     const name = first orelse return null;
@@ -184,6 +185,18 @@ test "accept: absent, empty and private-only directories are fresh, a marked one
     try testing.expectEqual(Kind.marked, (try accept(a, io, dir, .explicit)).accepted);
     try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "" });
     try testing.expect((try accept(a, io, try std.fs.path.join(a, &.{ root, "f" }), .explicit)) == .refused);
+}
+
+test "accept: an entry named as an OS file that is not a regular file is no OS file" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const dir = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "s" });
+    try tmp.dir.createDirPath(io, "s/.DS_Store");
+    try testing.expect((try accept(a, io, dir, .explicit)) == .refused);
 }
 
 test "accept: a directory holding only lock files and OS files is fresh, and an empty mox.lock is no evidence of a state" {

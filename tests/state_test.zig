@@ -2427,6 +2427,25 @@ test "state directory: a full uninstall removes the marker last, and one that ke
     }
 }
 
+test "uninstall: a directory named as an OS file inside v2/ or a store is the user's, and keeps it whole" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "state/v2/.DS_Store/photo", "jpg\n");
+    try writeRepo(io, &tmp, "state/v2/Thumbs.db", "x");
+    const r = try h.run(&.{ "mox", "uninstall", "--purge-snapshots" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("jpg\n", try read(io, a, try statePath(h, &.{ "v2", ".DS_Store", "photo" })));
+    try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds .DS_Store, which mox did not make)", .{try statePath(h, &.{"v2"})})));
+}
+
 /// Readers that overlap one another, each its own holder as a separate mox
 /// would be: a new one every 100 ms holds the readers lock shared for
 /// 400 ms, taking it through the gate as mox's readers do, until `stop`.
