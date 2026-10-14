@@ -79,101 +79,31 @@ pub fn processId() u32 {
     };
 }
 
-/// Where a call's scratch files are staged under the scratch directory: a
-/// child's stdin, a manager's export. Named per process, and swept of what
-/// a dead process left by `sweepScratch`.
-pub const tmp_subdir = "tmp";
-
-pub fn scratchTmpDir(arena: std.mem.Allocator, scratch_dir: []const u8) ![]const u8 {
-    return std.fs.path.join(arena, &.{ scratch_dir, tmp_subdir });
-}
-
-/// Remove what an interrupted mox left under `<scratch_dir>/tmp`: a stdin
-/// file or an export whose owning process is gone. This process's own files
-/// and a live process's are left alone. Windows cannot ask whether a pid is
-/// alive, so there only a file older than an hour goes. Best effort: a
-/// sweep that cannot run is not a failed command.
-pub fn sweepScratch(io: Io, arena: std.mem.Allocator, scratch_dir: []const u8) void {
-    const dir_path = scratchTmpDir(arena, scratch_dir) catch return;
-    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-
-    var stale: std.ArrayList([]const u8) = .empty;
-    var it = dir.iterate();
-    while (it.next(io) catch null) |e| {
-        if (e.kind != .file) continue;
-        const pid = scratchPidOf(e.name) orelse continue;
-        var age_ms: i64 = 0;
-        if (by_age) {
-            const st = dir.statFile(io, e.name, .{}) catch continue;
-            age_ms = st.mtime.durationTo(Io.Timestamp.now(io, .real)).toMilliseconds();
-        }
-        if (!scratchStale(pid, processId(), age_ms, by_age)) continue;
-        stale.append(arena, arena.dupe(u8, e.name) catch return) catch return;
-    }
-    for (stale.items) |name| dir.deleteFile(io, name) catch {};
-}
-
-/// Whether a platform decides a scratch file's owner is gone by the file's
-/// age rather than by asking after the pid.
-const by_age = builtin.os.tag == .windows;
-
-/// How old a scratch file must be before age alone condemns it.
-const scratch_stale_age_ms: i64 = 3_600_000;
-
-/// Whether the file named for `pid`, last written `age_ms` ago, is one an
-/// interrupted run left behind. The pid `self_pid` names is answered first and
-/// on its own: where `age_decides`, this call's own stdin file is condemned by
-/// the rule that follows the moment the run passes an hour, and the file that
-/// rule would take is the one the child is reading.
-fn scratchStale(pid: u32, self_pid: u32, age_ms: i64, age_decides: bool) bool {
-    if (pid == self_pid) return false;
-    if (age_decides) return age_ms >= scratch_stale_age_ms;
-    return !processAlive(pid);
-}
-
-/// Whether `name` is one a call stages under `<scratch_dir>/tmp`.
-pub fn isScratchName(name: []const u8) bool {
-    return scratchPidOf(name) != null;
-}
-
-/// The pid a scratch file is named for, or null for any other file.
-fn scratchPidOf(name: []const u8) ?u32 {
-    const digits = for ([_][2][]const u8{
-        .{ "stdin-", ".txt" },
-        .{ "winget-export-", ".json" },
-    }) |shape| {
-        if (name.len <= shape[0].len + shape[1].len) continue;
-        if (!std.mem.startsWith(u8, name, shape[0])) continue;
-        if (!std.mem.endsWith(u8, name, shape[1])) continue;
-        break name[shape[0].len .. name.len - shape[1].len];
-    } else blk: {
-        // A staged installer is `<backend>-installer-<pid>`, plus the
-        // extension its interpreter needs, and what a plugin wrote beside it
-        // `<backend>-installer-<pid>.bindir`. The
-        // backend names itself, so the pid is what follows the marker.
-        const marker = "-installer-";
-        const at = std.mem.lastIndexOf(u8, name, marker) orelse return null;
-        var rest = name[at + marker.len ..];
-        if (std.mem.indexOfScalar(u8, rest, '.')) |dot| rest = rest[0..dot];
-        break :blk rest;
+/// Make a directory of this process's own under the OS temp directory
+/// `temp_dir`, 0700 and named at random, to stage one call's scratch files
+/// in: a child's stdin, a manager's export, a fetched installer. The caller
+/// removes it, with what it holds, by `removePrivateDir`.
+pub fn privateDir(arena: std.mem.Allocator, io: Io, temp_dir: []const u8) ![]const u8 {
+    if (builtin.is_test) if (private_dir_override) |p| {
+        try Io.Dir.cwd().createDirPath(io, p);
+        return p;
     };
-    return std.fmt.parseInt(u31, digits, 10) catch null;
+    var bytes: [8]u8 = undefined;
+    io.random(&bytes);
+    const path = try std.fs.path.join(arena, &.{ temp_dir, try std.fmt.allocPrint(arena, "mox-{s}", .{&std.fmt.bytesToHex(bytes, .lower)}) });
+    try Io.Dir.cwd().createDir(io, path, if (Io.File.Permissions.has_executable_bit) .fromMode(0o700) else .default_dir);
+    return path;
 }
 
-/// Signal 0 delivers nothing and answers whether the pid exists. EPERM is
-/// alive: what this sweep must not delete is a file a running process is
-/// reading, and who owns that process decides nothing about it. (`cli/lock.zig`
-/// asks the same question and answers EPERM the other way, because its lock
-/// sits under a per-user state directory and so was never written by a
-/// process this user may not signal.) Windows cannot put the question at all
-/// and decides by age instead, so nothing there asks this; unasked, the answer
-/// that deletes nothing is the one to give.
-fn processAlive(pid: u32) bool {
-    if (builtin.os.tag == .windows) return true;
-    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |e| return e == error.PermissionDenied;
-    return true;
+pub fn removePrivateDir(io: Io, path: []const u8) void {
+    if (builtin.is_test) if (private_dir_override) |p| if (std.mem.eql(u8, p, path)) return;
+    Io.Dir.cwd().deleteTree(io, path) catch {};
 }
+
+/// The directory `privateDir` answers in a test, so a fixture can name a
+/// staged file's path; null makes one as a run does. Every call shares it,
+/// so it is left in place, and a caller removes the files it staged.
+pub var private_dir_override: ?[]const u8 = null;
 
 /// A kill for exceeding the bound must be named as such, never read as the
 /// manager's own failure.
@@ -489,14 +419,15 @@ fn killWhatIsLeft(io: Io, child: *std.process.Child, group: ?std.process.Child.I
 /// Runs the argv as a real child process. `env` is the environment mox itself
 /// reads through, so a manager invoked here sees the same HOME and PATH mox
 /// resolved its own paths from; null falls back to the process environment.
-/// `scratch_dir` backs a child's stdin with a file, which cannot deadlock the
-/// way a pipe written alongside a pipe read can. `out`/`err` are mox's own
-/// buffered writers, flushed before every spawn so what mox said about a
-/// call reaches the terminal before the call's own output does.
+/// A child's stdin is backed by a file, which cannot deadlock the way a pipe
+/// written alongside a pipe read can, staged in a `privateDir` under the OS
+/// temp directory `temp_dir`. `out`/`err` are mox's own buffered writers,
+/// flushed before every spawn so what mox said about a call reaches the
+/// terminal before the call's own output does.
 pub const Process = struct {
     io: Io,
     env: ?*const EnvironMap = null,
-    scratch_dir: []const u8 = "",
+    temp_dir: []const u8 = "",
     /// The bound on a captured call.
     timeout_ms: i64 = default_timeout_ms,
     /// The bound on a streamed call; `<= 0` is none.
@@ -631,21 +562,21 @@ pub const Process = struct {
     ) anyerror!Result {
         const io = self.io;
 
+        var stdin_dir: ?[]const u8 = null;
+        defer if (stdin_dir) |d| removePrivateDir(io, d);
         var stdin_file: ?Io.File = null;
         defer if (stdin_file) |f| f.close(io);
         var stdin_io: std.process.SpawnOptions.StdIo = .close;
         if (stdin == null and stdout_io != .pipe and self.terminalStdin()) stdin_io = .inherit;
         if (stdin) |bytes| {
-            const tmp_dir = try scratchTmpDir(arena, self.scratch_dir);
-            try Io.Dir.cwd().createDirPath(io, tmp_dir);
-            // Named per process: two mox runs sharing a state dir (a status
-            // beside an apply) must not truncate each other's stdin mid-read.
+            stdin_dir = try privateDir(arena, io, self.temp_dir);
             const name = try std.fmt.allocPrint(arena, "stdin-{d}.txt", .{processId()});
-            const path = try std.fs.path.join(arena, &.{ tmp_dir, name });
+            const path = try std.fs.path.join(arena, &.{ stdin_dir.?, name });
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
             stdin_file = try Io.Dir.cwd().openFile(io, path, .{});
             // Unlinked as soon as it is open: the child inherits the open
-            // descriptor, and a mox that dies mid-call leaves nothing behind.
+            // descriptor, and a mox that dies mid-call leaves no copy of the
+            // bytes behind.
             Io.Dir.cwd().deleteFile(io, path) catch {};
             stdin_io = .{ .file = stdin_file.? };
         }
@@ -1102,13 +1033,6 @@ pub const Fake = struct {
 };
 
 const testing = std.testing;
-
-test "scratchPidOf: a staged installer is named for its pid with or without an extension" {
-    try testing.expectEqual(@as(?u32, 7), scratchPidOf("brew-installer-7"));
-    try testing.expectEqual(@as(?u32, 42), scratchPidOf("scoop-installer-42.ps1"));
-    try testing.expectEqual(@as(?u32, 9), scratchPidOf("fakeports-installer-9.bindir"));
-    try testing.expectEqual(@as(?u32, null), scratchPidOf("scoop-installer-.ps1"));
-}
 
 test "Fake: answers a scripted argv and records the call" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1600,53 +1524,6 @@ test "killGroupOf: reaches a live child, and reports a pid nothing answers to as
     _ = try child.wait(io);
 }
 
-test "sweepScratch: a dead process's files go, this process's and a live one's stay" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
-    const tmp_dir = try scratchTmpDir(a, scratch);
-    try Io.Dir.cwd().createDirPath(io, tmp_dir);
-
-    const mine = try std.fmt.allocPrint(a, "stdin-{d}.txt", .{processId()});
-    const files = [_][]const u8{ "stdin-2147483000.txt", "winget-export-2147483000.json", mine, "stdin-1.txt", "notes.txt" };
-    for (files) |f| {
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ tmp_dir, f }), .data = "x" });
-    }
-
-    sweepScratch(io, a, scratch);
-
-    // pid 1 is always alive; the impossible pid never is; a file not named
-    // for a pid is not this sweep's to touch.
-    for (files, [_]bool{ false, false, true, true, true }) |f, remains| {
-        const path = try std.fs.path.join(a, &.{ tmp_dir, f });
-        const present = if (Io.Dir.cwd().access(io, path, .{})) |_| true else |_| false;
-        try testing.expectEqual(remains, present);
-    }
-}
-
-test "sweepScratch: a scratch directory that does not exist is nothing to sweep" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "never-made" });
-
-    sweepScratch(io, a, scratch);
-
-    // Nothing to sweep is not something to create: a best-effort sweep that
-    // made its own directory would leave one behind on every failed probe.
-    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, scratch, .{}));
-}
-
 test "runPowerShell: pwsh is tried first, and powershell answers when it is absent" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2048,53 +1925,6 @@ test "Process: a straggler that keeps writing does not cost the child its answer
     try testing.expect(elapsed_ms < 2_000);
 }
 
-test "sweepScratch: this process's own scratch file is never swept" {
-    // Where a platform cannot ask whether a pid is alive, age is the whole
-    // rule, and a run of an hour makes this call's own stdin file older than
-    // the threshold -- while the child is still reading it. The pid it is
-    // named for is what keeps the sweep off it, and is asked first.
-    const own = processId();
-    try testing.expect(!scratchStale(own, own, 10 * scratch_stale_age_ms, true));
-    try testing.expect(scratchStale(2_147_483_000, own, 10 * scratch_stale_age_ms, true));
-    // Where the pid can be asked after, a file of any age whose process is
-    // gone goes, and this process's own stays.
-    if (builtin.os.tag == .windows) return;
-    try testing.expect(!scratchStale(own, own, 10 * scratch_stale_age_ms, false));
-    try testing.expect(scratchStale(2_147_483_000, own, 0, false));
-}
-
-test "Process: a call's stdin file is named for this process alone" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const io = std.testing.io;
-    const cwd = try std.process.currentPathAlloc(io, a);
-    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    const tmp_dir = try scratchTmpDir(a, scratch);
-    try Io.Dir.cwd().createDirPath(io, tmp_dir);
-
-    // Two names in the one scratch directory: this process's, and the one a
-    // mox running beside it would use. The call takes the first and leaves
-    // the second untouched -- a second mox sharing a state directory must not
-    // have its stdin truncated out from under the child reading it.
-    const mine = try std.fs.path.join(a, &.{ tmp_dir, try std.fmt.allocPrint(a, "stdin-{d}.txt", .{processId()}) });
-    const other = try std.fs.path.join(a, &.{ tmp_dir, "stdin-0.txt" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = "stale\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = other, .data = "another mox's\n" });
-
-    var p: Process = .{ .io = io, .scratch_dir = scratch };
-    const res = try p.runner().runInput(a, &.{"cat"}, "hello from stdin\n");
-    try testing.expectEqualStrings("hello from stdin\n", res.stdout);
-
-    // Written, opened, and unlinked: the name this process's file had is the
-    // one the call used.
-    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, mine, .{}));
-    try testing.expectEqualStrings("another mox's\n", try Io.Dir.cwd().readFileAlloc(io, other, a, .limited(64)));
-}
-
 test "Process: stdin bytes reach the child and stdout is captured" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -2103,12 +1933,53 @@ test "Process: stdin bytes reach the child and stdout is captured" {
     defer arena.deinit();
     const a = arena.allocator();
     const cwd = try std.process.currentPathAlloc(std.testing.io, a);
-    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    const temp = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 
-    var p: Process = .{ .io = std.testing.io, .scratch_dir = scratch };
+    var p: Process = .{ .io = std.testing.io, .temp_dir = temp };
     const res = try p.runner().runInput(a, &.{"cat"}, "hello from stdin\n");
     try testing.expect(res.ok);
     try testing.expectEqualStrings("hello from stdin\n", res.stdout);
+}
+
+test "Process: a call's stdin is staged in a directory of its own, 0700, under the temp directory, and removed after the call" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const temp = try tmp.dir.realPathFileAlloc(io, ".", a);
+
+    var p: Process = .{ .io = io, .temp_dir = temp };
+    const res = try p.runner().runInput(a, &.{ "/bin/sh", "-c", "cat; ls -ld \"$0\"/mox-*", temp }, "in\n");
+    try testing.expect(res.ok);
+    try testing.expectStringStartsWith(res.stdout, "in\ndrwx------");
+    var d = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    try testing.expect((try it.next(io)) == null);
+}
+
+test "privateDir: each call makes a new directory, 0700, under the temp directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const temp = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const one = try privateDir(a, io, temp);
+    const two = try privateDir(a, io, temp);
+    try testing.expect(!std.mem.eql(u8, one, two));
+    for ([_][]const u8{ one, two }) |d| {
+        try testing.expectEqualStrings(temp, std.fs.path.dirname(d).?);
+        const st = try Io.Dir.cwd().statFile(io, d, .{});
+        try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+        removePrivateDir(io, d);
+        try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, d, .{}));
+    }
 }
 
 /// The locale a child reports, written where the test can read it: a

@@ -1408,25 +1408,28 @@ so a lock it cannot take stops it with nothing removed. `mox.lock`,
 `readers.lock` and `readers.gate`, the lock files, are kept and listed as
 kept, whatever the flags. Only the entries mox makes in the state directory
 are removed (its stores, `bin/`, `coupling/`, `commit-recovery/`,
-`mox-path`, `triggers.txt`, the package managers' `tmp/` and `zypper.txt`, a
-check hook's leftover `check-*`, and `private/` with `--purge-private`); any
-other entry is listed as kept, "not made by mox", and never followed or
-removed. `bin/`, `tmp/` and `trash/` are names a home directory holds too,
-so each is mox's only while it is a directory holding nothing but what mox
-puts there: in `bin/` the link to (on Windows, the copy of) the running
-`mox`, in `tmp/` the package managers' per-process scratch files, and in
-`trash/` the directories named by run id. `v2/` is mox's only while it holds
-nothing but the entries mox makes in it. One holding anything else, beyond
-the files a file browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`),
-is kept whole and listed with the first entry mox did not make. A directory
-that is not a mox state directory (see the top of this page) is refused,
-exit 2, before anything is created, followed or removed in it; an absent or
-empty one has no state to remove. The marker, `.mox-state`, is removed last,
-once the directory holds nothing but the lock files and the files a file
-browser leaves; while any other entry is kept, mox's (the history, trash,
-the private layer) or not, the marker is kept and listed, so an uninstall
-that stopped partway, or kept what it did not make, leaves a directory the
-next run still takes for mox's. The user's source repo is never touched.
+`mox-path`, `triggers.txt`, `zypper.txt`, a check hook's leftover `check-*`,
+and `private/` with `--purge-private`); any other entry is listed as kept,
+"not made by mox", and never followed or removed. `bin/` and `trash/` are
+names a home directory holds too, so each is mox's only while it is a
+directory holding nothing but what mox puts there: in `bin/` the link to (on
+Windows, the copy of) the running `mox`, and in `trash/` the directories
+named by run id. The package managers' scratch files (a child's stdin,
+winget's export, a bootstrap's installer) are not in the state directory:
+each call stages them in a directory of its own, 0700, under the system's
+temp directory (`TMPDIR`, else `/tmp`; on Windows `TEMP`, else `TMP`), and
+removes it when the call is done. `v2/` is mox's only while it holds nothing
+but the entries mox makes in it. One holding anything else, beyond the files
+a file browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`), is kept
+whole and listed with the first entry mox did not make. A directory that is
+not a mox state directory (see the top of this page) is refused, exit 2,
+before anything is created, followed or removed in it; an absent or empty
+one has no state to remove. The marker, `.mox-state`, is removed last, once
+the directory holds nothing but the lock files and the files a file browser
+leaves; while any other entry is kept, mox's (the history, trash, the
+private layer) or not, the marker is kept and listed, so an uninstall that
+stopped partway, or kept what it did not make, leaves a directory the next
+run still takes for mox's. The user's source repo is never touched.
 
 <!-- generated: flags uninstall -->
 | Flag | Description |

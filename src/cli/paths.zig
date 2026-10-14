@@ -144,6 +144,18 @@ pub fn realStateDir(arena: std.mem.Allocator, io: std.Io, p: Paths, why: *?[]con
     return withStateDir(arena, p, real);
 }
 
+/// The OS temp directory: `TMPDIR` then `/tmp` on POSIX; `TEMP` then `TMP`
+/// then `C:\Windows\Temp` on Windows.
+pub fn tempDir(arena: std.mem.Allocator, env: Env) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (env.get(arena, "TEMP")) |v| return v;
+        if (env.get(arena, "TMP")) |v| return v;
+        return arena.dupe(u8, "C:\\Windows\\Temp");
+    }
+    if (env.get(arena, "TMPDIR")) |v| return v;
+    return arena.dupe(u8, "/tmp");
+}
+
 /// An absolute `path` without its `.` segments and repeated separators, or
 /// `path` itself when it has none or is not absolute.
 fn withoutDots(arena: std.mem.Allocator, path: []const u8, os_tag: std.Target.Os.Tag) ![]const u8 {

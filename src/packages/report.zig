@@ -411,7 +411,7 @@ test "fromManifest: a manager no row names failing a verb is a note, not this re
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --full-name --installed-on-request", .code = 3 },
         .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --cask --full-name", .code = 3 },
     } };
-    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io, .scratch_dir = "" };
+    var b: brew_mod.Brew = .{ .runner = fake.runner(), .io = testing.io };
     var bindings = std.StringHashMap([]const u8).init(a);
     const r: resolver_mod.Resolver = .{ .live = &.{ .bindings = &bindings } };
 

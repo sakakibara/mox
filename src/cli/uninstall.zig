@@ -1,14 +1,15 @@
 //! `mox uninstall`: remove mox's machine-local state. Records, provenance and
-//! flags are forgotten; the displaced history in `v2/` -- the pre-mox original
-//! content of every file mox replaced -- is kept, so `mox rollback` still
-//! works, unless `--purge-snapshots` or a confirmation at a terminal deletes
-//! `v2/`. The private layer is PRESERVED unless `--purge-private`; trash is
-//! preserved unless `--purge-trash` or confirmed. The user's source repo is
-//! NEVER touched, and nothing outside the state directory is deleted. A
-//! directory that is not a mox state directory is refused. Inside one, only
-//! entries mox makes are removed, and `bin/`, `tmp/`, `trash/` and the history
-//! only while all they hold is what mox puts there; every other entry is
-//! listed as kept. The marker goes last, once nothing else of mox's is left.
+//! flags are forgotten; the displaced history in `v2/` -- the pre-mox
+//! original content of every file mox replaced -- is kept, so `mox rollback`
+//! still works, unless `--purge-snapshots` or a confirmation at a terminal
+//! deletes `v2/`. The private layer is PRESERVED unless `--purge-private`;
+//! trash is preserved unless `--purge-trash` or confirmed. The user's source
+//! repo is NEVER touched, and nothing outside the state directory is deleted.
+//! A directory that is not a mox state directory is refused. Inside one, only
+//! entries mox makes are removed, and `bin/`, `trash/` and the history only
+//! while all they hold is what mox puts there; every other entry is listed as
+//! kept. The marker goes last, once nothing but the lock files and OS files
+//! is left.
 //! Under the lock.
 
 const std = @import("std");
@@ -49,8 +50,8 @@ pub fn actionFor(name: []const u8, purge_private: bool) Action {
 
 /// The entries of a state directory, beside the state module's own, that
 /// mox makes: the scripts' bin directory and PATH note, the coupling graph,
-/// commit's recovery copies, the trigger state, the package managers'
-/// scratch directory and zypper's ledger, and a check hook's staging.
+/// commit's recovery copies, the trigger state, zypper's ledger, and a
+/// check hook's staging.
 fn madeByMox(name: []const u8) bool {
     const fixed = [_][]const u8{
         mox.apply.run_scripts.bin_dir_name,
@@ -58,33 +59,26 @@ fn madeByMox(name: []const u8) bool {
         "commit-recovery",
         "mox-path",
         mox.trigger.state.state_basename,
-        mox.packages.exec.tmp_subdir,
         "zypper.txt",
     };
     for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
     return isCheckStaging(name);
 }
 
-/// Why the entry `e` of the state directory is not mox's although its name is,
-/// or null when it is mox's. `bin/`, `tmp/` and `trash/` are names a home
-/// directory holds too, so each is mox's only while it is a directory holding
-/// nothing but what mox puts there: the running mox, the package managers'
-/// per-process scratch files, and trash generations named by run id. The
-/// history is judged by the state module the same way.
+/// Why the entry `e` of the state directory is not mox's although its name
+/// is, or null when it is mox's. `bin/` and `trash/` are names a home
+/// directory holds too, so each is mox's only while it is a directory
+/// holding nothing but what mox puts there: the running mox, and trash
+/// generations named by run id. The history is judged by the state module
+/// the same way.
 fn notMoxs(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent.Entry) !?[]const u8 {
     const own: *const fn (dirent.Entry) bool = if (std.mem.eql(u8, e.name, mox.apply.run_scripts.bin_dir_name))
         mox.apply.run_scripts.isBinEntry
-    else if (std.mem.eql(u8, e.name, mox.packages.exec.tmp_subdir))
-        isScratch
     else if (std.mem.eql(u8, e.name, "trash"))
         isTrashGeneration
     else
         return mox.state.notOwn(arena, io, state_dir, e.name);
     return mox.state.marker.whyNotOwn(arena, io, try std.fs.path.join(arena, &.{ state_dir, e.name }), own);
-}
-
-fn isScratch(h: dirent.Entry) bool {
-    return h.kind == .file and mox.packages.exec.isScratchName(h.name);
 }
 
 fn isTrashGeneration(h: dirent.Entry) bool {
@@ -309,7 +303,7 @@ pub const command = app.command(Spec, .{
     .name = "uninstall",
     .usage = "mox uninstall [--flags]",
     .summary = "Remove mox state",
-    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. A directory that is not a mox state directory is refused. Only entries mox makes in it are removed, and bin/, tmp/, trash/ and the history only while they hold nothing but what mox puts there; any other is listed as kept. The .mox-state marker goes last, once nothing else of mox's is left. The source repo is never touched.",
+    .details = "Records and flags are forgotten; the snapshot history is kept unless --purge-snapshots or confirmed, and trash unless --purge-trash or confirmed; the private layer is kept unless --purge-private. A directory that is not a mox state directory is refused. Only entries mox makes in it are removed, and bin/, trash/ and the history only while they hold nothing but what mox puts there; any other is listed as kept. The .mox-state marker goes last, once nothing but the lock files and OS files is left. The source repo is never touched.",
     .group = .general,
     .needs_context = true,
 }, run);

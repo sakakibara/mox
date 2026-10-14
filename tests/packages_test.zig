@@ -21,7 +21,11 @@ fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: testutil.
     // These fixtures are about packages, not files, so the tree exists and is
     // empty rather than absent -- an absent `src/` is its own error path.
     pinned.create_repo_src = true;
-    return testutil.setup(a, io, tmp, pinned);
+    const h = try testutil.setup(a, io, tmp, pinned);
+    // A run's scratch files go to `<root>/staging` rather than a new
+    // directory under the OS temp directory, so a fixture can name them.
+    mox.packages.exec.private_dir_override = try std.fs.path.join(a, &.{ h.root, "staging" });
+    return h;
 }
 
 fn writeManifest(io: Io, h: Harness, a: std.mem.Allocator, name: []const u8, body: []const u8) !void {
@@ -125,6 +129,35 @@ const no_brew_prefix = [_][]const u8{"/nonexistent/mox-test-prefix/bin"};
 
 fn useFake(fake: *mox.packages.exec.Fake) void {
     mox.cli.app.package_runner_override = fake.runner();
+}
+
+test "status: reading the packages creates nothing in the state directory, absent or empty, and refuses one that is not mox's" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+    const fake = try brewWith(a, "ripgrep\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const absent = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(std.mem.indexOf(u8, absent.err, "packages:") == null);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, h.state, .{}));
+    try Io.Dir.cwd().createDirPath(io, h.state);
+    _ = try h.run(&.{ "mox", "status" });
+    var d = try Io.Dir.cwd().openDir(io, h.state, .{ .iterate = true });
+    defer d.close(io);
+    var it = d.iterate();
+    try std.testing.expect((try it.next(io)) == null);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ h.state, "notes.txt" }), .data = "mine\n" });
+    const refused = try h.run(&.{ "mox", "status" });
+    try std.testing.expectEqual(@as(u8, 2), refused.rc);
+    try std.testing.expect(std.mem.indexOf(u8, refused.err, "is not a mox state directory") != null);
 }
 
 test "status: an untracked package and a missing one are both reported" {
@@ -1351,7 +1384,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     mox.cli.app.brew_prefixes_override = &.{prefix_bin};
     defer mox.cli.app.brew_prefixes_override = null;
     const staged = try std.fs.path.join(a, &.{
-        h.state,                                                                           "tmp",
+        h.root,                                                                            "staging",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     const interpreter = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash {s}", .{staged});
@@ -1386,6 +1419,7 @@ test "bootstrap: a manager that is absent is installed from the declared install
     // install has ended.
     try std.testing.expect(fake.called(interpreter));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try std.fs.path.join(a, &.{ h.state, "tmp" }), .{}));
     try std.testing.expectEqual(@as(u8, 0), r.rc);
 }
 
@@ -1412,7 +1446,7 @@ test "bootstrap: scoop's installer is staged under the .ps1 name PowerShell's -F
     // `-File` refuses a script whose name does not end in `.ps1`, before a
     // line of it runs, so the staged name is what decides whether it runs.
     const staged = try std.fs.path.join(a, &.{
-        h.state,                                                                                "tmp",
+        h.root,                                                                                 "staging",
         try std.fmt.allocPrint(a, "scoop-installer-{d}.ps1", .{mox.packages.exec.processId()}),
     });
     const run_installer = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s}", .{staged});
@@ -1464,7 +1498,7 @@ test "bootstrap: an installer that exits nonzero is reported by its exit code" {
     , .{hex}));
 
     const staged = try std.fs.path.join(a, &.{
-        h.state,                                                                           "tmp",
+        h.root,                                                                            "staging",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     const interpreter = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash {s}", .{staged});
@@ -1819,7 +1853,7 @@ test "bootstrap: a bad digest refuses and the installer never runs" {
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: the installer that came back is not the one the manifest's sha256 names") != null);
     // The substituted file is not left where a later run could find it.
     const staged = try std.fs.path.join(a, &.{
-        h.state,                                                                           "tmp",
+        h.root,                                                                            "staging",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
@@ -2447,7 +2481,7 @@ test "apply --dry-run: an absent manager is planned as a bootstrap, with nothing
     }
     // Nothing was staged where a real bootstrap would put the installer.
     const staged = try std.fs.path.join(a, &.{
-        h.state,                                                                           "tmp",
+        h.root,                                                                            "staging",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, staged, .{}));
@@ -4663,7 +4697,7 @@ fn brewBootstrap(a: std.mem.Allocator, io: Io, h: Harness, installer_code: u8, s
     mox.cli.app.brew_prefixes_override = prefixes;
 
     const staged = try std.fs.path.join(a, &.{
-        h.state,                                                                           "tmp",
+        h.root,                                                                            "staging",
         try std.fmt.allocPrint(a, "brew-installer-{d}", .{mox.packages.exec.processId()}),
     });
     const interpreter = try std.fmt.allocPrint(a, "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash {s}", .{staged});
@@ -4934,6 +4968,7 @@ test "bootstrap: after init --clone --apply installed the Command Line Tools, br
     }
 
     const h = try testutil.setup(a, io, &tmp, .{ .os = "darwin", .extra_env = &.{.{ .name = "PATH", .value = bin }} });
+    mox.packages.exec.private_dir_override = try std.fs.path.join(a, &.{ h.root, "staging" });
     var seeded = h;
     seeded.repo = seed;
     try tmp.dir.createDirPath(io, "seed/src");

@@ -80,7 +80,6 @@ pub const Brew = struct {
     runner: exec.Runner,
     /// Staging a verified installer, and reading an install receipt.
     io: ?std.Io = null,
-    scratch_dir: []const u8 = "",
     /// How brew is invoked. `brew` until a bootstrap installs it, then the
     /// absolute path it landed at: a child's PATH is never used to resolve
     /// argv[0] (only the parent's is), so a freshly installed brew that is on
@@ -1724,7 +1723,7 @@ test "bootstrap: after installing, brew is invoked by the path it landed at" {
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash /tmp/i" },
     } };
-    var b: Brew = .{ .runner = fake.runner(), .io = io, .scratch_dir = "/tmp" };
+    var b: Brew = .{ .runner = fake.runner(), .io = io };
     const before = b.exe;
     if (b.backend().bootstrap(a, "/tmp/i")) |dir| {
         try testing.expect(dir != null);
@@ -1744,7 +1743,7 @@ test "bootstrap: an installer killed at its bound is a timeout, not a failed boo
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash /tmp/i", .timed_out = true },
     } };
-    var b: Brew = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var b: Brew = .{ .runner = fake.runner(), .io = std.testing.io };
 
     try testing.expectError(error.TimedOut, b.backend().bootstrap(a, "/tmp/i"));
     try testing.expectEqualStrings("brew", b.exe);
@@ -2626,7 +2625,7 @@ test "every brew child but the bare version probe runs with ask mode off" {
         .{ .argv = "/bin/bash /tmp/i", .match = .suffix, .code = 1 },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
-    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer, .io = std.testing.io, .scratch_dir = "/tmp" };
+    var b: Brew = .{ .runner = fake.runner(), .err = &w.writer, .io = std.testing.io };
 
     _ = try b.backend().available(a);
     try b.backend().install(a, &.{

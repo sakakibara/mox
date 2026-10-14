@@ -1009,15 +1009,17 @@ fn bootstrapBackends(
         }
 
         try ctx.out.print("  bootstrapping   {s}\n", .{b.backend});
-        // Per process, like every other staged file: a second mox in the
-        // same state dir must not be able to replace a verified installer
-        // between the digest check and the shell that runs it.
+        // In a directory of this run's own, 0700: no other process can
+        // replace a verified installer between the digest check and the
+        // shell that runs it.
+        const staging = try mox.packages.exec.privateDir(ctx.alloc, ctx.io, pkg_backends.tempDir());
+        defer mox.packages.exec.removePrivateDir(ctx.io, staging);
         const installer_name = try std.fmt.allocPrint(ctx.alloc, "{s}-installer-{d}{s}", .{ b.backend, mox.packages.exec.processId(), backend.installer_extension });
         const path = mox.packages.bootstrap.fetchVerified(
             ctx.alloc,
             ctx.io,
             pkg_backends.runner(),
-            try mox.packages.exec.scratchTmpDir(ctx.alloc, context.paths.state_dir),
+            staging,
             installer_name,
             .{ .url = b.url, .sha256 = b.sha256 },
         ) catch |e| {
@@ -1027,8 +1029,6 @@ fn bootstrapBackends(
             try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
-        // However the install ends, nothing is left in state that a later
-        // run could mistake for a fresh fetch.
         defer std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         // Staged like an install's: a run the user interrupts from here on
         // ends inside sudo or the installer, and nothing deferred would say

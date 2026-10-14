@@ -614,10 +614,9 @@ pub const export_limitation = "winget export reports only what a source supplied
 pub const Winget = struct {
     runner: exec.Runner,
     io: Io,
-    /// Where an export is staged. mox's own state directory, so a machine
-    /// with an unwritable TEMP still works and nothing is left in a shared
-    /// location.
-    scratch_dir: []const u8,
+    /// The OS temp directory, under which an export is staged in a
+    /// directory of its own (`exec.privateDir`).
+    temp_dir: []const u8,
     /// How many of the last `install`'s rows were converged without an
     /// install, which `installMarked` answers with.
     marked: usize = 0,
@@ -719,17 +718,11 @@ pub const Winget = struct {
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
         const self: *Winget = @ptrCast(@alignCast(ctx));
 
-        // Named per process: a status running beside an apply must not read
-        // the other's half-written export as this machine's state.
-        const name = try std.fmt.allocPrint(arena, "winget-export-{d}.json", .{exec.processId()});
-        const tmp_dir = try exec.scratchTmpDir(arena, self.scratch_dir);
-        const path = try std.fs.path.join(arena, &.{ tmp_dir, name });
-        try Io.Dir.cwd().createDirPath(self.io, tmp_dir);
-        // A stale export from an interrupted run would otherwise be read as
-        // this machine's current state.
-        Io.Dir.cwd().deleteFile(self.io, path) catch {};
-        // And whatever this run leaves, on every path out: a failed export
-        // may still have written part of one.
+        const tmp_dir = try exec.privateDir(arena, self.io, self.temp_dir);
+        defer exec.removePrivateDir(self.io, tmp_dir);
+        const path = try std.fs.path.join(arena, &.{ tmp_dir, try std.fmt.allocPrint(arena, "winget-export-{d}.json", .{exec.processId()}) });
+        // Whatever this run leaves, on every path out: a failed export may
+        // still have written part of one.
         defer Io.Dir.cwd().deleteFile(self.io, path) catch {};
 
         const res = try self.runner.run(arena, &.{
@@ -1441,7 +1434,7 @@ test "winget: an export yields every PackageIdentifier" {
     try testing.expectEqualStrings("Git.Git", got[1]);
 }
 
-test "winget: the export is staged under a per-process name and removed after" {
+test "winget: the export is staged in a directory of its own, removed with it after" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1449,15 +1442,17 @@ test "winget: the export is staged under a per-process name and removed after" {
     defer arena.deinit();
     const a = arena.allocator();
     const cwd = try std.process.currentPathAlloc(io, a);
-    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+    const staging = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "staging" });
+    exec.private_dir_override = staging;
+    defer exec.private_dir_override = null;
     const name = try std.fmt.allocPrint(a, "winget-export-{d}.json", .{exec.processId()});
-    const path = try std.fs.path.join(a, &.{ scratch, exec.tmp_subdir, name });
+    const path = try std.fs.path.join(a, &.{ staging, name });
     const argv = try std.fmt.allocPrint(a, "winget export -o {s} --accept-source-agreements", .{path});
 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = argv, .stdout = winget_export, .write_after = "-o", .io = io },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = io, .scratch_dir = scratch };
+    var w: Winget = .{ .runner = fake.runner(), .io = io, .temp_dir = "/unused" };
 
     const got = try w.backend().installedExplicit(a);
     try testing.expectEqual(@as(usize, 2), got.len);
@@ -1487,7 +1482,7 @@ test "winget: install carries source, scope and override, and both agreements" {
         .{ .argv = "winget install --id Microsoft.PowerShell --exact --source winget --scope machine " ++
             "--override /SILENT --no-upgrade --accept-package-agreements --accept-source-agreements --disable-interactivity" },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     // No `--silent` beside an `--override`: winget replaces the installer's
     // whole argument string with the override and returns before it picks a
@@ -1520,7 +1515,7 @@ test "winget: a bare row installs unattended, with no prompt anything can answer
         .{ .argv = winget_absent, .code = 0x14 },
         .{ .argv = argv },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     try w.backend().install(a, &.{wingetRow("Git.Git", &.{})});
     try testing.expect(fake.called(argv));
@@ -1540,7 +1535,7 @@ test "winget: a package it already has is marked, and never handed to install" {
         .{ .argv = winget_absent, .stdout = "Name  Id       Version\nGit   Git.Git  2.46\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
-    var wg: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp", .err = &w.writer };
+    var wg: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp", .err = &w.writer };
 
     try wg.backend().install(a, &.{wingetRow("Git.Git", &.{})});
     try testing.expectEqual(@as(usize, 1), wg.backend().installMarked());
@@ -1569,7 +1564,7 @@ test "winget: an install winget refused over a package it has is marked, not cou
         .{ .argv = winget_absent, .stdout = "Name  Id       Version\nGit   Git.Git  2.46\n" },
     } };
     var w: std.Io.Writer.Allocating = .init(a);
-    var wg: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp", .err = &w.writer };
+    var wg: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp", .err = &w.writer };
 
     try wg.backend().install(a, &.{wingetRow("Git.Git", &.{})});
     try testing.expectEqual(@as(usize, 1), wg.backend().installMarked());
@@ -1584,7 +1579,7 @@ test "winget: an install winget refused over a package it has is marked, not cou
         .{ .argv = winget_absent, .code = 0x14 },
         .{ .argv = argv, .code = 0x2B },
     } };
-    var w2: Winget = .{ .runner = other.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w2: Winget = .{ .runner = other.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
     try testing.expectError(Error.WingetInstallFailed, w2.backend().install(a, &.{wingetRow("Git.Git", &.{})}));
     try testing.expectEqual(@as(usize, 0), w2.backend().installMarked());
 }
@@ -1612,7 +1607,7 @@ test "winget: whether a package is installed is the exit code, never the table" 
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = "winget list --id Microsoft.VCRedist.2015+.x64 --exact --accept-source-agreements", .stdout = truncated },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     // No install entry in the Fake: a row read as absent here would be handed
     // to `winget install` and fail the test.
@@ -1628,16 +1623,18 @@ test "winget: a failed export leaves no scratch file behind" {
     defer arena.deinit();
     const a = arena.allocator();
     const cwd = try std.process.currentPathAlloc(io, a);
-    const scratch = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "state" });
+    const staging = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "staging" });
+    exec.private_dir_override = staging;
+    defer exec.private_dir_override = null;
     const name = try std.fmt.allocPrint(a, "winget-export-{d}.json", .{exec.processId()});
-    const path = try std.fs.path.join(a, &.{ scratch, exec.tmp_subdir, name });
+    const path = try std.fs.path.join(a, &.{ staging, name });
     const argv = try std.fmt.allocPrint(a, "winget export -o {s} --accept-source-agreements", .{path});
 
     // The export writes a partial file and then fails.
     var fake: exec.Fake = .{ .arena = a, .entries = &.{
         .{ .argv = argv, .stdout = "{\"Sources\":[", .write_after = "-o", .io = io, .code = 1 },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = io, .scratch_dir = scratch };
+    var w: Winget = .{ .runner = fake.runner(), .io = io, .temp_dir = "/unused" };
 
     try testing.expectError(Error.WingetQueryFailed, w.backend().installedExplicit(a));
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
@@ -1645,7 +1642,7 @@ test "winget: a failed export leaves no scratch file behind" {
 
 test "winget: validate refuses an unknown key and a scope outside the set" {
     var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
     const be = w.backend();
 
     var d1: Diag = .{};
@@ -1664,7 +1661,7 @@ test "winget: validate refuses an unknown key and a scope outside the set" {
 
 test "winget: a valid row passes every field" {
     var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     try w.backend().validate(wingetRow("Microsoft.PowerShell", &.{
         .{ .key = "source", .value = .{ .string = "msstore" } },
@@ -1882,7 +1879,7 @@ test "scoop: an empty SCOOP is not a root, and the profile answers instead" {
 
 test "winget: the export's blind spots are declared, in both directions" {
     var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
     const be = w.backend();
 
     // Narrower than "what did the user ask for": a package no source supplied
@@ -1918,7 +1915,7 @@ test "available: scoop present then broken, winget absent then broken" {
         .{ .argv = "winget --version", .fail = error.FileNotFound, .once = true },
         .{ .argv = "winget --version", .code = 255 },
     } };
-    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
     try testing.expect((try w.backend().available(a)) == .absent);
     const wb = try w.backend().available(a);
     try testing.expectEqual(@as(u8, 255), wb.broken.code);
@@ -1937,7 +1934,7 @@ test "declare: an observed id round-trips on both managers" {
     try testing.expectEqualStrings("7zip", try s.backend().idOf(a, scoopRow(sd.name, sd.fields)));
 
     var wf: exec.Fake = .{ .arena = a, .entries = &.{} };
-    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
     const wd = try w.backend().declare(a, "Git.Git");
     try testing.expectEqualStrings("Git.Git", wd.name);
     try testing.expectEqualStrings("Git.Git", try w.backend().idOf(a, wingetRow(wd.name, wd.fields)));
@@ -2043,7 +2040,7 @@ test "install: whether scoop's install ran is what says the rows may have landed
 
 test "validate: a winget row names an identifier, and its fields are shaped for an argv" {
     var wf: exec.Fake = .{ .arena = testing.allocator, .entries = &.{} };
-    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = wf.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
     const be = w.backend();
 
     for ([_][]const u8{ "--help", "-i", "msstore/Git.Git", "C:\\x\\evil.msi", "https://evil/x.msi", "Git.*" }) |name| {
@@ -2105,7 +2102,7 @@ test "winget: an install matches the identifier exactly, never as a substring" {
         .{ .argv = "winget install --id Microsoft.PowerShell --exact --no-upgrade " ++
             "--accept-package-agreements --accept-source-agreements --disable-interactivity --silent" },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     try w.backend().install(a, &.{wingetRow("Microsoft.PowerShell", &.{})});
     for (fake.calls.items) |c| {
@@ -2124,7 +2121,7 @@ test "winget: a row naming a source installs from that source, exactly" {
         .{ .argv = winget_absent, .code = 0x14 },
         .{ .argv = argv },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     try w.backend().install(a, &.{wingetRow("Git.Git", &.{.{ .key = "source", .value = .{ .string = "winget" } }})});
     try testing.expect(fake.called(argv));
@@ -2146,7 +2143,7 @@ test "winget: an override carrying a quoted installer argument is accepted" {
                 "--no-upgrade --accept-package-agreements --accept-source-agreements --disable-interactivity",
         },
     } };
-    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .scratch_dir = "/tmp" };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
 
     const row = wingetRow("Some.App", &.{.{ .key = "override", .value = .{ .string = "/DIR=\"C:\\Program Files\\App\"" } }});
     try w.backend().validate(row, null);

@@ -2128,7 +2128,7 @@ test "uninstall: an entry of the state directory mox did not make is kept and li
     try std.testing.expect(!exists(io, try statePath(h, &.{"coupling"})));
 }
 
-test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept and listed, and mox's own are removed" {
+test "uninstall: a bin/ or trash/ holding what mox did not make, and any tmp/, is kept and listed, and mox's own are removed" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2151,17 +2151,17 @@ test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept an
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try statePath(foreign, &.{ "tmp", "notes" })));
     try std.testing.expectEqualStrings("jpg\n", try read(io, a, try statePath(foreign, &.{ "trash", "old-photos", "a.jpg" })));
     try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds user-script, which mox did not make)", .{try statePath(foreign, &.{"bin"})})));
-    try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds notes, which mox did not make)", .{try statePath(foreign, &.{"tmp"})})));
+    try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (not made by mox)", .{try statePath(foreign, &.{"tmp"})})));
     try std.testing.expect(contains(r.out, try std.fmt.allocPrint(a, "kept {s} (holds old-photos, which mox did not make)", .{try statePath(foreign, &.{"trash"})})));
 
-    // Without the marker, a bin/ and tmp/ of the user's are not mox's.
+    // Without the marker, a bin/ of the user's is not mox's.
     for ([_][]const u8{ ".mox-state", "mox.lock", "readers.lock", "readers.gate" }) |n| Io.Dir.cwd().deleteFile(io, try statePath(foreign, &.{n})) catch {};
     const refused = try foreign.run(&.{ "mox", "uninstall" });
     try std.testing.expectEqual(@as(u8, 2), refused.rc);
     try std.testing.expect(contains(refused.err, "is not a mox state directory"));
 
-    // A real state: the scripts' bin/ apply made, the package managers'
-    // scratch files and a trash generation are mox's, and go.
+    // A real state: the scripts' bin/ apply made and a trash generation
+    // are mox's, and go; mox stages nothing in a tmp/, so one is kept.
     h = try withState(h, try std.fs.path.join(a, &.{ h.root, "state" }));
     try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
     try writeRepo(io, &tmp, "repo/scripts/pre/00-noop.sh", "#!/bin/sh\nexit 0\n");
@@ -2173,7 +2173,9 @@ test "uninstall: a bin/, tmp/ or trash/ holding what mox did not make is kept an
     try writeRepo(io, &tmp, "state/trash/20260101T000000Z-2/src/.old", "old\n");
     const ok = try h.run(&.{ "mox", "uninstall", "--purge-trash" });
     try std.testing.expectEqual(@as(u8, 0), ok.rc);
-    for ([_][]const u8{ "bin", "tmp", "trash" }) |n| try std.testing.expect(!exists(io, try statePath(h, &.{n})));
+    for ([_][]const u8{ "bin", "trash" }) |n| try std.testing.expect(!exists(io, try statePath(h, &.{n})));
+    try std.testing.expectEqualStrings("in\n", try read(io, a, try statePath(h, &.{ "tmp", "stdin-99999.txt" })));
+    try std.testing.expect(contains(ok.out, try std.fmt.allocPrint(a, "kept {s} (not made by mox)", .{try statePath(h, &.{"tmp"})})));
 }
 
 /// The top-level entry names of `dir`, sorted; none when it is absent.

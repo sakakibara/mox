@@ -74,12 +74,18 @@ All notable changes to mox are documented here. The format follows
 - `mox uninstall` removes only the entries mox makes in the state
   directory, and lists every other entry as kept, "not made by mox",
   without following it; it used to remove every entry it did not know.
-  `bin/`, `tmp/`, `trash/` and `v2/` are removed only while they hold
-  nothing but what mox puts there; one holding anything else is kept whole
-  and listed with the first entry mox did not make. The marker goes last,
-  once nothing but the lock files and the files a file browser leaves is
-  left; while uninstall keeps any other entry, mox's or not, it keeps the
-  marker.
+  `bin/`, `trash/` and `v2/` are removed only while they hold nothing but
+  what mox puts there; one holding anything else is kept whole and listed
+  with the first entry mox did not make. The marker goes last, once nothing
+  but the lock files and the files a file browser leaves is left; while
+  uninstall keeps any other entry, mox's or not, it keeps the marker.
+- The package managers' scratch files -- a child's stdin, winget's export, a
+  bootstrap's installer -- are staged in a directory of the call's own,
+  0700, under the system's temp directory, removed when the call is done,
+  rather than in `<state dir>/tmp/`. A command that only reads, `mox status`
+  among them, no longer creates or marks the state directory when it reads
+  the packages. uninstall lists a `tmp/` an earlier mox left in the state
+  directory as kept, for you to delete.
 - The setup scripts' `<state dir>/bin` is refreshed by replacing only the
   running `mox` there. When it holds anything else, mox removes nothing,
   keeps the directory off `PATH` for that run and warns; it used to remove

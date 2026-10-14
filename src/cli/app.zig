@@ -143,6 +143,12 @@ pub const PackageBackends = struct {
     /// anything, so what will execute is visible rather than inferred.
     notes: []const []const u8 = &.{},
 
+    /// The OS temp directory a call of this registry stages its scratch
+    /// files under.
+    pub fn tempDir(self: *const PackageBackends) []const u8 {
+        return self.proc.temp_dir;
+    }
+
     /// The bound every streamed call of this registry runs under, so a
     /// diagnostic about one killed at it can say what killed it.
     pub fn installTimeoutMs(self: *const PackageBackends) i64 {
@@ -159,10 +165,10 @@ pub const PackageBackends = struct {
         return (if (builtin.is_test) package_runner_override else null) orelse self.proc.runner();
     }
 
-    /// `scratch_dir` stages a manager's own export file and a plugin's stdin;
-    /// mox's state directory keeps both inside a directory mox already owns,
-    /// marked here as mox's before anything is staged in it.
-    /// `env` is what every backend and plugin runs under; apply hands its
+    /// `state_dir` holds zypper's ledger; it is checked as mox's here and
+    /// only read, so a command that only reads creates and marks nothing.
+    /// A manager's export file and a child's stdin are staged under the OS
+    /// temp directory instead (`exec.privateDir`). `env` is what every backend and plugin runs under; apply hands its
     /// script environment so a bootstrap's PATH addition reaches the probes
     /// that follow in the same run. Plugins are discovered only when
     /// `discover_plugins`: a repo that carries no manifest is not using the
@@ -176,7 +182,7 @@ pub const PackageBackends = struct {
         self: *PackageBackends,
         arena: std.mem.Allocator,
         io: std.Io,
-        scratch_dir: []const u8,
+        state_dir: []const u8,
         state_origin: mox.state.marker.Origin,
         home: []const u8,
         env: ?*const std.process.Environ.Map,
@@ -186,26 +192,25 @@ pub const PackageBackends = struct {
         err: *std.Io.Writer,
         diag: ?*mox.packages.manifest.Diag,
     ) !mox.packages.backend.Registry {
-        switch (try mox.state.marker.acceptForWrite(arena, io, scratch_dir, state_origin)) {
+        switch (try mox.state.marker.accept(arena, io, state_dir, state_origin)) {
             .refused => |why| {
                 try err.writeAll(why);
                 return error.NotStateDirectory;
             },
             .accepted => {},
         }
+        const temp_dir = try paths_mod.tempDir(arena, (if (builtin.is_test) environ_override else null) orelse Env.current());
         self.proc = .{
             .io = io,
             .env = env,
-            .scratch_dir = scratch_dir,
+            .temp_dir = temp_dir,
             .timeout_ms = mox.packages.exec.timeoutFromEnv(env, err),
             .install_timeout_ms = mox.packages.exec.installTimeoutMs(env, err),
             .out = out,
             .err = err,
         };
-        // What a mox that died mid-call left staged for a call of its own.
-        mox.packages.exec.sweepScratch(io, arena, scratch_dir);
         const r = self.runner();
-        self.brew = .{ .runner = r, .io = io, .scratch_dir = scratch_dir, .err = err, .probe_budget_ms = if (self.proc.timeout_ms <= 0) -1 else self.proc.timeout_ms };
+        self.brew = .{ .runner = r, .io = io, .err = err, .probe_budget_ms = if (self.proc.timeout_ms <= 0) -1 else self.proc.timeout_ms };
         if (builtin.is_test) if (brew_prefixes_override) |p| {
             self.brew.prefixes = p;
         };
@@ -213,10 +218,10 @@ pub const PackageBackends = struct {
         self.dnf = .{ .manager = .dnf, .runner = r, .err = err };
         self.pacman = .{ .manager = .pacman, .runner = r, .err = err };
         self.scoop = .{ .runner = r, .home = home, .env = env, .err = err, .io = io };
-        self.winget = .{ .runner = r, .io = io, .scratch_dir = scratch_dir, .err = err };
+        self.winget = .{ .runner = r, .io = io, .temp_dir = temp_dir, .err = err };
         self.zypper = .{
             .runner = r,
-            .ledger = .{ .io = io, .dir = scratch_dir, .backend = "zypper" },
+            .ledger = .{ .io = io, .dir = state_dir, .backend = "zypper" },
             .err = err,
         };
 

@@ -348,25 +348,13 @@ pub fn downloadUrl(alloc: std.mem.Allocator, base: []const u8, tag: []const u8, 
     return std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ base, tag, asset });
 }
 
-/// The process temp directory: `TMPDIR` then `/tmp` on POSIX; `TEMP` then
-/// `TMP` then `C:\Windows\Temp` on Windows.
-fn tempBase(alloc: std.mem.Allocator, env: Env) ![]const u8 {
-    if (builtin.os.tag == .windows) {
-        if (env.get(alloc, "TEMP")) |v| return v;
-        if (env.get(alloc, "TMP")) |v| return v;
-        return alloc.dupe(u8, "C:\\Windows\\Temp");
-    }
-    if (env.get(alloc, "TMPDIR")) |v| return v;
-    return alloc.dupe(u8, "/tmp");
-}
-
 const temp_name_random_bytes = 12;
 const temp_name_len = std.base64.url_safe.Encoder.calcSize(temp_name_random_bytes);
 
 /// Creates a fresh `mox-upgrade-<random>` directory under the platform temp
 /// location to stage the downloaded archive in. Caller deletes it when done.
 fn makeTempDir(alloc: std.mem.Allocator, io: Io, env: Env) ![]const u8 {
-    const base = try tempBase(alloc, env);
+    const base = try @import("paths.zig").tempDir(alloc, env);
 
     var random_bytes: [temp_name_random_bytes]u8 = undefined;
     io.random(&random_bytes);
