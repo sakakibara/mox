@@ -7,6 +7,7 @@ const Io = std.Io;
 const exe_options = @import("exe_options");
 const testutil = @import("testutil.zig");
 const Harness = testutil.Harness;
+const tilde = testutil.tilde;
 const containsAnywhere = testutil.containsAnywhere;
 
 fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, editor: ?[]const u8) !Harness {
@@ -2938,7 +2939,7 @@ test "mv: a partial target moves no state, and the next apply leaves the old liv
     const apply = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), apply.rc);
     try std.testing.expect(std.mem.indexOf(u8, apply.out, "adopted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, apply.out, "left ~/app.toml in place (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply.out, try tilde(a, "left ~/app.toml in place (no longer managed)")) != null);
     try std.testing.expect(exists(io, old_live));
     try std.testing.expect(!try testutil.hasRecord(h, old_live, .owned));
     try std.testing.expect(try testutil.hasRecord(h, new_live, .owned));
@@ -5347,18 +5348,18 @@ test "stale: a deleted source is STALE and diffed as removed, apply removes it s
 
     const s = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), s.rc);
-    try std.testing.expect(lineWith(s.out, "STALE", "~/.gone"));
-    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.edited"));
+    try std.testing.expect(lineWith(s.out, "STALE", try tilde(a, "~/.gone")));
+    try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.edited")));
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-bye\n") != null);
 
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.gone (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.gone (no longer managed)")) != null);
     try std.testing.expect(exists(io, try h.liveOf(".gone")));
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "removed ~/.gone (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "removed ~/.gone (no longer managed)")) != null);
     try std.testing.expect(!exists(io, try h.liveOf(".gone")));
     try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
     try std.testing.expectEqualStrings("stays\n", try read(io, a, try h.liveOf(".kept")));
@@ -5366,13 +5367,13 @@ test "stale: a deleted source is STALE and diffed as removed, apply removes it s
     try std.testing.expect((try testutil.snapshotEntry(h, snaps[snaps.len - 1], ".gone")) != null);
 
     // The guidance names the edited path, and only naming it removes it.
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "mox apply --overwrite ~/.edited") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "mox commit ~/.edited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "mox apply --overwrite ~/.edited")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "mox commit ~/.edited")) != null);
     try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
     try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
     const named = try h.run(&.{ "mox", "apply", "--overwrite", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 0), named.rc);
-    try std.testing.expect(std.mem.indexOf(u8, named.out, "removed ~/.edited (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, named.out, try tilde(a, "removed ~/.edited (no longer managed)")) != null);
     try std.testing.expect(!exists(io, try h.liveOf(".edited")));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
@@ -5404,7 +5405,7 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
     // Named beside a managed file with nothing to commit, it still exits 1.
     const mixed = try h.run(&.{ "mox", "commit", "~/.edited", "~/.other" });
     try std.testing.expectEqual(@as(u8, 1), mixed.rc);
-    try std.testing.expect(std.mem.indexOf(u8, report.out, "would release ~/.edited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.out, try tilde(a, "would release ~/.edited")) != null);
     try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     // A run that aborts on a prompt releases nothing.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".other"), .data = "o, edited\n" });
@@ -5414,7 +5415,7 @@ test "stale: commit of an edited stale path keeps the edit and releases it here"
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".other"), .data = "o\n" });
     const c = try h.run(&.{ "mox", "commit", "--yes", "~/.edited" });
     try std.testing.expectEqual(@as(u8, 0), c.rc);
-    try std.testing.expect(std.mem.indexOf(u8, c.out, "released ~/.edited on this machine") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, try tilde(a, "released ~/.edited on this machine")) != null);
     try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".edited"), .file)));
     try std.testing.expectEqualStrings("mine, edited\n", try read(io, a, try h.liveOf(".edited")));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
@@ -5578,16 +5579,16 @@ test "stale: an owned file is left in place and forgotten, and a symlink is remo
     try Io.Dir.cwd().deleteFile(io, try h.srcOf("link"));
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "");
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "STALE", "~/app.toml"));
-    try std.testing.expect(lineWith(s.out, "STALE", "~/link"));
+    try std.testing.expect(lineWith(s.out, "STALE", try tilde(a, "~/app.toml")));
+    try std.testing.expect(lineWith(s.out, "STALE", try tilde(a, "~/link")));
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-symlink -> /nonexistent/target") != null);
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "left ~/app.toml in place (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "left ~/app.toml in place (no longer managed)")) != null);
     try std.testing.expect(exists(io, try h.liveOf("app.toml")));
     try std.testing.expect(!try testutil.hasRecord(h, try h.liveOf("app.toml"), .owned));
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "removed ~/link (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "removed ~/link (no longer managed)")) != null);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try h.liveOf("link"), .{ .follow_symlinks = false }));
     // Reported once: nothing is left to say.
     const again = try h.run(&.{ "mox", "apply" });
@@ -5616,7 +5617,7 @@ test "stale: an unchanged apply gives an owned record another repo wrote this ru
     // does.
     try Io.Dir.cwd().deleteFile(io, try h.srcOf("app.toml"));
     const gone = try h.run(&.{ "mox", "apply" });
-    try std.testing.expect(std.mem.indexOf(u8, gone.out, "left ~/app.toml in place (no longer managed)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gone.out, try tilde(a, "left ~/app.toml in place (no longer managed)")) != null);
 }
 
 test "stale: a live path holding a newline is refused" {
@@ -5709,7 +5710,7 @@ test "remove: a tombstone keeps every machine's live file; --purge leaves none, 
     // The third machine keeps the released file and forgets it; its unedited
     // copy of the purged one goes.
     const s = try third.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "STALE", "~/.purged"));
+    try std.testing.expect(lineWith(s.out, "STALE", try tilde(a, "~/.purged")));
     try std.testing.expect(std.mem.indexOf(u8, s.out, ".kept") == null);
     try std.testing.expectEqual(@as(u8, 0), (try third.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("k\n", try read(io, a, try third.homePath(".kept")));
@@ -5845,7 +5846,7 @@ test "private: an attributes entry for a repo path holds with no private file th
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     const st = try Io.Dir.cwd().statFile(io, try h.liveOf(".ssh/config"), .{});
     try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
-    try std.testing.expect(lineWith(r.err, "ERROR   ~/.other", "only mode may be set for a path the repo manages"));
+    try std.testing.expect(lineWith(r.err, try tilde(a, "ERROR   ~/.other"), "only mode may be set for a path the repo manages"));
 }
 
 test "mv and remove: a file the private layer still varies is refused before anything moves" {
@@ -5886,18 +5887,18 @@ test "stale: a broken attributes entry with no source is an ERROR, and nothing i
     try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".mine\"]\nbogus = 1\n");
 
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "ERROR", "~/.kept (.mox/attributes.toml"));
-    try std.testing.expect(lineWith(s.out, "ERROR", "~/.mine (private .mox/attributes.toml"));
-    try std.testing.expect(!lineWith(s.out, "STALE", "~/.kept"));
+    try std.testing.expect(lineWith(s.out, "ERROR", try tilde(a, "~/.kept (.mox/attributes.toml")));
+    try std.testing.expect(lineWith(s.out, "ERROR", try tilde(a, "~/.mine (private .mox/attributes.toml")));
+    try std.testing.expect(!lineWith(s.out, "STALE", try tilde(a, "~/.kept")));
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineWith(r.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
+    try std.testing.expect(lineWith(r.err, try tilde(a, "ERROR   ~/.kept"), ".mox/attributes.toml"));
     try std.testing.expectEqualStrings("k\n", try read(io, a, try h.liveOf(".kept")));
     try std.testing.expect((try testutil.hasRecord(h, try h.liveOf(".kept"), .file)));
     const e = try h.run(&.{ "mox", "export", try std.fs.path.join(a, &.{ h.root, "out" }) });
     try std.testing.expect(e.rc != 0);
-    try std.testing.expect(lineWith(e.err, "ERROR   ~/.kept", ".mox/attributes.toml"));
-    try std.testing.expect(lineWith(e.err, "ERROR   ~/.mine", "private .mox/attributes.toml"));
+    try std.testing.expect(lineWith(e.err, try tilde(a, "ERROR   ~/.kept"), ".mox/attributes.toml"));
+    try std.testing.expect(lineWith(e.err, try tilde(a, "ERROR   ~/.mine"), "private .mox/attributes.toml"));
 }
 
 test "stale: a failed write at a moved path keeps the old path's file" {
@@ -5939,14 +5940,14 @@ test "stale: a directory the tree now plants as a symlink into the repo loses no
     try std.testing.expect(lineWith(s.out, "STALE", "a parent directory is a symlink"));
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(lineWith(r.out, "~/.config/nvim/init.lua", "left in place: a parent directory is a symlink"));
+    try std.testing.expect(lineWith(r.out, try tilde(a, "~/.config/nvim/init.lua"), "left in place: a parent directory is a symlink"));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
     try std.testing.expect(!(try testutil.hasRecord(h, try h.liveOf(".config/nvim/init.lua"), .file)));
 
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(lineWith(rb.err, "~/.config/nvim/init.lua", "not restored: a parent directory is a symlink; the snapshot copy is at"));
-    try std.testing.expect(lineWith(rb.err, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory", " keeps it under key .config/nvim)"));
+    try std.testing.expect(lineWith(rb.err, try tilde(a, "~/.config/nvim/init.lua"), "not restored: a parent directory is a symlink; the snapshot copy is at"));
+    try std.testing.expect(lineWith(rb.err, try tilde(a, "~/.config/nvim (not restored: a symlink sits where the snapshot has a directory"), " keeps it under key .config/nvim)"));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ h.repo, "nvim", "init.lua" })));
 }
 
@@ -5973,7 +5974,7 @@ test "stale: a hand-made symlinked parent pointing outside HOME keeps the file i
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(lineWith(r.out, "~/.config/nvim/init.lua", "left in place: a parent directory is a symlink"));
+    try std.testing.expect(lineWith(r.out, try tilde(a, "~/.config/nvim/init.lua"), "left in place: a parent directory is a symlink"));
     try std.testing.expectEqualStrings("x\n", try read(io, a, try std.fs.path.join(a, &.{ code, "init.lua" })));
 }
 
@@ -6030,7 +6031,7 @@ test "symlinked parent: a file that composes to nothing, an exact dir and a purg
     try writeRepo(io, &tmp, "repo/data/ids.toml", "ids = []\n");
 
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
-    try std.testing.expect(lineWith(r.out, "~/.config/t/ids.inc", "left in place: a parent directory is a symlink"));
+    try std.testing.expect(lineWith(r.out, try tilde(a, "~/.config/t/ids.inc"), "left in place: a parent directory is a symlink"));
     try std.testing.expect(lineWith(r.out, ".config/x/", "left in place: a parent directory is a symlink"));
     try std.testing.expectEqualStrings("name = one\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "t", "ids.inc" })));
     try std.testing.expectEqualStrings("f\n", try read(io, a, try std.fs.path.join(a, &.{ ext, "x", "foreign" })));
@@ -6055,11 +6056,11 @@ test "diff: a broken attributes entry is a refusal, exit 1, with or without a so
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".a\"]\nbogus = 1\n");
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 1), d.rc);
-    try std.testing.expect(lineWith(d.err, "ERROR", "~/.a"));
+    try std.testing.expect(lineWith(d.err, "ERROR", try tilde(a, "~/.a")));
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".nosource\"]\nbogus = 1\n");
     const d2 = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 1), d2.rc);
-    try std.testing.expect(lineWith(d2.err, "ERROR", "~/.nosource"));
+    try std.testing.expect(lineWith(d2.err, "ERROR", try tilde(a, "~/.nosource")));
 }
 
 test "attributes: a directive key on a non-JSON target is named, and a TOML error has its line" {
@@ -6074,7 +6075,7 @@ test "attributes: a directive key on a non-JSON target is named, and a TOML erro
     try writeRepo(io, &tmp, "repo/src/app.toml", "a = 1\n");
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\ndisown = [\"a\"]\n");
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "~/app.toml", "disown is a directive key, which only a strict-JSON target takes"));
+    try std.testing.expect(lineWith(s.out, try tilde(a, "~/app.toml"), "disown is a directive key, which only a strict-JSON target takes"));
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\"app.toml\"]\nmode = \"0600\"\nmode =\n");
     const r = try h.run(&.{ "mox", "status" });
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox status: .mox/attributes.toml:3:") != null);
@@ -6113,7 +6114,7 @@ test "apply: leaves of a generator that left the tree, or no longer produced, co
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"a\"\n");
     const pruned = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, pruned.out, ", 1 removed,") != null);
-    if (builtin.os.tag != .windows) try std.testing.expect(std.mem.indexOf(u8, pruned.out, "removed ~/.config/id-b.inc (generated, no longer produced)") != null);
+    if (builtin.os.tag != .windows) try std.testing.expect(std.mem.indexOf(u8, pruned.out, try tilde(a, "removed ~/.config/id-b.inc (generated, no longer produced)")) != null);
     try Io.Dir.cwd().deleteFile(io, try h.srcOf(".config/g.inc"));
     const orphan = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, orphan.out, ", 1 removed,") != null);
@@ -6195,10 +6196,10 @@ test "remove: a tombstone that matches nothing is a warning until apply has seen
     try writeRepo(io, &tmp, "repo/src/.kept", "k\n");
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".nothing\"]\nreleased = true\n");
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "WARN", "released ~/.nothing matches nothing mox manages"));
+    try std.testing.expect(lineWith(s.out, "WARN", try tilde(a, "released ~/.nothing matches nothing mox manages")));
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(lineWith(r.out, "WARN", "released ~/.nothing matches nothing mox manages"));
+    try std.testing.expect(lineWith(r.out, "WARN", try tilde(a, "released ~/.nothing matches nothing mox manages")));
     const again = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(std.mem.indexOf(u8, again.out, "matches nothing") == null);
     const s2 = try h.run(&.{ "mox", "status" });
@@ -6228,7 +6229,7 @@ test "rollback: a live path that is now a symlink keeps the link and names the s
     try Io.Dir.cwd().symLink(io, "/etc/hosts", try h.liveOf(".rc"), .{});
     const r = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(lineWith(r.err, "~/.rc", "not restored: it is a symlink mox did not plant; the snapshot copy is at"));
+    try std.testing.expect(lineWith(r.err, try tilde(a, "~/.rc"), "not restored: it is a symlink mox did not plant; the snapshot copy is at"));
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings("/etc/hosts", buf[0..try Io.Dir.cwd().readLink(io, try h.liveOf(".rc"), &buf)]);
 }
@@ -6250,8 +6251,8 @@ test "status and diff preview the files of a generator that left the tree" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/id-b.inc"), .data = "edited\n" });
     const s = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), s.rc);
-    try std.testing.expect(lineWith(s.out, "STALE", "~/.config/id-a.inc (its generator left the tree)"));
-    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/id-b.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "STALE", try tilde(a, "~/.config/id-a.inc (its generator left the tree)")));
+    try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/id-b.inc (its generator left the tree)")));
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=a") != null);
     try std.testing.expect(std.mem.indexOf(u8, d.out, "edited") == null);
@@ -6341,20 +6342,20 @@ test "orphans: status, diff and apply --dry-run judge an orphaned generator's fi
     try writeRepo(io, &tmp, "repo/.moxignore", ".config/id-d.inc\n.config/kept.inc\n");
 
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "STALE", "~/.config/id-a.inc (its generator left the tree)"));
-    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/id-b.inc (its generator left the tree)"));
-    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/id-c.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "STALE", try tilde(a, "~/.config/id-a.inc (its generator left the tree)")));
+    try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/id-b.inc (its generator left the tree)")));
+    try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/id-c.inc (its generator left the tree)")));
     try std.testing.expect(std.mem.indexOf(u8, s.out, "id-d.inc") == null);
     try std.testing.expect(std.mem.indexOf(u8, s.out, "kp-") == null);
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=a") != null);
     try std.testing.expect(std.mem.indexOf(u8, d.out, "kp-") == null);
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-a.inc (generated, no longer produced)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-b.inc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-c.inc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/id-d.inc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/kp-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/id-a.inc (generated, no longer produced)")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/id-b.inc")) == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/id-c.inc")) == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/id-d.inc")) == null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/kp-")) == null);
     _ = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(!exists(io, try h.liveOf(".config/id-a.inc")));
     try std.testing.expectEqualStrings("k=d\n", try read(io, a, try h.liveOf(".config/id-d.inc")));
@@ -6564,8 +6565,8 @@ test "orphans: an edited file of a gone generator is removed by a named --overwr
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(try std.fmt.allocPrint(a, ".config/{s}.inc", .{n})), .data = "edited\n" });
     }
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/r-a.inc (its generator left the tree)"));
-    try std.testing.expect(lineWith(s.out, "DRIFT", "~/.config/p-a.inc (its generator left the tree)"));
+    try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/r-a.inc (its generator left the tree)")));
+    try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/p-a.inc (its generator left the tree)")));
 
     for ([_][]const u8{ "r-a", "p-a" }) |n| {
         const name = try std.fmt.allocPrint(a, "~/.config/{s}.inc", .{n});
@@ -6623,7 +6624,7 @@ test "apply: a planted link behind a symlinked directory is never removed, and t
     const moved = try std.fs.path.join(a, &.{ elsewhere, "c.toml" });
 
     const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, st.out, "ERROR    ~/.config/c.toml (left in place: a parent directory is a symlink)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, try tilde(a, "ERROR    ~/.config/c.toml (left in place: a parent directory is a symlink)")) != null);
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(dry.rc, r.rc);
@@ -6662,7 +6663,7 @@ test "rollback: a planted link it puts back is drift, replaced only by --overwri
     try std.testing.expect(std.mem.indexOf(u8, sl.out, "(what rolling back") != null);
 
     const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(st.out, "DRIFT", "~/.config/c.toml"));
+    try std.testing.expect(lineWith(st.out, "DRIFT", try tilde(a, "~/.config/c.toml")));
     const plain = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 1), plain.rc);
     try std.testing.expectEqualStrings(s.inrepo, try linkTarget(io, a, live));
@@ -6700,7 +6701,7 @@ test "rollback: a user's link it puts back reads as drift, never re-pointed or s
     try std.testing.expectEqualStrings(real, try linkTarget(io, a, live));
 
     const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(st.out, "DRIFT", "~/.foo"));
+    try std.testing.expect(lineWith(st.out, "DRIFT", try tilde(a, "~/.foo")));
     try std.testing.expectEqual(@as(u8, 1), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings(real, try linkTarget(io, a, live));
 
@@ -6730,7 +6731,7 @@ test "stale: a record whose path is now a directory mox never wrote is forgotten
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "~/.cfg: now a directory; its record is forgotten") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, "~/.cfg: now a directory; its record is forgotten")) != null);
     const again = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), again.rc);
     try std.testing.expect(std.mem.indexOf(u8, again.out, "now a directory") == null);
@@ -6890,14 +6891,14 @@ test "status, diff and apply --dry-run preview a planted link's replacement as t
     const h = s.h;
 
     const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(std.mem.indexOf(u8, st.out, "OUTDATED ~/.config/c.toml  (own 1) (replace the symlink mox planted with a file)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, try tilde(a, "OUTDATED ~/.config/c.toml  (own 1) (replace the symlink mox planted with a file)")) != null);
     try std.testing.expect(std.mem.indexOf(u8, st.out, "DRIFT") == null);
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-symlink -> ") != null);
     try std.testing.expect(std.mem.indexOf(u8, d.out, "+a = 1") != null);
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expectEqual(@as(u8, 0), dry.rc);
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would replace the symlink mox planted at ~/.config/c.toml with a file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would replace the symlink mox planted at ~/.config/c.toml with a file")) != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, "1 would be written") != null);
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
@@ -6923,7 +6924,7 @@ test "apply: a link that cannot be removed fails that one file and the run goes 
 
     const r = try h.run(&.{ "mox", "apply" });
     try std.testing.expect(r.rc != 0);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "~/.config/c.toml: could not remove") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try tilde(a, "~/.config/c.toml: could not remove")) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "1 written") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "1 failed") != null);
     try std.testing.expectEqualStrings("zz\n", try read(io, a, try h.liveOf("zz.txt")));
@@ -6969,7 +6970,7 @@ test "add --own and --disown: a live file that does not parse is refused with it
     for ([_][]const u8{ "--own", "--disown" }) |flag| {
         const r = try h.run(&.{ "mox", "add", flag, "a", live });
         try std.testing.expectEqual(@as(u8, 1), r.rc);
-        try std.testing.expect(std.mem.indexOf(u8, r.err, "live ~/x.toml:1:5: does not parse as toml") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, try tilde(a, "live ~/x.toml:1:5: does not parse as toml")) != null);
         try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
     }
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try h.srcOf("x.toml"), .{}));
@@ -7018,7 +7019,7 @@ test "rollback: an entry that cannot be restored is that entry's error, and the 
 
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(lineWith(rb.err, "ERROR", "~/.bar (not restored:"));
+    try std.testing.expect(lineWith(rb.err, "ERROR", try tilde(a, "~/.bar (not restored:")));
     try std.testing.expectEqualStrings("old foo\n", try read(io, a, try h.liveOf(".foo")));
     try std.testing.expectEqualStrings("precious\n", try read(io, a, try h.liveOf(".bar/inner")));
     try std.testing.expect(std.mem.indexOf(u8, rb.out, "is kept in snapshot ") != null);
@@ -7096,10 +7097,10 @@ test "generated: a file of a generator where mox planted a link replaces the lin
     const leaf = try h.liveOf(".config/Id-a.inc");
 
     const st = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(lineWith(st.out, "OUTDATED", "~/.config/Id-a.inc (replace the symlink mox planted with a file)"));
+    try std.testing.expect(lineWith(st.out, "OUTDATED", try tilde(a, "~/.config/Id-a.inc (replace the symlink mox planted with a file)")));
     try std.testing.expect(std.mem.indexOf(u8, st.out, "STALE") == null);
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would replace the symlink mox planted at ~/.config/Id-a.inc with a file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would replace the symlink mox planted at ~/.config/Id-a.inc with a file")) != null);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try std.testing.expect((try Io.Dir.cwd().statFile(io, leaf, .{ .follow_symlinks = false })).kind == .file);
     try std.testing.expectEqualStrings("k=a\n", try read(io, a, real));
@@ -7170,7 +7171,7 @@ test "rollback: an entry that holds a redacted secret is refused, never written"
     const before = try read(io, a, live);
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(lineWith(rb.err, "~/.netrc", "holds a secret mox does not store; run mox apply to resolve it again"));
+    try std.testing.expect(lineWith(rb.err, try tilde(a, "~/.netrc"), "holds a secret mox does not store; run mox apply to resolve it again"));
     try std.testing.expectEqualStrings(before, try read(io, a, live));
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "redacted") == null);
 }

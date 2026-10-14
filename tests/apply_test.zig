@@ -337,6 +337,7 @@ fn read(io: Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
 }
 
 const testutil = @import("testutil.zig");
+const tilde = testutil.tilde;
 const Cli = testutil.Harness;
 
 fn cliSetup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !Cli {
@@ -6868,9 +6869,9 @@ test "strict json: a note comment, an inline comment and a trailing comma are ER
 
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "src/b.json:1:1: comments not allowed in strict json; remove the comment, or set format = \"jsonc\""));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:9: trailing comma not allowed in strict json; remove the trailing comma"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/b.json"), "src/b.json:1:1: comments not allowed in strict json; remove the comment, or set format = \"jsonc\""));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.json"), "src/c.json:2:10:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/d.json"), "src/d.json:1:9: trailing comma not allowed in strict json; remove the trailing comma"));
     // Nothing of an invalid file reaches the live tree; the rest applies.
     try std.testing.expect(!exists(io, try c.homePath("b.json")));
     try std.testing.expect(!exists(io, try c.homePath("c.json")));
@@ -6882,12 +6883,12 @@ test "strict json: a note comment, an inline comment and a trailing comma are ER
     try std.testing.expect(lineHasBoth(s.out, "ERROR", "src/d.json:1:9: trailing comma"));
 
     const d = try c.run(&.{ "mox", "diff" });
-    try std.testing.expect(lineHasBoth(d.err, "ERROR   ~/c.json", "src/c.json:2:10:"));
+    try std.testing.expect(lineHasBoth(d.err, try tilde(a, "ERROR   ~/c.json"), "src/c.json:2:10:"));
 
     const out = try std.fs.path.join(a, &.{ c.root, "export" });
     const e = try c.run(&.{ "mox", "export", out });
     try std.testing.expectEqual(@as(u8, 2), e.rc);
-    try std.testing.expect(lineHasBoth(e.err, "ERROR   ~/b.json", "src/b.json:1:1:"));
+    try std.testing.expect(lineHasBoth(e.err, try tilde(a, "ERROR   ~/b.json"), "src/b.json:1:1:"));
 }
 
 test "strict json: a leading directive is refused naming the attributes key that replaces it" {
@@ -6903,7 +6904,7 @@ test "strict json: a leading directive is refused naming the attributes key that
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/conf.d/app.json", "src/.config/conf.d/app.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml as below and remove the comments)"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.config/conf.d/app.json"), "src/.config/conf.d/app.json:1:1: mox directive \"disown\" in strict JSON, which has no comments; declare it in .mox/attributes.toml as below and remove the comments)"));
     try std.testing.expect(!exists(io, try c.homePath(".config/conf.d/app.json")));
 
     // The entry printed under the ERROR row is pasted as is.
@@ -6911,7 +6912,7 @@ test "strict json: a leading directive is refused naming the attributes key that
     var lines = std.mem.splitScalar(u8, r.err, '\n');
     var after = false;
     while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "ERROR   ~/.config/conf.d/app.json") != null) {
+        if (std.mem.indexOf(u8, line, try tilde(a, "ERROR   ~/.config/conf.d/app.json")) != null) {
             after = true;
             continue;
         }
@@ -7039,7 +7040,7 @@ test "strict json: a commented live file of a partial target is refused with the
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = program });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json (live ~/s.json:2:3: does not parse as json; remove the comment, or set format = \"jsonc\"", "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/s.json (live ~/s.json:2:3: does not parse as json; remove the comment, or set format = \"jsonc\""), "; the live file does not parse, and mox cannot patch what it cannot preserve)"));
     try std.testing.expectEqualStrings(program, try read(io, a, live));
 }
 
@@ -7059,10 +7060,10 @@ test "validation: a layer that does not parse names its line, matching this mach
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "src/app.toml.d/os=zzz.toml:2:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "src/c.yaml:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.ini", "src/c.ini:1:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.gitconfig", "src/.gitconfig:1:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "src/app.toml.d/os=zzz.toml:2:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.yaml"), "src/c.yaml:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.ini"), "src/c.ini:1:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.gitconfig"), "src/.gitconfig:1:"));
 }
 
 test "validation: a stripped head keeps the line a base error names the line the source has it on" {
@@ -7077,7 +7078,7 @@ test "validation: a stripped head keeps the line a base error names the line the
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "src/app.toml:4:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "src/app.toml:4:"));
 }
 
 test "validation: capture-bearing and region-bearing TOML layers are checked on their output, which names its layers" {
@@ -7102,7 +7103,7 @@ test "validation: capture-bearing and region-bearing TOML layers are checked on 
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath("ok.toml")), "port = 8080") != null);
     try std.testing.expectEqualStrings("k = 2\n", try read(io, a, try c.homePath("regions.toml")));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/bad.toml", "composed output line 2 from src/bad.toml and src/bad.toml.d/os=" ++ host_os ++ ".toml: "));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/bad.toml"), "composed output line 2 from src/bad.toml and src/bad.toml.d/os=" ++ host_os ++ ".toml: "));
 }
 
 const host_os = switch (builtin.os.tag) {
@@ -7137,7 +7138,7 @@ test "validation: a line carrying a resolved secret is never quoted in a parse e
     const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t value" }} });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "composed output line 2 from src/app.toml: "));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "composed output line 2 from src/app.toml: "));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "s3cr3t") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "s3cr3t") == null);
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
@@ -7159,8 +7160,8 @@ test "validation: a duplicate JSON key in a merge layer, or made by a key captur
     const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/m.json", "src/m.json.d/os=" ++ host_os ++ ".json:1:10: duplicate key \"b\""));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/k.json", "composed output line 1 from src/k.json: duplicate key \"" ++ host_os ++ "\""));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/m.json"), "src/m.json.d/os=" ++ host_os ++ ".json:1:10: duplicate key \"b\""));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/k.json"), "composed output line 1 from src/k.json: duplicate key \"" ++ host_os ++ "\""));
     try std.testing.expectEqualStrings("{\"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("single.json")));
 }
 
@@ -7242,9 +7243,9 @@ test "attributes: a bad entry is that file's error and every other file applies"
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/a.toml", "write it as a head directive in the file"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/b.json", "format = \"jsonc\" is the only format value"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.json", "check requires own or disown"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/a.toml"), "write it as a head directive in the file"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/b.json"), "format = \"jsonc\" is the only format value"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.json"), "check requires own or disown"));
     try std.testing.expectEqualStrings("fine\n", try read(io, a, try c.homePath("ok.conf")));
     const s = try c.run(&.{ "mox", "status" });
     try std.testing.expect(lineHasBoth(s.out, "ERROR", "a.toml"));
@@ -7354,7 +7355,7 @@ test "bases: a strict-JSON target needs no base, a {} base composes, and an empt
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expectEqualStrings("{\n  \"a\": 1,\n  \"b\": 2\n}\n", try read(io, a, try c.homePath("nobase.json")));
     try std.testing.expectEqualStrings("{\n  \"c\": 3\n}\n", try read(io, a, try c.homePath("braces.json")));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/empty.json", "src/empty.json:1:1: unexpected end of input; an empty file is not JSON: write {}"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/empty.json"), "src/empty.json:1:1: unexpected end of input; an empty file is not JSON: write {}"));
     try std.testing.expect(!exists(io, try c.homePath("empty.json")));
 }
 
@@ -7434,9 +7435,9 @@ test "captures in JSON: a bare capture is refused with the hint for its kind" {
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "src/d.json:1:10:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "; quote it: a quoted single data capture emits its typed value)"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/m.json", "; quote it)"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/d.json"), "src/d.json:1:10:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/d.json"), "; quote it: a quoted single data capture emits its typed value)"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/m.json"), "; quote it)"));
 }
 
 test "private: attributes hold for a private-only path, and only mode for a repo path, beating the automatic 0600" {
@@ -7480,7 +7481,7 @@ test "private: attributes hold for a private-only path, and only mode for a repo
     // A private mode on a repo path wins, over the automatic 0600 too.
     try std.testing.expectEqual(@as(u32, 0o640), try modeOf(io, try c.homePath("shared.json")));
     // Any other private key on a repo path is that file's error.
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/other.json", "only mode may be set for a path the repo manages"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/other.json"), "only mode may be set for a path the repo manages"));
     // The private attributes file is no source.
     try std.testing.expect(!exists(io, try c.homePath(".mox/attributes.toml")));
 }
@@ -7501,10 +7502,10 @@ test "private: a base at a repo path is refused naming both, and an overlay into
     const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.myrc", "a private base at a path the repo manages"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.myrc", "src/.myrc"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json", "private overlay"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.json", "os=" ++ host_os ++ ".json defines content under disowned path model"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.myrc"), "a private base at a path the repo manages"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.myrc"), "src/.myrc"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/s.json"), "private overlay"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/s.json"), "os=" ++ host_os ++ ".json defines content under disowned path model"));
     try std.testing.expect(!exists(io, try c.homePath(".myrc")));
 }
 
@@ -7570,7 +7571,7 @@ test "captures in JSON: a key capture stays a string, and a duplicate it makes i
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/s.jsonc", "duplicate key \"same\""));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/s.jsonc"), "duplicate key \"same\""));
 }
 
 test "validation: a secret-bearing error keeps its reason, and a duplicate key from a secret capture is never printed" {
@@ -7590,13 +7591,13 @@ test "validation: a secret-bearing error keeps its reason, and a duplicate key f
     try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
     var it = std.mem.splitScalar(u8, r.err, '\n');
     var toml_line: []const u8 = "";
-    while (it.next()) |l| if (std.mem.indexOf(u8, l, "~/app.toml") != null) {
+    while (it.next()) |l| if (std.mem.indexOf(u8, l, try tilde(a, "~/app.toml")) != null) {
         toml_line = l;
     };
     try std.testing.expect(std.mem.indexOf(u8, toml_line, "composed output line 2 from src/app.toml: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, toml_line, ": <redacted>)") == null);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/d.json", "duplicate key <redacted>"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/e.json", "duplicate key \"a\\n\\\"b\""));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/d.json"), "duplicate key <redacted>"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/e.json"), "duplicate key \"a\\n\\\"b\""));
 }
 
 test "validation: a bare capture in a merged TOML or YAML layer names its layer, line and column" {
@@ -7615,9 +7616,9 @@ test "validation: a bare capture in a merged TOML or YAML layer names its layer,
     const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "src/app.toml.d/os=" ++ host_os ++ ".toml:2:"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/app.toml", "a capture in a merged layer must sit inside a string"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "src/c.yaml:3:1: unterminated flow sequence"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "src/app.toml.d/os=" ++ host_os ++ ".toml:2:"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "a capture in a merged layer must sit inside a string"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.yaml"), "src/c.yaml:3:1: unterminated flow sequence"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "TomlParseError") == null);
 }
 
@@ -7644,9 +7645,9 @@ test "validation: no byte of a resolved secret reaches any command's output when
     const secrets = [_][]const u8{ "s3cr3tval", "qu'o", "te\\bsq", "zzml" };
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/t1.toml", "composed output line 3 from src/t1.toml: does not parse as toml"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/t2.toml", "duplicate key <redacted>"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/t5.json", "duplicate key <redacted>"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/t1.toml"), "composed output line 3 from src/t1.toml: does not parse as toml"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/t2.toml"), "duplicate key <redacted>"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/t5.json"), "duplicate key <redacted>"));
     for ([_][]const []const u8{ &.{"apply"}, &.{"diff"}, &.{"status"}, &.{ "commit", "--dry-run" } }) |args| {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(a, "mox");
@@ -7676,7 +7677,7 @@ test "json capture: a TOML inf is a compose error naming its key, and a float fo
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, "~/bad.json", "NotRepresentableInJson"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "~/bad.json"), "NotRepresentableInJson"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "data.n.huge is inf, not representable in JSON") != null);
     try std.testing.expectEqualStrings("{\"b\": 1e+300, \"h\": 0.5}\n", try read(io, a, try c.homePath("ok.json")));
 }
@@ -8283,7 +8284,7 @@ test "apply: a symlink of every key format honours a false when gate" {
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     for ([_][]const u8{ "a.json", "b.json", "c.toml", "d.yaml" }) |k| {
-        try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "skipped ~/{s} (axis-gated off)", .{k})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, try tilde(a, try std.fmt.allocPrint(a, "skipped ~/{s} (axis-gated off)", .{k}))) != null);
         try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath(k), .{ .follow_symlinks = false }));
     }
 }
@@ -8312,10 +8313,10 @@ test "generator: a JSON-family file escapes and types its captures, and one that
     if (builtin.os.tag != .windows) {
         try std.testing.expectEqualStrings("{\"s\": \"p\\\"w\"}\n", try read(io, a, try c.homePath("s-a.json")));
     }
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/bad-a.json", "composed output line 1 from src/bad.json"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/bad-a.json"), "composed output line 1 from src/bad.json"));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath("bad-a.json"), .{}));
     const st = try c.run(&.{ "mox", "status" });
-    try std.testing.expect(lineHasBoth(st.out, "ERROR    ~/bad-a.json", "src/bad.json"));
+    try std.testing.expect(lineHasBoth(st.out, try tilde(a, "ERROR    ~/bad-a.json"), "src/bad.json"));
 }
 
 test "generator: a JSON template types a bare capture and a whole-string loop capture" {
@@ -8366,7 +8367,7 @@ test "status: a partial target whose live file does not parse gives its location
     const c = try cliSetup(a, io, &tmp);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try c.homePath("p.toml"), .data = "a = = 1\n" });
     const st = try c.run(&.{ "mox", "status" });
-    try std.testing.expect(lineHasBoth(st.out, "ERROR    ~/p.toml", "live ~/p.toml:1:5: does not parse as toml"));
+    try std.testing.expect(lineHasBoth(st.out, try tilde(a, "ERROR    ~/p.toml"), try tilde(a, "live ~/p.toml:1:5: does not parse as toml")));
 }
 
 test "generator: a JSON template's string row value expands its own captures, a secret included" {
@@ -8401,7 +8402,7 @@ test "generator: a literal duplicate key is passed as written, one a key capture
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqualStrings("{\"a\": 1, \"a\": 2}\n", try read(io, a, try c.homePath("lit-a.json")));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/cap-a.json", "duplicate key"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/cap-a.json"), "duplicate key"));
 }
 
 test "attributes: a symlink takes no directive key, whatever its key; its directives live in its head" {
@@ -8415,7 +8416,7 @@ test "attributes: a symlink takes no directive key, whatever its key; its direct
     try put(io, &tmp, "repo/src/l.json", "/etc/hosts\n");
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/l.json", "when is a directive key, which a symlink takes as a head directive in its source"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/l.json"), "when is a directive key, which a symlink takes as a head directive in its source"));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try c.homePath("l.json"), .{ .follow_symlinks = false }));
 }
 
@@ -8434,13 +8435,13 @@ test "status and diff: a file a live generator no longer produces is shown as ap
     try put(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"public\"\n");
 
     const st = try c.run(&.{ "mox", "status" });
-    try std.testing.expect(lineHasBoth(st.out, "STALE", "~/.config/Id-two.inc (its generator no longer produces it)"));
-    try std.testing.expect(lineHasBoth(st.out, "DRIFT", "~/.config/Id-three.inc (its generator no longer produces it)"));
+    try std.testing.expect(lineHasBoth(st.out, "STALE", try tilde(a, "~/.config/Id-two.inc (its generator no longer produces it)")));
+    try std.testing.expect(lineHasBoth(st.out, "DRIFT", try tilde(a, "~/.config/Id-three.inc (its generator no longer produces it)")));
     const d = try c.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=two") != null);
     try std.testing.expect(std.mem.indexOf(u8, d.out, "mine") == null);
     const dry = try c.run(&.{ "mox", "apply", "--dry-run" });
-    try std.testing.expect(std.mem.indexOf(u8, dry.out, "would remove ~/.config/Id-two.inc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/Id-two.inc")) != null);
 }
 
 test "apply and status: an unreadable source is labelled the same way by both" {
@@ -8459,9 +8460,9 @@ test "apply and status: an unreadable source is labelled the same way by both" {
     try Io.Dir.cwd().setFilePermissions(io, src, Io.File.Permissions.fromMode(0o000), .{});
     defer Io.Dir.cwd().setFilePermissions(io, src, Io.File.Permissions.fromMode(0o644), .{}) catch {};
     const st = try c.run(&.{ "mox", "status" });
-    try std.testing.expect(lineHasBoth(st.out, "~/.secret", "compose failed: AccessDenied"));
+    try std.testing.expect(lineHasBoth(st.out, try tilde(a, "~/.secret"), "compose failed: AccessDenied"));
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(lineHasBoth(r.err, "~/.secret", "compose failed: AccessDenied"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "~/.secret"), "compose failed: AccessDenied"));
 }
 
 test "captures in JSON: a default with raw or escaped quotes is one capture, in .json, .jsonc and a generator" {
@@ -8497,7 +8498,7 @@ test "generator: a leaf that does not parse names that a bare capture's default 
     try put(io, &tmp, "repo/src/ok.json", "// mox: for id in \"data/ids.toml\" into \"ok-<id.slug>.json\"\n{\"n\": <id.nm | default \"null\">}\n// mox: end\n");
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/g-a.json", "a bare capture's default is written as a JSON string"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/g-a.json"), "a bare capture's default is written as a JSON string"));
     try std.testing.expectEqualStrings("{\"n\": \"null\"}\n", try read(io, a, try c.homePath("ok-a.json")));
 }
 
@@ -8528,7 +8529,7 @@ test "generator: each file is checked in the format its own path names, its json
     try put(io, &tmp, "repo/.mox/attributes.toml", "[\".config/x-b.json\"]\nformat = \"jsonc\"\n");
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.config/x-a.json", "set format = \"jsonc\" for [\".config/x-a.json\"] in .mox/attributes.toml"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.config/x-a.json"), "set format = \"jsonc\" for [\".config/x-a.json\"] in .mox/attributes.toml"));
     try std.testing.expectEqualStrings("{\"k\": \"b\" /* note */}\n", try read(io, a, try c.homePath(".config/x-b.json")));
 }
 
@@ -8545,9 +8546,9 @@ test "attributes: an ownership key where ownership is not possible is not allowe
     try put(io, &tmp, "repo/src/.bashrc", "b\n");
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/l.json", "own is not allowed on this target"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.zshrc", "own is not allowed on this target"));
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/.bashrc", "when is a directive key, which only a strict-JSON target takes; write it as a head directive in the file"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/l.json"), "own is not allowed on this target"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.zshrc"), "own is not allowed on this target"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.bashrc"), "when is a directive key, which only a strict-JSON target takes; write it as a head directive in the file"));
 }
 
 test "partial: a live YAML file with a repeated key is refused in fixed text, never written back" {
@@ -8562,7 +8563,7 @@ test "partial: a live YAML file with a repeated key is refused in fixed text, ne
     const live = try c.homePath("c.yaml");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a: 0\nb: hunter2\nb: 3\n" });
     const r = try c.run(&.{ "mox", "apply", "--overwrite" });
-    try std.testing.expect(lineHasBoth(r.err, "ERROR   ~/c.yaml", "live ~/c.yaml:3:1: duplicate key <redacted>"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.yaml"), try tilde(a, "live ~/c.yaml:3:1: duplicate key <redacted>")));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
     try std.testing.expectEqualStrings("a: 0\nb: hunter2\nb: 3\n", try read(io, a, live));
 }
@@ -8581,7 +8582,7 @@ test "generator: a secret in the into path is a compose error naming its positio
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expect(r.rc != 0);
-    try std.testing.expect(lineHasBoth(r.err, "~/d.inc", "SecretInGeneratedPath"));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "~/d.inc"), "SecretInGeneratedPath"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "the into path's capture at column 4 resolves a secret") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "the into path's capture at column 13 resolves a secret") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter") == null);

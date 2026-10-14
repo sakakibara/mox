@@ -8,6 +8,7 @@ const mox = @import("mox");
 const Io = std.Io;
 const testutil = @import("testutil.zig");
 const Harness = testutil.Harness;
+const tilde = testutil.tilde;
 
 fn setup(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !Harness {
     return testutil.setup(a, io, tmp, .{ .create_repo_src = true });
@@ -332,7 +333,7 @@ test "state: an owned record whose canonical blob is gone is an error naming it,
     const a = arena.allocator();
     const h = try setup(a, io, &tmp);
     const blob = try ownedWithoutCanonical(a, io, &tmp, h);
-    const remedy = "mox apply --overwrite ~/app.toml";
+    const remedy = try tilde(a, "mox apply --overwrite ~/app.toml");
 
     const s = try h.run(&.{ "mox", "status" });
     try std.testing.expectEqual(@as(u8, 1), s.rc);
@@ -600,7 +601,7 @@ test "snapshot: a missing displaced blob refuses that restore, naming the path" 
     try Io.Dir.cwd().deleteFile(io, try statePath(h, &.{ "v2", "blobs", &mox.apply.applied.contentHashHex("v1\n") }));
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(contains(rb.err, "~/.zshrc"));
+    try std.testing.expect(contains(rb.err, try tilde(a, "~/.zshrc")));
     try std.testing.expectEqualStrings("v2\n", try read(io, a, try h.liveOf(".zshrc")));
 }
 
@@ -1478,7 +1479,7 @@ test "state: an owned record naming no canonical blob says so, doctor lists it, 
     try std.testing.expect(!contains(said, try std.fmt.allocPrint(a, "{s},", .{try statePath(h, &.{ "v2", "blobs" })})));
 
     const doc = try h.run(&.{ "mox", "doctor" });
-    try std.testing.expect(contains(doc.out, "missing-canonical ~/app.toml"));
+    try std.testing.expect(contains(doc.out, try std.fmt.allocPrint(a, "missing-canonical {s}", .{try tilde(a, "~/app.toml")})));
 
     try writeRepo(io, &tmp, "repo/src/app.toml", "# mox: own a\n[a]\nk = 2\n");
     const fixed = try h.run(&.{ "mox", "apply", "--overwrite" });

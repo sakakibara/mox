@@ -130,6 +130,22 @@ pub const Harness = struct {
 
 fn noRefresh(_: ?*anyopaque, _: Io) void {}
 
+/// `text` with each `~/...` path spelled with the platform separator, as
+/// mox displays a path under home.
+pub fn tilde(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.fs.path.sep == '/') return text;
+    const out = try a.dupe(u8, text);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "~/")) |at| {
+        var j = at + 1;
+        while (j < out.len and std.mem.indexOfScalar(u8, " \n\t:'\"),;", out[j]) == null) : (j += 1) {
+            if (out[j] == '/') out[j] = std.fs.path.sep;
+        }
+        i = j;
+    }
+    return out;
+}
+
 /// The state dump of `h`'s state directory, its flags asked of `h`'s repo
 /// and HOME.
 pub fn dumpOf(h: Harness) !mox.state.dump.Dump {
