@@ -507,7 +507,7 @@ pub fn readersHeld(io: Io, path: []const u8) bool {
 pub fn bootId(arena: std.mem.Allocator, io: Io) ![]const u8 {
     switch (builtin.os.tag) {
         .linux => {
-            const bytes = try Io.Dir.cwd().readFileAlloc(io, "/proc/sys/kernel/random/boot_id", arena, .limited(128));
+            const bytes = try readProcFile(arena, io, "/proc/sys/kernel/random/boot_id");
             return std.mem.trim(u8, bytes, " \n");
         },
         .macos, .ios, .tvos, .watchos, .visionos => {
@@ -523,6 +523,18 @@ pub fn bootId(arena: std.mem.Allocator, io: Io) ![]const u8 {
         },
         else => return error.NoBootId,
     }
+}
+
+/// A procfs file read to its end. Its size reads as 0, so a positional read
+/// that stops at the size reads nothing.
+fn readProcFile(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+    const file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var r = file.readerStreaming(io, &.{});
+    return r.interface.allocRemaining(arena, .limited(4096)) catch |e| switch (e) {
+        error.ReadFailed => return r.err.?,
+        else => |x| return x,
+    };
 }
 
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
@@ -568,7 +580,7 @@ pub fn processStart(arena: std.mem.Allocator, io: Io, pid: Pid) []const u8 {
     switch (builtin.os.tag) {
         .linux => {
             const path = std.fmt.allocPrint(arena, "/proc/{d}/stat", .{pid}) catch return "";
-            const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096)) catch return "";
+            const content = readProcFile(arena, io, path) catch return "";
             // Field 2 may hold spaces and parentheses: count from the last
             // `)`; `starttime` is field 22, the 20th after it.
             const close = std.mem.lastIndexOfScalar(u8, content, ')') orelse return "";
@@ -600,6 +612,18 @@ const testing = std.testing;
 
 fn tmpState(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) ![]const u8 {
     return tmp.dir.realPathFileAlloc(io, ".", a);
+}
+
+test "bootId and processStart: this boot and this process are named" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.SkipZigTest,
+    }
+    try testing.expect(isBootId(try bootId(a, testing.io)));
+    try testing.expect(processStart(a, testing.io, selfPid()).len > 0);
 }
 
 test "lock: a held lock refuses with the holder; the file is never empty while locked and empty after" {
