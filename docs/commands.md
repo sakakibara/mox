@@ -26,14 +26,17 @@ one line naming the format (`mox state 1`), 0600, when it creates the
 directory. Every command but `version`, help, `upgrade`, `path`, `git`,
 `secret`, `data` and `edit` first checks the directory. The default path,
 used when `MOX_STATE_DIR` is not set, is mox's whatever it holds. A
-directory `MOX_STATE_DIR` names is used only when it is absent, or holds
-nothing but the private layer, the lock files (`mox.lock`, `readers.lock`,
-`readers.gate`) and the files a file browser leaves (`.DS_Store`,
-`Thumbs.db`, `desktop.ini`); or when it holds the marker. mox creates the
-state directory, with the marker, when it first writes; a command that only
-reads an absent one finds an empty state and creates nothing. Any other
-directory is refused, exit 2, before anything in it is read or changed, with
-both ways out:
+directory `MOX_STATE_DIR` names is used when it holds the marker, or when it
+is absent or holds nothing but what a first run can leave beside the store,
+each in the form mox writes it: the lock files (`mox.lock`, `readers.lock`,
+`readers.gate`), each empty or holding one holder line; `bin/` holding only
+`mox`; `coupling/` holding only the coupling graph and its declines;
+`triggers.txt` holding only trigger records; and the files a file browser
+leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`). mox creates the state
+directory, with the marker, when it first writes; a command that only reads
+an absent one finds an empty state and creates nothing. Any other directory
+is refused, exit 2, before anything in it is read or changed, with both ways
+out:
 
 ```
 mox: <dir> is not a mox state directory: it holds no .mox-state marker, so mox leaves it as it is; point MOX_STATE_DIR at a dedicated directory, or, if it is a mox state, mark it as one:
@@ -42,7 +45,9 @@ mox: <dir> is not a mox state directory: it holds no .mox-state marker, so mox l
 ```
 
 So a `MOX_STATE_DIR` that names a home or another directory by mistake is
-left as it is. Only `mox state 1` is the marker; a `.mox-state` naming a
+left as it is. The private layer alone is no evidence: to set it up under
+a `MOX_STATE_DIR` before mox first runs there, write the marker first, with
+the commands above. Only `mox state 1` is the marker; a `.mox-state` naming a
 higher number is a newer mox's, and every command refuses it, at the
 default path too: `mox: state written by a newer mox (.mox-state says mox
 state <n>); upgrade mox to use <dir>`.

@@ -63,14 +63,18 @@ All notable changes to mox are documented here. The format follows
 - The state directory says it is mox's: mox writes `<state
   dir>/.mox-state` when it creates one, and every command that touches the
   state uses a directory `MOX_STATE_DIR` names only when it is absent,
-  holds nothing but the private layer, the lock files and the files a file
-  browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`), or holds that
-  marker. Any other directory is refused with exit 2 before anything in it
-  is read or changed, so a `MOX_STATE_DIR` that names a home or another
-  directory by mistake is left as it is; the refusal prints the command that
-  writes the marker, for a directory that is a mox state. The default path
-  is mox's whatever it holds. A `.mox-state` naming a format above `mox
-  state 1` is refused as a newer mox's. See the top of commands.md.
+  holds nothing but what a first run leaves beside the store, each in mox's
+  form (lock files empty or holding a holder line, `bin/` holding only
+  `mox`, `coupling/`, `triggers.txt`) and the files a file browser leaves
+  (`.DS_Store`, `Thumbs.db`, `desktop.ini`), or holds that marker. The
+  private layer alone is no evidence: set it up under a `MOX_STATE_DIR` by
+  writing the marker first. Any other directory is refused with exit 2
+  before anything in it is read or changed, so a `MOX_STATE_DIR` that names
+  a home or another directory by mistake is left as it is; the refusal
+  prints the command that writes the marker, for a directory that is a mox
+  state. The default path is mox's whatever it holds. A `.mox-state` naming
+  a format above `mox state 1` is refused as a newer mox's. See the top of
+  commands.md.
 - `mox uninstall` removes only the entries mox makes in the state
   directory, and lists every other entry as kept, "not made by mox",
   without following it; it used to remove every entry it did not know.

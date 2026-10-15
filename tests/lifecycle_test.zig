@@ -4463,6 +4463,7 @@ test "export --as: a presence test, a negated comparison and the private layer a
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.presence", "head\n# mox: when signing_key\nsigned\n# mox: end\n");
     try writeRepo(io, &tmp, "repo/src/.negated", "head\n# mox: when not role=client\nnotclient\n# mox: end\n");
     try tmp.dir.createDirPath(io, "state/private");
@@ -5762,6 +5763,7 @@ test "remove: a private-only file is forgotten here, with no tombstone, and its 
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "state/private/.mine", "m\n");
     try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".mine\"]\nmode = \"0600\"\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -5839,6 +5841,7 @@ test "private: an attributes entry for a repo path holds with no private file th
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.ssh/config", "Host x\n");
     try writeRepo(io, &tmp, "repo/src/.other", "o\n");
     try writeRepo(io, &tmp, "state/private/.mox/attributes.toml", "[\".ssh/config\"]\nmode = \"0600\"\n\n[\".other\"]\nreleased = true\n");
@@ -5858,6 +5861,7 @@ test "mv and remove: a file the private layer still varies is refused before any
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "base\n");
     try writeRepo(io, &tmp, "state/private/.zshrc.d/os=darwin", "mine\n");
     const mv = try h.run(&.{ "mox", "mv", ".zshrc", ".bashrc" });
@@ -6553,6 +6557,7 @@ test "orphans: an edited file of a gone generator is removed by a named --overwr
     const a = arena.allocator();
 
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     const tmpl = "# mox: for id in \"data/ids.toml\" into \"{s}-<id.slug>.inc\"\nk=<id.slug>\n# mox: end\n";
     try writeRepo(io, &tmp, "repo/src/.config/g.inc", try std.fmt.allocPrint(a, tmpl, .{"r"}));
     try writeRepo(io, &tmp, "state/private/.config/p.inc", try std.fmt.allocPrint(a, tmpl, .{"p"}));
@@ -6806,6 +6811,7 @@ test "private layer: once it held sources, every composing command refuses while
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.r", "r\n");
     try writeRepo(io, &tmp, "repo/src/.tok", "token=abc\n");
     try writeRepo(io, &tmp, "repo/data/ids.toml", "[[ids]]\nslug = \"public\"\n");
@@ -6846,6 +6852,7 @@ test "private retire: after it, a missing private layer reads as absent again" {
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.r", "r\n");
     try writeRepo(io, &tmp, "state/private/.pa", "pa\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -6872,6 +6879,7 @@ test "private layer: one that never held a source is not expected" {
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp, null);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.r", "r\n");
     try writeRepo(io, &tmp, "state/private/.DS_Store", "x");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);

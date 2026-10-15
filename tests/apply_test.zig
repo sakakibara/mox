@@ -3329,6 +3329,7 @@ test "apply generator: private-layer data shadows the committed source" {
     try tmp.dir.writeFile(io, .{ .sub_path = "state/private/data/ids.toml", .data = "[[ids]]\nslug = \"secret\"\n" });
 
     const c = try cliSetup(a, io, &tmp);
+    try testutil.markState(c);
     try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("key=secret\n", try read(io, a, try c.homePath(".config/id-secret.inc")));
 }
@@ -7472,6 +7473,7 @@ test "private: attributes hold for a private-only path, and only mode for a repo
     try writeExecScript(io, tmp.dir, "stubbin/pass", "#!/bin/sh\nprintf 't\\n'\n", try std.fs.path.join(a, &.{ stub, "pass" }));
     const path = try std.fmt.allocPrint(a, "{s}:{s}", .{ stub, std.testing.environ.getAlloc(a, "PATH") catch "" });
     const c = try testutil.setup(a, io, &tmp, .{ .os = host_os, .extra_env = &.{.{ .name = "PATH", .value = path }} });
+    try testutil.markState(c);
     const mine = try c.homePath("mine.json");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = "{\"m\": 1, \"program\": 5}\n" });
     const r = try c.run(&.{ "mox", "apply" });
@@ -7500,6 +7502,7 @@ test "private: a base at a repo path is refused naming both, and an overlay into
     try put(io, &tmp, "repo/.mox/attributes.toml", "[\"s.json\"]\ndisown = [\"model\"]\n");
     try put(io, &tmp, "state/private/s.json.d/os=" ++ host_os ++ ".json", "{\"model\": \"mine\"}\n");
     const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    try testutil.markState(c);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/.myrc"), "a private base at a path the repo manages"));
@@ -7521,6 +7524,7 @@ test "private: a gate and defaults in private attributes reach fact discovery" {
     try put(io, &tmp, "state/private/p.json", "{\"p\": 1}\n");
     try put(io, &tmp, "state/private/.mox/attributes.toml", "[\"p.json\"]\nwhen = \"site=home\"\ndefaults = { site = \"home\" }\n");
     const c = try cliSetup(a, io, &tmp);
+    try testutil.markState(c);
     const r = try c.run(&.{ "mox", "apply", "--defaults" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath(".config/mox/facts.toml")), "site = \"home\"") != null);
@@ -8456,6 +8460,7 @@ test "apply and status: an unreadable source is labelled the same way by both" {
     try put(io, &tmp, "repo/src/.r", "r\n");
     try put(io, &tmp, "state/private/.secret", "s\n");
     const c = try cliSetup(a, io, &tmp);
+    try testutil.markState(c);
     const src = try std.fs.path.join(a, &.{ c.state, "private", ".secret" });
     try Io.Dir.cwd().setFilePermissions(io, src, Io.File.Permissions.fromMode(0o000), .{});
     defer Io.Dir.cwd().setFilePermissions(io, src, Io.File.Permissions.fromMode(0o644), .{}) catch {};

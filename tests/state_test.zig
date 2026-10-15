@@ -110,6 +110,7 @@ test "lock: private retire takes the lock, its dry run reads without it" {
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "repo/src/.zshrc", "x\n");
     try writeRepo(io, &tmp, "state/private/.p", "p\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
@@ -165,6 +166,7 @@ test "state: an apply that fails after finding the private layer still records t
     defer arena.deinit();
     const a = arena.allocator();
     const h = try setup(a, io, &tmp);
+    try testutil.markState(h);
     try writeRepo(io, &tmp, "state/private/.p", "p\n");
     try writeRepo(io, &tmp, "repo/src/.a", "a\n");
     try tmp.dir.symLink(io, "/nonexistent", "repo/src/.link", .{});
@@ -188,7 +190,7 @@ fn withState(h: Harness, state: []const u8) !Harness {
 test "state directory: one spelled ending in `.` or `..` is the directory it names" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
-    for ([_][]const u8{ "/.", "/private/.." }) |suffix| {
+    for ([_][]const u8{ "/.", "/coupling/.." }) |suffix| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -196,7 +198,7 @@ test "state directory: one spelled ending in `.` or `..` is the directory it nam
         const a = arena.allocator();
         const real = try setup(a, io, &tmp);
         try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=2\n");
-        try Io.Dir.cwd().createDirPath(io, try statePath(real, &.{"private"}));
+        try Io.Dir.cwd().createDirPath(io, try statePath(real, &.{"coupling"}));
         const h = try withState(real, try std.mem.concat(a, u8, &.{ real.state, suffix }));
         try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
         try std.testing.expect(exists(io, try statePath(real, &.{ "v2", "current" })));
@@ -2886,12 +2888,13 @@ test "state directory: a fresh state, an absent or empty one, gets the marker on
     }
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 
-    // A state directory that holds only the private layer is one the user
-    // set up before the first run.
+    // A private layer set up before the first run under MOX_STATE_DIR is
+    // set up with the marker first.
     var tmp2 = std.testing.tmpDir(.{});
     defer tmp2.cleanup();
     const p = try setup(a, io, &tmp2);
     try writeRepo(io, &tmp2, "repo/src/.zshrc", "v1\n");
+    try testutil.markState(p);
     try writeRepo(io, &tmp2, "state/private/.p", "private\n");
     try std.testing.expectEqual(@as(u8, 0), (try p.run(&.{ "mox", "apply" })).rc);
     try std.testing.expectEqualStrings("private\n", try read(io, a, try p.liveOf(".p")));
@@ -2941,6 +2944,109 @@ test "state directory: one holding only lock files and OS files is fresh under M
     try std.testing.expectEqualStrings("v1\n", try read(io, a, try d.liveOf(".zshrc")));
     try std.testing.expectEqualStrings("mox state 1\n", try read(io, a, try statePath(d, &.{".mox-state"})));
     try std.testing.expectEqualStrings("mine\n", try read(io, a, try statePath(d, &.{"notes.txt"})));
+}
+
+test "state directory: under MOX_STATE_DIR the private layer alone is no evidence, and a directory marked first keeps it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try writeRepo(io, &tmp, "state/private/.p", "private\n");
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(contains(r.err, try std.fmt.allocPrint(a, "{s} is not a mox state directory", .{h.state})));
+    try std.testing.expect(!exists(io, try statePath(h, &.{".mox-state"})));
+    try std.testing.expect(!exists(io, try h.liveOf(".zshrc")));
+    try testutil.markState(h);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
+    try std.testing.expectEqualStrings("private\n", try read(io, a, try statePath(h, &.{ "private", ".p" })));
+}
+
+test "state directory: under MOX_STATE_DIR a lock file holding anything but a holder line is foreign" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    for ([_][]const u8{ "mox.lock", "readers.lock", "readers.gate" }) |name| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try writeRepo(io, &tmp, try std.fs.path.join(a, &.{ "state", name }), "important user data\n");
+        const r = try h.run(&.{ "mox", "status" });
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        try std.testing.expect(contains(r.err, "is not a mox state directory"));
+        try std.testing.expectEqualStrings("important user data\n", try read(io, a, try statePath(h, &.{name})));
+        try std.testing.expect(!exists(io, try statePath(h, &.{".mox-state"})));
+    }
+    for ([_][]const u8{ "", "999999 - 00000000-0000-0000-0000-000000000000 apply\n" }) |line| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try writeRepo(io, &tmp, "state/mox.lock", line);
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
+    }
+}
+
+test "state directory: under MOX_STATE_DIR one holding only what mox makes beside its record stores is fresh, each in its own form" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const Case = struct { name: []const u8, data: []const u8 };
+    const own = [_]Case{
+        .{ .name = "state/coupling/graph.json", .data = "{\"v\": 1, \"postings\": {}}" },
+        .{ .name = "state/coupling/declines.json", .data = "{\"v\": 1, \"global\": [], \"pairs\": []}" },
+        .{ .name = "state/triggers.txt", .data = "seen:k=\nevery:e=1700000000\nhash:/x=0123abcd\n" },
+        .{ .name = "state/mox.lock", .data = "" },
+        .{ .name = "state/.DS_Store", .data = "" },
+    };
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        for (own) |c| try writeRepo(io, &tmp, c.name, c.data);
+        try tmp.dir.createDirPath(io, "state/bin");
+        try tmp.dir.symLink(io, "/nonexistent-mox", "state/bin/mox", .{});
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try std.testing.expectEqualStrings("v1\n", try read(io, a, try h.liveOf(".zshrc")));
+        try std.testing.expect(exists(io, try statePath(h, &.{".mox-state"})));
+    }
+    const foreign = [_]Case{
+        .{ .name = "state/coupling/graph.json", .data = "my notes" },
+        .{ .name = "state/coupling/notes.txt", .data = "{}" },
+        .{ .name = "state/triggers.txt", .data = "remember the milk\n" },
+        .{ .name = "state/bin/tool", .data = "#!/bin/sh\n" },
+        .{ .name = "state/mox-path", .data = "/x\n" },
+    };
+    for (foreign) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setup(a, io, &tmp);
+        try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+        try writeRepo(io, &tmp, c.name, c.data);
+        const r = try h.run(&.{ "mox", "apply" });
+        if (r.rc != 2) std.debug.print("{s}: rc {d}\n", .{ c.name, r.rc });
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        try std.testing.expect(contains(r.err, "is not a mox state directory"));
+    }
 }
 
 test "state directory: a marker a newer mox wrote is refused, at the default path too" {

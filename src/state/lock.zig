@@ -121,6 +121,15 @@ pub fn acquire(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: 
     return .{ .acquired = .{ .io = io, .file = file, .path = path } };
 }
 
+/// The content of a lock file is what mox leaves in one: nothing, or one
+/// holder line.
+pub fn isLockContent(content: []const u8) bool {
+    if (content.len == 0) return true;
+    const end = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+    if (end + 1 < content.len) return false;
+    return parseHolder(content) != null;
+}
+
 /// `<pid> <start> <boot id>` for `pid`, as a holder line and a journal
 /// header name a process.
 pub fn holderStamp(arena: std.mem.Allocator, io: Io, pid: Pid) ![]const u8 {

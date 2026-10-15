@@ -1,8 +1,8 @@
 //! How a state directory says it is mox's: the marker `.mox-state`, which
 //! mox writes into every state directory it creates. An unmarked directory
 //! `MOX_STATE_DIR` names is refused before anything in it is read or
-//! changed, unless it holds only the private layer, lock files and OS files;
-//! mox's default path is its own whatever it holds.
+//! changed, unless it holds only what mox makes beside its store, each in
+//! its own form; mox's default path is its own whatever it holds.
 
 const std = @import("std");
 const Io = std.Io;
@@ -26,10 +26,10 @@ pub const Origin = enum {
 };
 
 pub const Kind = enum {
-    /// Absent, or holding only the private layer, lock files and OS files:
-    /// nothing in it is mox's to lose, and a write makes it a state
-    /// directory. At the default path, also one holding anything else that
-    /// is not marked.
+    /// Absent, or holding only what mox makes beside its store
+    /// (`freshEntry`): nothing in it is mox's to lose, and a write makes it
+    /// a state directory. At the default path, also one holding anything
+    /// else that is not marked.
     fresh,
     marked,
 };
@@ -63,11 +63,75 @@ pub fn accept(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: O
         .none => {},
     };
     if (origin == .default) return .{ .accepted = .fresh };
-    for (entries) |e| {
-        if (std.mem.eql(u8, e.name, "private") or isLockFile(e.name) or isOsFile(e)) continue;
-        return .{ .refused = try refusal(arena, state_dir) };
-    }
+    for (entries) |e| if (!try freshEntry(arena, io, state_dir, e)) return .{ .refused = try refusal(arena, state_dir) };
     return .{ .accepted = .fresh };
+}
+
+/// The top-level entry `e` of an unmarked directory `MOX_STATE_DIR` names
+/// is one mox makes beside its store, in the form it makes it, as
+/// a first run can leave it: an OS file, a lock file holding nothing or a
+/// holder line, `bin/` holding only the running mox, `coupling/` holding
+/// the coupling graph and declines, and the trigger state.
+fn freshEntry(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent.Entry) !bool {
+    if (isOsFile(e)) return true;
+    const path = try std.fs.path.join(arena, &.{ state_dir, e.name });
+    if (isLockFile(e.name)) return e.kind == .file and lockContent(arena, io, path);
+    if (std.mem.eql(u8, e.name, run_scripts.bin_dir_name)) return try whyNotOwn(arena, io, path, run_scripts.isBinEntry) == null;
+    if (std.mem.eql(u8, e.name, "coupling")) return e.kind == .directory and try couplingOnly(arena, io, path);
+    if (std.mem.eql(u8, e.name, trigger_state.state_basename)) return e.kind == .file and triggerForm(arena, io, path);
+    return false;
+}
+
+fn lockContent(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4096)) catch return false;
+    return lock.isLockContent(bytes);
+}
+
+/// `coupling/` holds only `graph.json` and `declines.json` as mox writes
+/// them, and OS files.
+fn couplingOnly(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
+    const entries = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    for (entries) |e| {
+        if (isOsFile(e)) continue;
+        if (e.kind != .file) return false;
+        const fields: []const []const u8 = if (std.mem.eql(u8, e.name, "graph.json"))
+            &.{"postings"}
+        else if (std.mem.eql(u8, e.name, "declines.json"))
+            &.{ "global", "pairs" }
+        else
+            return false;
+        const bytes = Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ dir, e.name }), arena, .limited(64 * 1024 * 1024)) catch return false;
+        const v = json.parse(arena, bytes, .{}) catch return false;
+        if (v != .object) return false;
+        const ver = v.object.get("v") orelse return false;
+        if (ver != .integer or ver.integer != 1) return false;
+        for (fields) |f| if (v.object.get(f) == null) return false;
+    }
+    return true;
+}
+
+/// The trigger state holds only `seen:<key>=`, `hash:<key>=<hex>` and
+/// `every:<key>=<seconds>` records, one per line.
+fn triggerForm(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 * 1024 * 1024)) catch return false;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        const eq = std.mem.lastIndexOfScalar(u8, line, '=') orelse return false;
+        if (eq < colon) return false;
+        const ns = line[0..colon];
+        const value = line[eq + 1 ..];
+        if (std.mem.eql(u8, ns, "seen")) {
+            if (value.len != 0) return false;
+        } else if (std.mem.eql(u8, ns, "hash")) {
+            if (value.len == 0) return false;
+            for (value) |c| if (!std.ascii.isHex(c)) return false;
+        } else if (std.mem.eql(u8, ns, "every")) {
+            _ = std.fmt.parseInt(i64, value, 10) catch return false;
+        } else return false;
+    }
+    return true;
 }
 
 /// `accept`, then for a directory accepted unmarked, the marker written:
@@ -174,7 +238,7 @@ pub fn whyNotOwn(arena: std.mem.Allocator, io: Io, path: []const u8, own: *const
 
 const testing = std.testing;
 
-test "accept: absent, empty and private-only directories are fresh, a marked one is mox's, and names alone are no evidence" {
+test "accept: absent and empty directories are fresh, a private-only one is not, a marked one is mox's, and names alone are no evidence" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -184,8 +248,10 @@ test "accept: absent, empty and private-only directories are fresh, a marked one
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     const dir = try std.fs.path.join(a, &.{ root, "s" });
     try testing.expectEqual(Kind.fresh, (try accept(a, io, dir, .explicit)).accepted);
-    try tmp.dir.createDirPath(io, "s/private");
+    try tmp.dir.createDirPath(io, "s");
     try testing.expectEqual(Kind.fresh, (try accept(a, io, dir, .explicit)).accepted);
+    try tmp.dir.createDirPath(io, "s/private");
+    try testing.expect((try accept(a, io, dir, .explicit)) == .refused);
     for ([_][]const u8{ "s/v2/notes", "s/trash/photo" }) |p| {
         if (std.fs.path.dirname(p)) |parent| try tmp.dir.createDirPath(io, parent);
         try tmp.dir.writeFile(io, .{ .sub_path = p, .data = "x\n" });

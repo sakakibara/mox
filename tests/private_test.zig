@@ -86,6 +86,7 @@ test "apply: a .mox-exact marker in the private layer prunes a foreign live file
     try writeFile(io, tmp.dir, "state/private/.config/app/.mox-exact", "");
 
     const h = try testutil.setup(a, io, &tmp, .{});
+    try testutil.markState(h);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
     const foreign = try h.homePath(".config/app/foreign.txt");
@@ -119,6 +120,7 @@ test "apply: a Cat C file composes its repo overlay, not the private overlay of 
     try writeFile(io, tmp.dir, "state/private/.config/site.pem.d/os=darwin.pem", "private-darwin\n");
 
     const h = try testutil.setup(a, io, &tmp, .{ .os = "darwin" });
+    try testutil.markState(h);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
     const live = try Io.Dir.cwd().readFileAlloc(io, try h.homePath(".config/site.pem"), a, .limited(1 << 20));

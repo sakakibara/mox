@@ -1311,6 +1311,7 @@ test "commit: a private-only file's edit lands in the private layer and leaves r
     try writeRepo(io, &tmp, "state/private/.zsecret", "# mox: include \"frag.sh\"\n");
     try writeRepo(io, &tmp, "state/private/.zsecret.d/frag.sh", "secret_one\nsecret_two\n");
     const h = try setup(a, io, &tmp, .{});
+    try testutil.markState(h);
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
@@ -5579,6 +5580,7 @@ test "commit: a private universal fragment's edit is confirmed as private, never
     try writeRepo(io, &tmp, "state/private/.zsecret.d/frag.sh", "secret_one\nsecret_two\n");
     try writeRepo(io, &tmp, "state/private/.zsecret.d/darwin.sh", "mac_line\n");
     const h = try setup(a, io, &tmp, .{});
+    try testutil.markState(h);
 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
@@ -6593,6 +6595,7 @@ test "commit: a simulated placement into a new overlay leaves no empty directory
     try writeRepo(io, &tmp, "repo/src/.keep", "x\n");
     try writeRepo(io, &tmp, "state/private/settings.toml.d/os=linux.toml", "theme = \"light\"\n");
     const h = try setup(a, io, &tmp, .{ .os = "darwin" });
+    try testutil.markState(h);
     const src_dir = try std.fs.path.join(a, &.{ h.repo, "src" });
     const before = try treeDigest(io, a, src_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("settings.toml"), .data = "theme = \"dark\"\nsize = 2\n" });
@@ -10288,6 +10291,7 @@ test "commit: a base line edited beside an equal private-layer line is manual, a
     try writeRepo(io, &tmp, "state/private/.myrc.d/profile/personal.myrc", private);
     try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\n");
     const h = try setup(a, io, &tmp, .{});
+    try testutil.markState(h);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     // The diff pairs the live "export A=1" with the base's line, so the
     // private layer's copy is deleted and the base keeps the text.
@@ -10360,6 +10364,7 @@ test "commit: a line removed from the repo while one is added to the private lay
     try writeRepo(io, &tmp, "state/private/.myrc.d/profile/personal.myrc", private);
     try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "profile = \"personal\"\n");
     const h = try setup(a, io, &tmp, .{});
+    try testutil.markState(h);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".myrc"), .data = "a\np1\np2\nb\n" });
 
