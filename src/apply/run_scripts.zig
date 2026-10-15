@@ -741,11 +741,11 @@ pub fn sweepCheckDirs(arena: std.mem.Allocator, io: Io, state_dir: []const u8) v
     }
 }
 
-const Staging = enum { dir, out };
+pub const Staging = enum { dir, out };
 
 /// What `name` is of a check hook's staging: its candidate directory
 /// `check-<16 hex>`, or that directory's `.out` capture; null for neither.
-fn checkStaging(name: []const u8) ?Staging {
+pub fn checkStaging(name: []const u8) ?Staging {
     if (!std.mem.startsWith(u8, name, "check-")) return null;
     const rest = name["check-".len..];
     const out = std.mem.endsWith(u8, rest, ".out");

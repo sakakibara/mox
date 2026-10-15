@@ -3094,6 +3094,11 @@ test "state directory: under MOX_STATE_DIR one holding only what mox makes besid
         .{ .name = "state/triggers.txt", .data = "seen:k=\nevery:e=1700000000\nhash:/x=0123abcd\n" },
         .{ .name = "state/mox.lock", .data = "" },
         .{ .name = "state/.DS_Store", .data = "" },
+        .{ .name = "state/mox-path", .data = "/x\n" },
+        .{ .name = "state/zypper.txt", .data = "ripgrep\n" },
+        .{ .name = "state/commit-recovery/20240101T000000Z/repo/src/.zshrc", .data = "v0\n" },
+        .{ .name = "state/check-0123456789abcdef/.zshrc", .data = "v0\n" },
+        .{ .name = "state/check-0123456789abcdef.out", .data = "refused\n" },
     };
     {
         var tmp = std.testing.tmpDir(.{});
@@ -3115,7 +3120,10 @@ test "state directory: under MOX_STATE_DIR one holding only what mox makes besid
         .{ .name = "state/coupling/notes.txt", .data = "{}" },
         .{ .name = "state/triggers.txt", .data = "remember the milk\n" },
         .{ .name = "state/bin/tool", .data = "#!/bin/sh\n" },
-        .{ .name = "state/mox-path", .data = "/x\n" },
+        .{ .name = "state/mox-path", .data = "x\n" },
+        .{ .name = "state/zypper.txt", .data = "my notes\n" },
+        .{ .name = "state/commit-recovery/notes.txt", .data = "x\n" },
+        .{ .name = "state/check-0123456789abcdef/sub/x", .data = "x\n" },
     };
     for (foreign) |c| {
         var tmp = std.testing.tmpDir(.{});

@@ -9,6 +9,7 @@ const Io = std.Io;
 const json = @import("json");
 const dirent = @import("../source/dirent.zig");
 const durable = @import("durable.zig");
+const id = @import("id.zig");
 const lock = @import("lock.zig");
 const quote = @import("quote.zig");
 const run_scripts = @import("../apply/run_scripts.zig");
@@ -71,7 +72,9 @@ pub fn accept(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: O
 /// is one mox makes beside its store, in the form it makes it, as
 /// a first run can leave it: an OS file, a lock file holding nothing or a
 /// holder line, `bin/` holding only the running mox, `coupling/` holding
-/// the coupling graph and declines, and the trigger state.
+/// the coupling graph and declines, the trigger state, the scripts' PATH
+/// note, zypper's ledger, commit's recovery copies, and a check hook's
+/// staging.
 fn freshEntry(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent.Entry) !bool {
     if (isOsFile(e)) return true;
     const path = try std.fs.path.join(arena, &.{ state_dir, e.name });
@@ -79,7 +82,95 @@ fn freshEntry(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent
     if (std.mem.eql(u8, e.name, run_scripts.bin_dir_name)) return try whyNotOwn(arena, io, path, run_scripts.isBinEntry) == null;
     if (std.mem.eql(u8, e.name, "coupling")) return e.kind == .directory and try couplingOnly(arena, io, path);
     if (std.mem.eql(u8, e.name, trigger_state.state_basename)) return e.kind == .file and triggerForm(arena, io, path);
-    return false;
+    if (std.mem.eql(u8, e.name, "mox-path")) return e.kind == .file and moxPathForm(arena, io, path);
+    if (std.mem.eql(u8, e.name, "zypper.txt")) return e.kind == .file and try ledgerForm(arena, io, path);
+    if (std.mem.eql(u8, e.name, "commit-recovery")) return e.kind == .directory and try recoveryOnly(arena, io, path);
+    return switch (run_scripts.checkStaging(e.name) orelse return false) {
+        .dir => e.kind == .directory and try checkDirForm(arena, io, path),
+        .out => e.kind == .file,
+    };
+}
+
+/// The scripts' PATH note holds only blank lines and absolute paths, one
+/// per line, as `$MOX_PATH` takes them.
+fn moxPathForm(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return false;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len > 0 and !std.fs.path.isAbsolute(line)) return false;
+    }
+    return true;
+}
+
+/// A package ledger is empty or holds distinct ids, one per line, each
+/// ending in a newline, with no whitespace in them.
+fn ledgerForm(arena: std.mem.Allocator, io: Io, path: []const u8) !bool {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(4 << 20)) catch return false;
+    if (bytes.len == 0) return true;
+    if (bytes[bytes.len - 1] != '\n') return false;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var it = std.mem.splitScalar(u8, bytes[0 .. bytes.len - 1], '\n');
+    while (it.next()) |id_| {
+        if (id_.len == 0 or std.mem.indexOfAny(u8, id_, " \t\r") != null) return false;
+        if ((try seen.fetchPut(arena, id_, {})) != null) return false;
+    }
+    return true;
+}
+
+/// `commit-recovery/` holds, beside OS files, only directories named by
+/// run id, each holding only the copies commit saves: `repo/` and
+/// `private/` trees of directories and regular files, a regular file
+/// `facts`, and `other/` holding regular files named by a number.
+fn recoveryOnly(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
+    const runs = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    for (runs) |r| {
+        if (isOsFile(r)) continue;
+        if (r.kind != .directory or !id.isId(r.name)) return false;
+        const run_dir = try std.fs.path.join(arena, &.{ dir, r.name });
+        const held = dirent.sortedPath(arena, io, run_dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+        for (held) |h| {
+            const p = try std.fs.path.join(arena, &.{ run_dir, h.name });
+            const ok = if (std.mem.eql(u8, h.name, "repo") or std.mem.eql(u8, h.name, "private"))
+                h.kind == .directory and try plainTree(arena, io, p)
+            else if (std.mem.eql(u8, h.name, "facts"))
+                h.kind == .file
+            else if (std.mem.eql(u8, h.name, "other"))
+                h.kind == .directory and try numberedFiles(arena, io, p)
+            else
+                false;
+            if (!ok) return false;
+        }
+    }
+    return true;
+}
+
+/// Everything under `dir` is a directory or a regular file.
+fn plainTree(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
+    const entries = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    for (entries) |e| switch (e.kind) {
+        .file => {},
+        .directory => if (!try plainTree(arena, io, try std.fs.path.join(arena, &.{ dir, e.name }))) return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// `dir` holds only regular files named by a decimal number.
+fn numberedFiles(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
+    const entries = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    for (entries) |e| {
+        if (e.kind != .file or e.name.len == 0) return false;
+        for (e.name) |c| if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
+}
+
+/// A check hook's staging directory holds at most the one candidate, a
+/// regular file.
+fn checkDirForm(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
+    const entries = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    return entries.len == 0 or (entries.len == 1 and entries[0].kind == .file);
 }
 
 fn lockContent(arena: std.mem.Allocator, io: Io, path: []const u8) bool {
@@ -300,6 +391,91 @@ test "accept: a directory holding only lock files and OS files is fresh, and an 
     try testing.expectEqual(Kind.fresh, (try accept(a, io, dir, .explicit)).accepted);
     try tmp.dir.writeFile(io, .{ .sub_path = "s/notes.txt", .data = "mine\n" });
     try testing.expect((try accept(a, io, dir, .explicit)) == .refused);
+}
+
+test "accept: mox-path, zypper.txt, commit-recovery/ and a check hook's staging are fresh in the forms mox writes them, and foreign in any other" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const abs = try tmp.dir.realPathFileAlloc(io, ".", a);
+    const Laid = struct {
+        /// A file holding `data`, or, when `data` is null, a directory.
+        path: []const u8,
+        data: ?[]const u8 = null,
+
+        /// What `accept` says of a directory `MOX_STATE_DIR` names holding
+        /// `laid`.
+        fn acceptOf(ar: std.mem.Allocator, t: *std.testing.TmpDir, sub: []const u8, laid: []const @This()) !Acceptance {
+            const dir = try std.fs.path.join(ar, &.{ try t.dir.realPathFileAlloc(testing.io, ".", ar), sub });
+            try t.dir.createDirPath(testing.io, sub);
+            for (laid) |l| {
+                const p = try std.fs.path.join(ar, &.{ sub, l.path });
+                if (l.data) |d| {
+                    if (std.fs.path.dirname(p)) |parent| try t.dir.createDirPath(testing.io, parent);
+                    try t.dir.writeFile(testing.io, .{ .sub_path = p, .data = d });
+                } else try t.dir.createDirPath(testing.io, p);
+            }
+            return accept(ar, testing.io, dir, .explicit);
+        }
+    };
+    const in_form = [_][]const Laid{
+        &.{.{ .path = "mox-path", .data = "" }},
+        &.{.{ .path = "mox-path", .data = try std.mem.concat(a, u8, &.{ abs, "\n\n", abs, "\n" }) }},
+        &.{.{ .path = "zypper.txt", .data = "" }},
+        &.{.{ .path = "zypper.txt", .data = "ripgrep\nfd\n" }},
+        &.{.{ .path = "commit-recovery" }},
+        &.{
+            .{ .path = "commit-recovery/20240101T000000Z/repo/src/.zshrc", .data = "x\n" },
+            .{ .path = "commit-recovery/20240101T000000Z/private/a/b", .data = "x\n" },
+            .{ .path = "commit-recovery/20240101T000000Z/facts", .data = "x\n" },
+            .{ .path = "commit-recovery/20240101T000000Z/other/1", .data = "x\n" },
+            .{ .path = "commit-recovery/20240101T000000Z-2" },
+            .{ .path = "commit-recovery/.DS_Store", .data = "" },
+        },
+        &.{.{ .path = "check-0123456789abcdef" }},
+        &.{
+            .{ .path = "check-0123456789abcdef/.zshrc", .data = "x\n" },
+            .{ .path = "check-0123456789abcdef.out", .data = "checker said no\n" },
+        },
+    };
+    for (in_form, 0..) |laid, i| {
+        const got = try Laid.acceptOf(a, &tmp, try std.fmt.allocPrint(a, "in{d}", .{i}), laid);
+        try testing.expect(got == .accepted and got.accepted == .fresh);
+    }
+    const foreign = [_][]const Laid{
+        &.{.{ .path = "mox-path" }},
+        &.{.{ .path = "mox-path", .data = "relative/dir\n" }},
+        &.{.{ .path = "zypper.txt" }},
+        &.{.{ .path = "zypper.txt", .data = "ripgrep" }},
+        &.{.{ .path = "zypper.txt", .data = "my notes\n" }},
+        &.{.{ .path = "zypper.txt", .data = "fd\n\nripgrep\n" }},
+        &.{.{ .path = "zypper.txt", .data = "fd\nfd\n" }},
+        &.{.{ .path = "commit-recovery", .data = "" }},
+        &.{.{ .path = "commit-recovery/notes", .data = "x\n" }},
+        &.{.{ .path = "commit-recovery/20240101T000000Z", .data = "x\n" }},
+        &.{.{ .path = "commit-recovery/20240101T000000Z/docs/a", .data = "x\n" }},
+        &.{.{ .path = "commit-recovery/20240101T000000Z/repo", .data = "x\n" }},
+        &.{.{ .path = "commit-recovery/20240101T000000Z/facts" }},
+        &.{.{ .path = "commit-recovery/20240101T000000Z/other/x", .data = "x\n" }},
+        &.{.{ .path = "commit-recovery/20240101T000000Z/other/1/a", .data = "x\n" }},
+        &.{.{ .path = "check-0123456789abcdef", .data = "" }},
+        &.{ .{ .path = "check-0123456789abcdef/a", .data = "x\n" }, .{ .path = "check-0123456789abcdef/b", .data = "x\n" } },
+        &.{.{ .path = "check-0123456789abcdef/sub" }},
+        &.{.{ .path = "check-0123456789abcdef.out" }},
+        &.{.{ .path = "check-0123456789abcde.out", .data = "" }},
+    };
+    for (foreign, 0..) |laid, i| {
+        const got = try Laid.acceptOf(a, &tmp, try std.fmt.allocPrint(a, "out{d}", .{i}), laid);
+        try testing.expect(got == .refused);
+    }
+    if (@import("builtin").os.tag != .windows) {
+        try tmp.dir.createDirPath(io, "link/commit-recovery/20240101T000000Z/repo");
+        try tmp.dir.symLink(io, "/bin/sh", "link/commit-recovery/20240101T000000Z/repo/sh", .{});
+        try testing.expect((try accept(a, io, try std.fs.path.join(a, &.{ abs, "link" }), .explicit)) == .refused);
+    }
 }
 
 test "accept: the default state path is mox's whatever it holds, unless it is not a directory or a newer mox's" {

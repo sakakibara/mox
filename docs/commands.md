@@ -31,12 +31,17 @@ is absent or holds nothing but what a first run can leave beside the store,
 each in the form mox writes it: the lock files (`mox.lock`, `readers.lock`,
 `readers.gate`), each empty or holding one holder line; `bin/` holding only
 `mox`; `coupling/` holding only the coupling graph and its declines;
-`triggers.txt` holding only trigger records; and the files a file browser
-leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`). mox creates the state
-directory, with the marker, when it first writes; a command that only reads
-an absent one finds an empty state and creates nothing. Any other directory
-is refused, exit 2, before anything in it is read or changed, with both ways
-out:
+`triggers.txt` holding only trigger records; `mox-path` holding only blank
+lines and absolute paths; `zypper.txt` empty or holding distinct package
+ids, one per line; `commit-recovery/` holding only run-id directories of
+commit's recovery copies (`repo/` and `private/` trees, `facts`, and
+`other/` files named by a number); a check hook's `check-<16 hex>` directory
+holding at most one regular file and its `.out` file; and the files a file
+browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`). mox creates the
+state directory, with the marker, when it first writes; a command that only
+reads an absent one finds an empty state and creates nothing. Any other
+directory is refused, exit 2, before anything in it is read or changed, with
+both ways out:
 
 ```
 mox: <dir> is not a mox state directory: it holds no .mox-state marker, so mox leaves it as it is; point MOX_STATE_DIR at a dedicated directory, or, if it is a mox state, mark it as one:
