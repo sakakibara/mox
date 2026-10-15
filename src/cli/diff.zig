@@ -186,13 +186,17 @@ const ComposedMask = struct {
 
 /// The live side as diff prints it: each line as `shapes.shown` gives it,
 /// paired with the outline the last apply wrote the file with, every form
-/// of every value this run resolved masked.
+/// of every value this run resolved masked. In a file that may hold a
+/// secret (`strict`), a line paired with nothing is replaced whole: an
+/// edited line can hold a value no shape or form finds.
 const LiveMask = struct {
     forms: shapes.Forms,
     outline: []const shapes.Entry,
     pairing: shapes.Pairing,
+    strict: bool,
 
     fn show(m: LiveMask, arena: std.mem.Allocator, i: usize, line: []const u8) anyerror![]const u8 {
+        if (m.strict and m.pairing.entry_of[i] == null) return mox.provenance.map.line_redaction;
         return shapes.shown(arena, m.outline, m.pairing, i, line, m.forms);
     }
 };
@@ -564,7 +568,12 @@ fn diffOne(
         };
         const forms = try runForms(st, ctx.alloc);
         const b_shown = try composedShown(ctx.alloc, forms, b_lines, hunks, prov_segments);
-        const m: LiveMask = .{ .forms = forms, .outline = recorded, .pairing = try shapes.pair(ctx.alloc, recorded, a_lines) };
+        const m: LiveMask = .{
+            .forms = forms,
+            .outline = recorded,
+            .pairing = try shapes.pair(ctx.alloc, recorded, a_lines),
+            .strict = hasShape(recorded) or hasSecret(prov_segments) or secretRecord(st, live_path),
+        };
         const a_shown = try shownLines(ctx.alloc, a_lines, hunks, .live, m, LiveMask.show);
         try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_shown, b_shown, hunks, sty));
     }
@@ -591,6 +600,11 @@ fn recordedOutline(
     if (!hasSecret(prov_segments) or !std.mem.eql(u8, &f.sha256, &mox.apply.applied.contentHashHex(composed_bytes))) return null;
     const values = if (st.secrets) |c| try c.values(ctx.alloc) else &.{};
     return try shapes.outlineOf(ctx.alloc, composed_bytes, prov_segments, values);
+}
+
+fn hasShape(outline: []const shapes.Entry) bool {
+    for (outline) |e| if (e == .shape) return true;
+    return false;
 }
 
 fn hasSecret(segments: []const mox.provenance.map.Segment) bool {
@@ -815,7 +829,7 @@ test "renderFile: no hunks renders empty" {
     try testing.expectEqualStrings("", out);
 }
 
-test "LiveMask: a line is masked at the slots of the shape it pairs with, a value wherever it is, and, failing closed, a line paired with nothing whole" {
+test "LiveMask: a line is masked at the slots of the shape it pairs with, a value wherever it is, and, strict or failing closed, a line paired with nothing whole" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -823,13 +837,18 @@ test "LiveMask: a line is masked at the slots of the shape it pairs with, a valu
     const outline = [_]shapes.Entry{ .{ .line = "user = me" }, .{ .shape = .{ .pieces = &.{ "token = ", "" } } } };
     const forms = try shapes.writtenForms(a, &.{"s3cr3t"});
     const kept = [_][]const u8{ "user = me", "token = old-value", "copy s3cr3t here" };
-    const m: LiveMask = .{ .forms = forms, .outline = &outline, .pairing = try shapes.pair(a, &outline, &kept) };
+    const m: LiveMask = .{ .forms = forms, .outline = &outline, .pairing = try shapes.pair(a, &outline, &kept), .strict = false };
     try testing.expect(!m.pairing.fail_closed);
     try testing.expectEqualStrings("user = me", try m.show(a, 0, kept[0]));
     try testing.expectEqualStrings("token = " ++ red, try m.show(a, 1, kept[1]));
     try testing.expectEqualStrings("copy " ++ red ++ " here", try m.show(a, 2, kept[2]));
+    var strict = m;
+    strict.strict = true;
+    try testing.expectEqualStrings("user = me", try strict.show(a, 0, kept[0]));
+    try testing.expectEqualStrings("token = " ++ red, try strict.show(a, 1, kept[1]));
+    try testing.expectEqualStrings(mox.provenance.map.line_redaction, try strict.show(a, 2, kept[2]));
     const lost = [_][]const u8{ "user = me", "tok3n: old-value", "other" };
-    const f: LiveMask = .{ .forms = forms, .outline = &outline, .pairing = try shapes.pair(a, &outline, &lost) };
+    const f: LiveMask = .{ .forms = forms, .outline = &outline, .pairing = try shapes.pair(a, &outline, &lost), .strict = false };
     try testing.expect(f.pairing.fail_closed);
     try testing.expectEqualStrings("user = me", try f.show(a, 0, lost[0]));
     try testing.expectEqualStrings(mox.provenance.map.line_redaction, try f.show(a, 1, lost[1]));

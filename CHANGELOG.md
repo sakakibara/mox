@@ -116,10 +116,11 @@ All notable changes to mox are documented here. The format follows
   shape is printed with the secret's place shown as
   `<mox:redacted-secret>`, and every value the current render of any
   managed file resolves is masked wherever it occurs, as written and
-  JSON-escaped, TOML- or YAML-quoted. When a shape pairs with no live line,
-  or with a live line equal to an outline line left unpaired, a secret
-  line was edited beyond it, and every live line paired with
-  nothing is printed as `<mox:redacted-line>`. A live file that may hold a
+  JSON-escaped, TOML- or YAML-quoted. Every live line of such a file
+  paired with nothing, a line the user added or edited, is printed as
+  `<mox:redacted-line>`, so a value in it that no shape or resolved value
+  finds (`#token=OLD` beside a new `token=mine`, with `OLD` rotated away)
+  is not printed. A live file that may hold a
   secret and whose provenance is missing or records no outline is masked by
   the current render's outline when that render reproduces what the last
   apply wrote, and is otherwise not shown; diff says so and that `mox apply`

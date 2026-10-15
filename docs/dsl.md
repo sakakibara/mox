@@ -336,7 +336,9 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   diff` masks it on both sides. For a file it writes a secret into, apply
   records the file's outline: each line as written, a line holding a secret
   by the text around the secret. It masks a live or displaced line that
-  pairs with a secret line's shape at the secret's place (see `mox diff` in
+  pairs with a secret line's shape at the secret's place, and diff prints
+  a live line of the file that pairs with no line of the outline, one you
+  added or edited, as `<mox:redacted-line>` (see `mox diff` in
   commands.md). The file's record also keeps a sha256 of the whole file as
   written, which lets someone holding the state and the rest of the file
   test guesses of a short secret. Masking a secret you have since removed

@@ -789,53 +789,61 @@ matches it, searched from the line after the one the entry before it pairs
 with and then from the start, so a secret line that moved is still found. A
 live line paired with a shape is printed with the spans between its pieces
 replaced by `<mox:redacted-secret>`, and one paired with an outline line as
-it is. When a shape pairs with no live line, a secret line was changed
-beyond its shape and its value may be anywhere: every live line paired with
-nothing is printed as `<mox:redacted-line>`; so is it when a shape pairs
-with a live line equal to an outline line left unpaired, which took that
-line's place. Otherwise a line paired with nothing is masked at the spans of
-every shape of the outline it matches. Pairing is bounded: past 1024 edits
-the line diff's pairs are dropped and every shape is paired the second way,
-and past 64 Mi line comparisons pairing stops and the file is treated as one
-whose secret line is lost. Every value the current render of any managed
-file resolves (diff renders them all before it prints) is masked on both
-sides wherever it occurs, as it is written and in each form mox writes it in
-(JSON-escaped, TOML- and YAML-quoted, and each line of a value of several
-lines). The composed side is masked at the secrets its own render placed. A
-live file that may hold a resolved secret (its source resolves one, its
-record was written for one, or its provenance names one) whose provenance is
-missing or records no outline is masked by this render's outline when the
-render reproduces what the last apply wrote, and is otherwise not shown:
-stderr says so, and that `mox apply` records what diff needs, or, for a file
-with edits, `mox apply --overwrite <path>`, which writes it again and keeps
-the edits in a snapshot. What a snapshot keeps of content apply displaces is
-masked by the same pairing, whatever displaces it (an overwrite, a removal,
-`mox remove --purge`, a rollback's own history): a line paired with a shape
-is masked at its slots, and when a shape pairs with no line, every line
-paired with nothing is kept as `<mox:redacted-line>`, which rollback puts
-back, saying how many lines of the file were not kept, when the copy holds
-no `<mox:redacted-secret>` (one that does, it refuses). Every value the run
+it is. In a file that may hold a resolved secret (its outline records one,
+its source resolves one, or its record was written for one), every live line
+paired with nothing, a line you added or edited, is printed as
+`<mox:redacted-line>`: it may hold a value no shape finds, as `#token=OLD`
+does beside a new `token=mine` once `OLD` is rotated away. A secret line is
+lost when its shape pairs with no live line, changed beyond its shape so
+that its value may be anywhere, or pairs with a live line equal to an
+outline line left unpaired, which took that line's place. Pairing is
+bounded: past 1024 edits the line diff's pairs are dropped and every shape
+is paired the second way, and past 64 Mi line comparisons pairing stops and
+the file is treated as one whose secret line is lost. Every value the
+current render of any managed file resolves (diff renders them all before it
+prints) is masked on both sides wherever it occurs, as it is written and in
+each form mox writes it in (JSON-escaped, TOML- and YAML-quoted, and each
+line of a value of several lines). The composed side is masked at the
+secrets its own render placed. A live file that may hold a resolved secret
+(its source resolves one, its record was written for one, or its provenance
+names one) whose provenance is missing or records no outline is masked by
+this render's outline when the render reproduces what the last apply wrote,
+and is otherwise not shown: stderr says so, and that `mox apply` records
+what diff needs, or, for a file with edits, `mox apply --overwrite <path>`,
+which writes it again and keeps the edits in a snapshot. What a snapshot
+keeps of content apply displaces is masked by the same pairing, whatever
+displaces it (an overwrite, a removal, `mox remove --purge`, a rollback's
+own history): a line paired with a shape is masked at its slots, a line
+paired with nothing is masked at the spans of every shape of the outline it
+matches, and when a secret line is lost, every line paired with nothing is
+kept as `<mox:redacted-line>`, which rollback puts back, saying how many
+lines of the file were not kept, when the copy holds no
+`<mox:redacted-secret>` (one that does, it refuses). Every value the run
 resolved that sits in a paired slot, and every value the file's new render
-wrote, is masked wherever it occurs; any other line is kept as it is. A file
-whose provenance names secret lines but records no outline has the lines at
-the positions it names masked whole, and one whose provenance is missing
-while its record was written for a secret has every line masked. A file
-whose source left the tree, which apply would remove, shows its live content
-on the removed side, and such a symlink the line `symlink -> <target>`, as
-does an unedited file of a generator that left the tree; a file that does
-not parse in its format is an `ERROR` line on stderr, as apply reports it.
-Read-only: it takes no writer lock, only the readers lock. A difference is
-not an error, so a run that completes exits 0 whether or not anything
-differs. An `attributes.toml`, the repo's or the private layer's, that is
-not valid TOML or cannot be read stops the run with exit 2, as it does in
-every command that reads attributes (add, apply, commit, doctor, edit,
-export, facts, mv, remove and status); rollback warns instead. A refusal
-exits 1: a path that is not managed, a head ownership declaration that does
-not parse, and an attributes entry that breaks the schema, with or without a
-source. A file's own `ERROR` that does not come from an attributes file -- a
-head directive on an unstructured target, one spelled with another file's
-comment marker, a mox directive in strict JSON, or a layer or output that
-does not parse -- is reported and the run still exits 0.
+wrote, is masked wherever it occurs; any other line is kept as it is, so
+rollback puts back the lines you edited. While no secret line is lost, a
+line you edited that holds a value the run neither wrote into the file nor
+resolved into one of its paired secret lines is kept with that value in the
+snapshot, in the state directory. A file whose provenance names secret lines
+but records no outline has the lines at the positions it names masked whole,
+and one whose provenance is missing while its record was written for a
+secret has every line masked. A file whose source left the tree, which apply
+would remove, shows its live content on the removed side, and such a symlink
+the line `symlink -> <target>`, as does an unedited file of a generator that
+left the tree; a file that does not parse in its format is an `ERROR` line
+on stderr, as apply reports it. Read-only: it takes no writer lock, only the
+readers lock. A difference is not an error, so a run that completes exits 0
+whether or not anything differs. An `attributes.toml`, the repo's or the
+private layer's, that is not valid TOML or cannot be read stops the run with
+exit 2, as it does in every command that reads attributes (add, apply,
+commit, doctor, edit, export, facts, mv, remove and status); rollback warns
+instead. A refusal exits 1: a path that is not managed, a head ownership
+declaration that does not parse, and an attributes entry that breaks the
+schema, with or without a source. A file's own `ERROR` that does not come
+from an attributes file -- a head directive on an unstructured target, one
+spelled with another file's comment marker, a mox directive in strict JSON,
+or a layer or output that does not parse -- is reported and the run still
+exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |

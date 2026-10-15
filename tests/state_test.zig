@@ -1508,7 +1508,7 @@ test "state: an owned record naming no canonical blob says so, doctor lists it, 
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
 
-test "diff: a secret line the last apply wrote is masked wherever it moved, and the lines around it are shown" {
+test "diff: a secret line the last apply wrote is masked wherever it moved, and the lines added around it are not shown" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1523,7 +1523,8 @@ test "diff: a secret line the last apply wrote is masked wherever it moved, and 
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 0), d.rc);
     try std.testing.expect(!contains(d.out, "tok-4c1d"));
-    try std.testing.expect(contains(d.out, "-n1\n-n2\n-n3\n"));
+    try std.testing.expect(!contains(d.out, "n1"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n-" ++ redacted_line ++ "\n-" ++ redacted_line ++ "\n"));
     try std.testing.expect(contains(d.out, "-token=" ++ mox.provenance.map.secret_redaction ++ "\n"));
 }
 
@@ -1817,7 +1818,7 @@ test "apply --overwrite: a secret line the user moved is masked in the snapshot"
     try std.testing.expect(try stateHolds(h, "token=" ++ redacted_secret ++ "\na\nz\nkept\n"));
 }
 
-test "diff: an edited secret line, a trailing comment added, is masked from its value on, and a copy in another hunk is masked by the value" {
+test "diff: an edited secret line, a trailing comment added, is masked from its value on, and the lines added in another hunk are not shown" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1833,8 +1834,9 @@ test "diff: an edited secret line, a trailing comment added, is masked from its 
     try std.testing.expect(!contains(d.out, "4c1d"));
     try std.testing.expect(contains(d.out, "-token=" ++ redacted_secret ++ "\n"));
     try std.testing.expect(contains(d.out, "+token=" ++ redacted_secret ++ "\n"));
-    try std.testing.expect(contains(d.out, "-export TOKEN=" ++ redacted_secret ++ "\n"));
-    try std.testing.expect(contains(d.out, "-q1\n"));
+    try std.testing.expect(!contains(d.out, "export"));
+    try std.testing.expect(!contains(d.out, "q1"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
 }
 
 test "diff: a value rotated behind the same reference prints neither value, and a stale file shows its removal masked" {
@@ -1897,7 +1899,7 @@ test "diff: a file that is one secret line shows none of its live lines" {
     try std.testing.expectEqual(@as(u8, 0), d.rc);
     try std.testing.expect(!contains(d.out, "4c1d"));
     try std.testing.expect(!contains(d.out, "note"));
-    try std.testing.expect(contains(d.out, "-" ++ redacted_secret ++ "\n-" ++ redacted_secret ++ "\n+plain\n"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_secret ++ "\n-" ++ redacted_line ++ "\n+plain\n"));
 }
 
 test "diff: a secret line edited beyond its shape leaves no unrecognized live line in clear" {
@@ -2198,6 +2200,49 @@ test "diff and apply --overwrite: a secret line edited beyond its shape is not s
     try std.testing.expect(!try stateHolds(h, "OLDSECRET1"));
 }
 
+test "diff: a secret line commented out beside a new line of its shape prints neither line's value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "OLDSECRET1");
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/rc.txt", try std.fmt.allocPrint(a, "a\ntoken={s}\nz\n", .{s.ref}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try rotate(io, s.path, "NEWSECRET2");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("rc.txt"), .data = "a\n#token=OLDSECRET1\ntoken=mine\nz\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "OLDSECRET1"));
+    try std.testing.expect(!contains(d.out, "NEWSECRET2"));
+    try std.testing.expect(!contains(d.out, "mine"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
+    try std.testing.expect(contains(d.out, "-token=" ++ redacted_secret ++ "\n"));
+}
+
+test "diff: an edited line no secret was written into is not shown in a secret-bearing file, and a clean one shows nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "OLDSECRET1");
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/rc.txt", try std.fmt.allocPrint(a, "a\ntoken={s}\nz\n", .{s.ref}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const clean = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), clean.rc);
+    try std.testing.expectEqualStrings("", clean.out);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("rc.txt"), .data = "a\ntoken=OLDSECRET1\nedited\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "edited"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n+z\n"));
+}
+
 test "diff: two secret lines of one shape under two INI sections, one edited beyond it, fail closed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2242,7 +2287,7 @@ test "diff: a YAML list of secrets with one item gone and its value moved elsewh
     try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
 }
 
-test "diff and apply --overwrite: a secret line moved below the lines around it is still recognized, and the other lines are shown and kept" {
+test "diff and apply --overwrite: a secret line moved below the lines around it is still recognized, and a line added is not shown but is kept" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2258,8 +2303,8 @@ test "diff and apply --overwrite: a secret line moved below the lines around it 
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 0), d.rc);
     try std.testing.expect(!contains(d.out, "MOVED"));
-    try std.testing.expect(!contains(d.out, redacted_line));
-    try std.testing.expect(contains(d.out, "-added\n"));
+    try std.testing.expect(!contains(d.out, "added"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
     try std.testing.expect(contains(d.out, "-token=" ++ redacted_secret ++ "\n"));
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
     try std.testing.expect(!try stateHolds(h, "MOVED"));
