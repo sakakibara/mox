@@ -1426,16 +1426,19 @@ so a lock it cannot take stops it with nothing removed. `mox.lock`,
 `readers.lock` and `readers.gate`, the lock files, are kept and listed as
 kept, whatever the flags. Only the entries mox makes in the state directory
 are removed (its stores, `bin/`, `coupling/`, `commit-recovery/`,
-`mox-path`, `triggers.txt`, `zypper.txt`, a check hook's leftover `check-*`,
-and `private/` with `--purge-private`); any other entry is listed as kept,
-"not made by mox", and never followed or removed. `bin/` and `trash/` are
-names a home directory holds too, so each is mox's only while it is a
-directory holding nothing but what mox puts there: in `bin/` the link to (on
-Windows, the copy of) the running `mox`, and in `trash/` the directories
-named by run id. The package managers' scratch files (a child's stdin,
-winget's export, a bootstrap's installer) are not in the state directory:
-each call stages them in a directory of its own, 0700, under the system's
-temp directory (`TMPDIR`, else `/tmp`; on Windows `TEMP`, else `TMP`), and
+`mox-path`, `triggers.txt`, `zypper.txt`, a check hook's leftover `check-<16
+hex>` directory and its `.out` capture, and `private/` with
+`--purge-private`); any other entry is listed as kept, "not made by mox",
+and never followed or removed. `bin/` and `trash/` are names a home
+directory holds too, so each is mox's only while it is a directory holding
+nothing but what mox puts there: in `bin/` the link to (on Windows, the copy
+of) the running `mox`, and in `trash/` the directories named by run id. That
+rule decides only what uninstall removes: `mox remove` still makes its own
+`trash/<id>/` in a `trash/` that holds other entries, and deletes nothing
+there. The package managers' scratch files (a child's stdin, winget's
+export, a bootstrap's installer) are not in the state directory: each call
+stages them in a directory of its own, 0700, under the system's temp
+directory (`TMPDIR`, else `/tmp`; on Windows `TEMP`, else `TMP`), and
 removes it when the call is done. `v2/` is mox's only while it holds nothing
 but the entries mox makes in it. One holding anything else, beyond the files
 a file browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`), is kept
