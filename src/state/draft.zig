@@ -32,15 +32,15 @@ pub const store_dir_name = "v2";
 pub const max_provenance_bytes: usize = 32 * 1024 * 1024;
 
 /// The provenance of a secret-bearing `content`, or, when that would be
-/// longer than `cap`, one that names every line a secret line of the
-/// whole-line shape: diff then masks every live line, and a snapshot every
-/// line, of the file.
-pub fn boundedProvenance(arena: std.mem.Allocator, live: []const u8, content: []const u8, segments: []const prov_map.Segment, shapes: []const prov_map.Shape, cap: usize) ![]u8 {
-    const full = try prov_map.serialize(arena, live, segments, shapes);
+/// longer than `cap`, one that names every line a secret line, with an
+/// outline of the one whole-line shape: diff then masks every live line,
+/// and a snapshot every line, of the file.
+pub fn boundedProvenance(arena: std.mem.Allocator, live: []const u8, content: []const u8, segments: []const prov_map.Segment, outline: []const prov_map.Entry, cap: usize) ![]u8 {
+    const full = try prov_map.serialize(arena, live, segments, outline);
     if (full.len <= cap) return full;
     const n = prov_map.lineCount(content);
     const coarse = [_]prov_map.Segment{.{ .out_start = 0, .out_len = @max(n, 1), .origin = .secret }};
-    return prov_map.serialize(arena, live, &coarse, &.{prov_shapes.whole_line});
+    return prov_map.serialize(arena, live, &coarse, &.{.{ .shape = prov_shapes.whole_line }});
 }
 
 /// A file as this run composed it: its bytes and their provenance.
@@ -258,25 +258,28 @@ pub const Draft = struct {
     }
 
     /// `content`, what was at `live` before this run replaces it, as a
-    /// snapshot keeps it. Every line that matches a shape of a line the last
-    /// apply wrote a secret into is masked at its slots, and, when this run
-    /// rendered the file anew (`render`), every value that render wrote is
-    /// masked wherever it occurs. Any other line is kept as it is. When the
-    /// provenance names secret lines but records no shapes, or is missing for
-    /// a record written for a secret, every line is masked: the values the
-    /// file was written with are not known.
+    /// snapshot keeps it. Paired with the outline the last apply wrote the
+    /// file with, each line that pairs with a secret line's shape is masked at
+    /// its slots, and, when a secret line pairs with none, every line paired
+    /// with nothing is replaced whole. Every value this run resolved that sits
+    /// in a paired slot, and, when this run rendered the file anew (`render`),
+    /// every value that render wrote, is masked wherever it occurs. When the
+    /// provenance names secret lines but holds no outline, the lines at the
+    /// positions it names are replaced whole; when it is missing for a record
+    /// written for a secret, every line is: the values the file was written
+    /// with are not known.
     pub fn redactPrior(d: *Draft, live: []const u8, content: []const u8, render: ?Render) ![]const u8 {
         const all = if (d.secrets) |c| try c.values(d.arena) else &.{};
         const values = if (render) |r| try prov_shapes.renderValues(d.arena, r.bytes, r.segments, all) else &.{};
-        const forms = try prov_shapes.writtenForms(d.arena, values);
-        const whole: []const prov_map.Shape = &.{prov_shapes.whole_line};
-        const shapes: []const prov_map.Shape = if (try d.provenance(live)) |m|
-            m.secretShapes() orelse whole
-        else if (d.fileRecord(live)) |f|
-            (if (f.cache_blob == null) whole else &.{})
-        else
-            &.{};
-        return prov_shapes.redact(d.arena, content, shapes, forms);
+        if (try d.provenance(live)) |m| {
+            if (m.secretOutline()) |outline| return prov_shapes.redactStored(d.arena, content, outline, all, values);
+            return prov_shapes.redactAt(d.arena, content, m.segments, try prov_shapes.writtenForms(d.arena, values));
+        }
+        if (d.fileRecord(live)) |f| if (f.cache_blob == null) {
+            const whole = [_]prov_map.Segment{.{ .out_start = 0, .out_len = std.math.maxInt(u32), .origin = .secret }};
+            return prov_shapes.redactAt(d.arena, content, &whole, .none);
+        };
+        return prov_shapes.redactStored(d.arena, content, &.{}, &.{}, values);
     }
 
     /// The generator at `gen_live`'s produced set.
@@ -420,8 +423,7 @@ pub const Draft = struct {
     }
 
     /// Keep `segments` as where each line of `content`, the bytes written
-    /// to `live`, came from, with the shapes of its secret lines when a
-    /// segment is a secret.
+    /// to `live`, came from, with its outline when a segment is a secret.
     /// A provenance with no secret segment that would be longer than
     /// `max_provenance_bytes` is not kept: `live` then has none.
     pub fn persistProvenance(d: *Draft, live: []const u8, content: []const u8, segments: []const prov_map.Segment) !void {
@@ -435,7 +437,7 @@ pub const Draft = struct {
             return if (bytes.len <= max_provenance_bytes) bytes else null;
         }
         const values = try (d.secrets orelse return error.SecretValuesUnknown).values(d.arena);
-        return try boundedProvenance(d.arena, live, content, segments, try prov_shapes.shapesOf(d.arena, content, segments, values), max_provenance_bytes);
+        return try boundedProvenance(d.arena, live, content, segments, try prov_shapes.outlineOf(d.arena, content, segments, values), max_provenance_bytes);
     }
 
     pub fn persistProvenanceBlob(d: *Draft, live: []const u8, h: Hex) !void {
@@ -1042,15 +1044,19 @@ test "boundedProvenance: one longer than the cap becomes a whole-file secret of 
         try segs.append(a, .{ .out_start = i, .out_len = 1, .origin = if (i % 2 == 0) .secret else .{ .base = .{ .line = i + 1 } } });
         try content.appendSlice(a, if (i % 2 == 0) "token=v\n" else "plain\n");
     }
-    const shapes = try prov_shapes.shapesOf(a, content.items, segs.items, &.{"v"});
-    const full = try prov_map.serialize(a, "/h/f", segs.items, shapes);
+    const outline = try prov_shapes.outlineOf(a, content.items, segs.items, &.{"v"});
+    const full = try prov_map.serialize(a, "/h/f", segs.items, outline);
     const cap = full.len - 1;
-    const bounded = try boundedProvenance(a, "/h/f", content.items, segs.items, shapes, cap);
+    const bounded = try boundedProvenance(a, "/h/f", content.items, segs.items, outline, cap);
     try std.testing.expect(bounded.len <= cap);
     const m = try prov_map.deserialize(a, bounded);
     try std.testing.expectEqual(@as(usize, 1), m.segments.len);
     try std.testing.expectEqual(@as(u32, 2000), m.segments[0].out_len);
     try std.testing.expect(m.segments[0].origin == .secret);
-    try std.testing.expect(m.secretShapes().?[0].wholeLine());
-    try std.testing.expectEqualStrings(full, try boundedProvenance(a, "/h/f", content.items, segs.items, shapes, full.len));
+    try std.testing.expectEqual(@as(usize, 1), m.secretOutline().?.len);
+    try std.testing.expect(m.secretOutline().?[0].shape.wholeLine());
+    const kept = try prov_shapes.redactStored(a, content.items, m.secretOutline().?, &.{}, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, kept, "plain") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "token") == null);
+    try std.testing.expectEqualStrings(full, try boundedProvenance(a, "/h/f", content.items, segs.items, outline, full.len));
 }

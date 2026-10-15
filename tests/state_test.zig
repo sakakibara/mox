@@ -2100,6 +2100,202 @@ test "remove --purge: a FIFO at the live path is removed without being read, and
     try std.testing.expect(r.rc <= 1);
 }
 
+/// A harness whose source resolves `<secret:file://{root}/sec>`, the file
+/// holding `value`; `rotate` rewrites it.
+fn withSecretFile(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, value: []const u8) !struct { h: Harness, ref: []const u8, path: []const u8 } {
+    const h = try setup(a, io, tmp);
+    const path = try std.fs.path.join(a, &.{ h.root, "sec" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = value });
+    return .{ .h = h, .ref = try std.fmt.allocPrint(a, "<secret:file://{s}>", .{path}), .path = path };
+}
+
+fn rotate(io: Io, path: []const u8, value: []const u8) !void {
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = value });
+}
+
+test "diff: a secret line edited beyond its shape fails closed although another line holds its prefix, and neither value is printed" {
+    const io = std.testing.io;
+    for ([_][]const u8{ "db_token=public", "other=public" }) |first| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const s = try withSecretFile(a, io, &tmp, "OLDSECRET1");
+        const h = s.h;
+        try writeRepo(io, &tmp, "repo/src/.app.conf", try std.fmt.allocPrint(a, "{s}\ntoken={s}\n", .{ first, s.ref }));
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try rotate(io, s.path, "NEWSECRET2");
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".app.conf"), .data = try std.fmt.allocPrint(a, "{s}\ntoken = OLDSECRET1\n", .{first}) });
+        const d = try h.run(&.{ "mox", "diff" });
+        try std.testing.expectEqual(@as(u8, 0), d.rc);
+        try std.testing.expect(!contains(d.out, "OLDSECRET1"));
+        try std.testing.expect(!contains(d.out, "NEWSECRET2"));
+        try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
+        try std.testing.expect(contains(d.out, "+token=" ++ redacted_secret ++ "\n"));
+    }
+}
+
+test "apply --overwrite and remove --purge: a secret line edited beyond its shape, its value rotated, is not kept in the snapshot" {
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |purge| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const s = try withSecretFile(a, io, &tmp, "OLDSECRET1");
+        const h = s.h;
+        try writeRepo(io, &tmp, "repo/src/.app.conf", try std.fmt.allocPrint(a, "other=public\ntoken={s}\n", .{s.ref}));
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        try rotate(io, s.path, "NEWSECRET2");
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".app.conf"), .data = "other=public\ntoken = OLDSECRET1\n" });
+        if (purge) {
+            try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", "--purge", ".app.conf" })).rc);
+        } else {
+            try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+        }
+        try std.testing.expect(!try stateHolds(h, "OLDSECRET1"));
+        try std.testing.expect(!try stateHolds(h, "NEWSECRET2"));
+        try std.testing.expect(try stateHolds(h, "other=public\n" ++ redacted_line ++ "\n"));
+    }
+}
+
+test "remove --purge: a secret line whose CRLF the user changed to LF is not kept in the snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "CRLFSECRET" }});
+    try writeRepo(io, &tmp, "repo/src/.app.conf", "other=public\r\ntoken=<secret:env:MOX_TEST_TOKEN>\r\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expect(contains(try read(io, a, try h.liveOf(".app.conf")), "token=CRLFSECRET\r\n"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".app.conf"), .data = "other=public\ntoken=CRLFSECRET\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", "--purge", ".app.conf" })).rc);
+    try std.testing.expect(!try stateHolds(h, "CRLFSECRET"));
+}
+
+test "diff: two secret lines of one shape under two INI sections, one edited beyond it, fail closed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "AAAOLDVALUE");
+    const h = s.h;
+    const b_path = try std.fs.path.join(a, &.{ h.root, "sec-b" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = b_path, .data = "BBBVALUE" });
+    try writeRepo(io, &tmp, "repo/src/app.ini", try std.fmt.allocPrint(a, "[a]\ntoken = {s}\n[b]\ntoken = <secret:file://{s}>\n", .{ s.ref, b_path }));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try rotate(io, s.path, "AAANEWVALUE");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("app.ini"), .data = "[a]\ntoken: AAAOLDVALUE\n[b]\ntoken = BBBVALUE\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "AAA"));
+    try std.testing.expect(!contains(d.out, "BBB"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
+}
+
+test "diff: a YAML list of secrets with one item gone and its value moved elsewhere fails closed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "KEYONEOLD");
+    const h = s.h;
+    const two = try std.fs.path.join(a, &.{ h.root, "sec-2" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = two, .data = "KEYTWO" });
+    try writeRepo(io, &tmp, "repo/src/keys.yaml", try std.fmt.allocPrint(a, "keys:\n  - {s}\n  - <secret:file://{s}>\nname: x\n", .{ s.ref, two }));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try rotate(io, s.path, "KEYONENEW");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("keys.yaml"), .data = "keys:\n  - KEYTWO\nname: x\nbackup: KEYONEOLD\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "KEYONE"));
+    try std.testing.expect(!contains(d.out, "KEYTWO"));
+    try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
+}
+
+test "diff and apply --overwrite: a secret line moved below the lines around it is still recognized, and the other lines are shown and kept" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "MOVEDOLD");
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/.cfg", try std.fmt.allocPrint(a, "a\ntoken={s}\nz\n", .{s.ref}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try rotate(io, s.path, "MOVEDNEW");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\nz\nadded\ntoken=MOVEDOLD\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "MOVED"));
+    try std.testing.expect(!contains(d.out, redacted_line));
+    try std.testing.expect(contains(d.out, "-added\n"));
+    try std.testing.expect(contains(d.out, "-token=" ++ redacted_secret ++ "\n"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expect(!try stateHolds(h, "MOVED"));
+    try std.testing.expect(try stateHolds(h, "a\nz\nadded\ntoken=" ++ redacted_secret ++ "\n"));
+}
+
+test "rollback: a snapshot whose lines were not kept because a secret line had changed says how many" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "OLDSECRET1");
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/.app.conf", try std.fmt.allocPrint(a, "other=public\ntoken={s}\n", .{s.ref}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try rotate(io, s.path, "NEWSECRET2");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".app.conf"), .data = "other=public\ntoken = OLDSECRET1\nnote = mine\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    try std.testing.expect(contains(rb.out, "2 line(s) were not kept"));
+    try std.testing.expectEqualStrings("other=public\n" ++ redacted_line ++ "\n" ++ redacted_line ++ "\n", try read(io, a, try h.liveOf(".app.conf")));
+}
+
+test "apply --overwrite: a record whose provenance holds no outline masks the lines at the secret's recorded positions" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "UNOUTLINEDOLD");
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/.cfg", try std.fmt.allocPrint(a, "a\ntoken={s}\nz\n", .{s.ref}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    raced_state = h.state;
+    try editCurrent(h, struct {
+        fn unrecorded(arena_: std.mem.Allocator, g: *mox.state.generation.Generation, p: []const u8) !void {
+            const segments = [_]mox.provenance.map.Segment{
+                .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+                .{ .out_start = 1, .out_len = 1, .origin = .secret },
+                .{ .out_start = 2, .out_len = 1, .origin = .{ .base = .{ .line = 3 } } },
+            };
+            const bytes = try mox.provenance.map.serialize(arena_, p, &segments, null);
+            const store = try mox.state.Store.init(arena_, raced_state);
+            g.paths.getPtr(p).?.file.?.provenance_blob = try mox.state.blob.put(arena_, std.testing.io, store.blobs, bytes);
+        }
+    }.unrecorded, try h.liveOf(".cfg"));
+    try rotate(io, s.path, "UNOUTLINEDNEW");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\ntoken = UNOUTLINEDOLD\nz\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expect(!try stateHolds(h, "UNOUTLINED"));
+    try std.testing.expect(try stateHolds(h, "a\n" ++ redacted_secret ++ "\nz\n"));
+}
+
 /// Fails the test run, rather than letting it hang, when the test does not
 /// stop it within `seconds`.
 const Watchdog = struct {

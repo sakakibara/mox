@@ -106,19 +106,26 @@ All notable changes to mox are documented here. The format follows
   `export`, `doctor`) can now be refused, with exit 2, when `readers.lock`
   cannot be opened, naming the file and what to do.
 - `mox diff` masks a secret in a live line wherever the line now sits:
-  apply records, in the file's provenance, the shape of each line it wrote
-  a secret into -- the text of the line around the secret -- and nothing
-  derived from the value. A live line with a recorded shape is printed with
-  the secret's place shown as `<mox:redacted-secret>`, and every value the
-  current render of any managed file resolves is masked wherever it
-  occurs, as written and JSON-escaped, TOML- or YAML-quoted. When a shape matches no live line, a
-  secret line was edited beyond it, and every live line diff cannot tell
-  apart from the composed output's lines that hold no secret is printed as
-  `<mox:redacted-line>`. A live file that may hold a secret and whose
-  provenance is missing or records no shapes is masked by the current
-  render's shapes when that render reproduces what the last apply wrote, and
-  is otherwise not shown; diff says so and that `mox apply` (or `mox apply
-  --overwrite <path>` for a file with edits) records what it needs.
+  for a file it wrote a secret into, apply records the file's outline in
+  its provenance -- each line as written, a line holding a secret by its
+  shape, the text around the secret. diff pairs the live file with the
+  outline as a line diff pairs two files, a shape with a live line that
+  starts with its first piece, ends with its last and holds the others in
+  order, then a shape left with the nearest live line left that matches
+  it. A line paired with a shape is printed with the secret's place shown
+  as `<mox:redacted-secret>`, and every value the current render of any
+  managed file resolves is masked wherever it occurs, as written and
+  JSON-escaped, TOML- or YAML-quoted. When a shape pairs with no live line,
+  a secret line was edited beyond it, and every live line paired with
+  nothing is printed as `<mox:redacted-line>`. A live file that may hold a
+  secret and whose provenance is missing or records no outline is masked by
+  the current render's outline when that render reproduces what the last
+  apply wrote, and is otherwise not shown; diff says so and that `mox apply`
+  (or `mox apply --overwrite <path>` for a file with edits) records what it
+  needs. Beside the outline, the file's record keeps a sha256 of the whole
+  file as written, and a partially owned file's record one of its owned
+  keys' canonical text when they hold a secret: someone holding the state
+  and the rest of the file can test guesses of a short secret against it.
 - An owned target whose record lost its canonical text is an `ERROR` in
   `status`, `diff`, `commit` and `apply`, naming the missing blob, or "no
   canonical blob recorded", and the remedy `mox apply --overwrite <path>`,
@@ -301,13 +308,18 @@ All notable changes to mox are documented here. The format follows
   release's history.
 
 ### Fixed
-- A snapshot of a file mox wrote a secret into masks the secret by the
-  shape of its line, wherever the line has moved, and masks every value the
-  file's new render wrote wherever it occurs; any other line is kept as it
-  is. It used to mask the lines at the places the last apply wrote secrets
-  to, so a secret line the user had moved was kept in clear and the line
-  now in its place was masked. A file whose provenance is missing, or
-  records no shapes, has every line of its snapshot masked.
+- A snapshot of a file mox wrote a secret into masks the secret by
+  pairing the file with the outline the last apply recorded, as diff does:
+  a line paired with a secret line's shape is masked at the secret's place,
+  wherever the line has moved, and every value the file's new render wrote,
+  or the run resolved and found in a paired secret line, is masked wherever
+  it occurs. When a secret line pairs with no line, every line paired with
+  nothing is kept as `<mox:redacted-line>`, and rollback says how many
+  lines of the file it did not keep. It used to mask the lines at the
+  places the last apply wrote secrets to, so a secret line the user had
+  moved was kept in clear and the line now in its place was masked. A file
+  whose provenance records no outline has the lines at those places masked
+  as before, and one whose provenance is missing every line.
 - `mox remove --purge` masks the secrets of the file it removes in its
   snapshot; it kept them in clear. A FIFO or device at the path is removed
   without being opened; the run used to wait on it forever.

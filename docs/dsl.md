@@ -333,18 +333,21 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   echoes the value; an empty `<secret:>` is rejected up front. A resolved
   secret never reaches disk or the terminal: its value is kept out of the
   content mox keeps of what it applied and of what it displaced, and `mox
-  diff` masks it on both sides. mox stores nothing derived from the value:
-  apply records only the shape of each line it wrote one into, the text
-  around the secret, and masks a live or displaced line that has that shape
-  at the secret's place (see `mox diff` in commands.md). Masking a secret
-  you have since removed relies on that file's stored provenance; when it
-  is missing, diff does not show that file's live content at all.
-  A live file that resolves an `op://` or `pass://` secret is applied at mode
-  0600 automatically (dedicated secret managers hold only secrets, so this is
-  never a false positive), unless `.mox/attributes.toml` sets an explicit mode.
-  The ambiguous schemes (`env:`, `file://`, `cmd:` -- the last often a non-secret
-  value like a computed theme name) are left at their composed mode; mark one
-  `mode = "0600"` in `.mox/attributes.toml` when it is sensitive.
+  diff` masks it on both sides. For a file it writes a secret into, apply
+  records the file's outline: each line as written, a line holding a secret
+  by the text around the secret. It masks a live or displaced line that
+  pairs with a secret line's shape at the secret's place (see `mox diff` in
+  commands.md). The file's record also keeps a sha256 of the whole file as
+  written, which lets someone holding the state and the rest of the file
+  test guesses of a short secret. Masking a secret you have since removed
+  relies on that file's stored provenance; when it is missing, diff does not
+  show that file's live content at all. A live file that resolves an `op://`
+  or `pass://` secret is applied at mode 0600 automatically (dedicated
+  secret managers hold only secrets, so this is never a false positive),
+  unless `.mox/attributes.toml` sets an explicit mode. The ambiguous schemes
+  (`env:`, `file://`, `cmd:` -- the last often a non-secret value like a
+  computed theme name) are left at their composed mode; mark one `mode =
+  "0600"` in `.mox/attributes.toml` when it is sensitive.
 
 Captures must not be adjacent (`<a><b>`) and a name must not repeat within one
 template; both are compose-time errors. A malformed `data.` capture (`<data.x>`

@@ -60,20 +60,23 @@ pub const Segment = struct {
 pub const Map = struct {
     live_path: []const u8,
     segments: []const Segment,
-    /// The shapes of the lines a secret was written into, or null when the map
-    /// has secret segments but was written without them.
-    shapes: ?[]const Shape = null,
+    /// The outline of the file when a secret was written into it: every
+    /// line, a secret line by its shape and any other as written. Null when
+    /// the map has no secret segment, or names secret lines and records no
+    /// outline, as only a damaged store holds it.
+    outline: ?[]const Entry = null,
 
-    /// The secret line shapes, or null when the map names secret lines it
-    /// recorded none for.
-    pub fn secretShapes(m: Map) ?[]const Shape {
-        if (m.shapes) |s| return s;
+    /// The secret outline, or null when the map names secret lines it
+    /// recorded none for. Empty for a map with no secret segment.
+    pub fn secretOutline(m: Map) ?[]const Entry {
+        if (m.outline) |o| return o;
         if (!hasSecret(m.segments)) return &.{};
         return null;
     }
 };
 
 pub const Shape = shapes_mod.Shape;
+pub const Entry = shapes_mod.Entry;
 
 /// Return the single segment fully containing the output-line range
 /// `[a_start, a_start + a_len)`. A zero-length range (pure insertion) is
@@ -171,8 +174,9 @@ pub const line_redaction = "<mox:redacted-line>";
 const version: i128 = 1;
 
 /// Serialize a provenance map to versioned JSON bytes (arena-owned).
-/// `secret_shapes` is written only when a segment is a secret.
-pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []const Segment, secret_shapes: ?[]const Shape) ![]u8 {
+/// `secret_outline` is written only when a segment is a secret: a line as a
+/// string, a secret line's shape as an array of its pieces.
+pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []const Segment, secret_outline: ?[]const Entry) ![]u8 {
     const seg_values = try arena.alloc(json.Value, segments.len);
     for (segments, 0..) |seg, i| seg_values[i] = try segmentToJson(arena, seg);
 
@@ -180,14 +184,17 @@ pub fn serialize(arena: std.mem.Allocator, live_path: []const u8, segments: []co
     try root.put(arena, "v", .{ .integer = version });
     try root.put(arena, "live_path", .{ .string = live_path });
     try root.put(arena, "segments", .{ .array = seg_values });
-    if (secret_shapes) |all| if (hasSecret(segments)) {
+    if (secret_outline) |all| if (hasSecret(segments)) {
         const arr = try arena.alloc(json.Value, all.len);
-        for (all, arr) |shape, *out| {
-            const pieces = try arena.alloc(json.Value, shape.pieces.len);
-            for (shape.pieces, pieces) |p, *o| o.* = .{ .string = p };
-            out.* = .{ .array = pieces };
-        }
-        try root.put(arena, "secret_shapes", .{ .array = arr });
+        for (all, arr) |entry, *out| switch (entry) {
+            .line => |l| out.* = .{ .string = l },
+            .shape => |shape| {
+                const pieces = try arena.alloc(json.Value, shape.pieces.len);
+                for (shape.pieces, pieces) |p, *o| o.* = .{ .string = p };
+                out.* = .{ .array = pieces };
+            },
+        };
+        try root.put(arena, "secret_outline", .{ .array = arr });
     };
 
     var aw: Io.Writer.Allocating = .init(arena);
@@ -249,19 +256,23 @@ pub fn deserialize(arena: std.mem.Allocator, bytes: []const u8) ParseError!Map {
 
     var out = try arena.alloc(Segment, segs_v.array.len);
     for (segs_v.array, 0..) |sv, i| out[i] = try segmentFromJson(arena, sv);
-    return .{ .live_path = try arena.dupe(u8, live), .segments = out, .shapes = try shapesFromJson(arena, v.get("secret_shapes")) };
+    return .{ .live_path = try arena.dupe(u8, live), .segments = out, .outline = try outlineFromJson(arena, v.get("secret_outline")) };
 }
 
-fn shapesFromJson(arena: std.mem.Allocator, v: ?json.Value) ParseError!?[]const Shape {
+fn outlineFromJson(arena: std.mem.Allocator, v: ?json.Value) ParseError!?[]const Entry {
     const val = v orelse return null;
     if (val != .array) return error.InvalidProvenance;
-    const out = try arena.alloc(Shape, val.array.len);
-    for (val.array, out) |sv, *o| {
-        if (sv != .array or sv.array.len < 2) return error.InvalidProvenance;
-        const pieces = try arena.alloc([]const u8, sv.array.len);
-        for (sv.array, pieces) |pv, *p| p.* = try arena.dupe(u8, stringOf(pv) orelse return error.InvalidProvenance);
-        o.* = .{ .pieces = pieces };
-    }
+    const out = try arena.alloc(Entry, val.array.len);
+    for (val.array, out) |ev, *o| switch (ev) {
+        .string => |l| o.* = .{ .line = try arena.dupe(u8, l) },
+        .array => |arr| {
+            if (arr.len < 2) return error.InvalidProvenance;
+            const pieces = try arena.alloc([]const u8, arr.len);
+            for (arr, pieces) |pv, *p| p.* = try arena.dupe(u8, stringOf(pv) orelse return error.InvalidProvenance);
+            o.* = .{ .shape = .{ .pieces = pieces } };
+        },
+        else => return error.InvalidProvenance,
+    };
     return out;
 }
 
@@ -412,7 +423,7 @@ test "serialize/deserialize round-trip preserves every origin kind" {
     try testing.expect(parsed.segments[6].origin == .private);
 }
 
-test "serialize/deserialize: secret shapes round-trip, and a map with secret lines written without them names none" {
+test "serialize/deserialize: a secret outline round-trips, and a map with secret lines written without one names none" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -420,10 +431,11 @@ test "serialize/deserialize: secret shapes round-trip, and a map with secret lin
         .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
         .{ .out_start = 1, .out_len = 1, .origin = .secret },
     };
-    const shapes = [_]Shape{.{ .pieces = &.{ "token=", " # c" } }};
-    const back = try deserialize(a, try serialize(a, "/h/f", &segs, &shapes));
-    try testing.expectEqual(@as(usize, 1), back.secretShapes().?.len);
-    try testing.expectEqualStrings(" # c", back.secretShapes().?[0].pieces[1]);
-    try testing.expect((try deserialize(a, try serialize(a, "/h/f", &segs, null))).secretShapes() == null);
-    try testing.expectEqual(@as(usize, 0), (try deserialize(a, try serialize(a, "/h/f", segs[0..1], null))).secretShapes().?.len);
+    const outline = [_]Entry{ .{ .line = "a = 1" }, .{ .shape = .{ .pieces = &.{ "token=", " # c" } } } };
+    const back = (try deserialize(a, try serialize(a, "/h/f", &segs, &outline))).secretOutline().?;
+    try testing.expectEqual(@as(usize, 2), back.len);
+    try testing.expectEqualStrings("a = 1", back[0].line);
+    try testing.expectEqualStrings(" # c", back[1].shape.pieces[1]);
+    try testing.expect((try deserialize(a, try serialize(a, "/h/f", &segs, null))).secretOutline() == null);
+    try testing.expectEqual(@as(usize, 0), (try deserialize(a, try serialize(a, "/h/f", segs[0..1], null))).secretOutline().?.len);
 }

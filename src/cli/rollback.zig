@@ -146,6 +146,9 @@ fn rollbackOpened(ctx: *app.Ctx, a: cli.Args(Spec), st: *mox.state.Draft) anyerr
 
     var repatched: usize = 0;
     var failed: usize = 0;
+    for (restored.partial) |p| {
+        try ctx.out.print("  {f}: {d} line(s) were not kept: a secret line had changed when the snapshot was taken, so each line it could not tell was free of the secret is {s}\n", .{ display.of(p.live_path, context.paths.home), p.lines, mox.provenance.map.line_redaction });
+    }
     for (restored.refused) |r| {
         const shown = display.of(r.live_path, context.paths.home);
         switch (r.why) {

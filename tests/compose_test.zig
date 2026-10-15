@@ -5750,8 +5750,8 @@ test "compose catA json: off the resolving path a secret capture stays its place
     try std.testing.expectEqualStrings("{\"t\": \"<SECRET:cmd:printf \\\"%s\\\" ok>\", \"o\": \"linux\"}\n", out);
 }
 
-/// `out` as a snapshot keeps it, by the shapes of its secret lines.
+/// `out` as a snapshot keeps it, by its outline.
 fn redactedByShapes(a: std.mem.Allocator, out: []const u8, prov: []const mox.provenance.map.Segment, cache: *const mox.secret.cache.Cache) ![]const u8 {
     const sh = mox.provenance.shapes;
-    return sh.redact(a, out, try sh.shapesOf(a, out, prov, try cache.values(a)), .none);
+    return sh.redactStored(a, out, try sh.outlineOf(a, out, prov, try cache.values(a)), &.{}, &.{});
 }
