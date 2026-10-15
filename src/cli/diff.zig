@@ -572,18 +572,18 @@ fn diffOne(
             .forms = forms,
             .outline = recorded,
             .pairing = try shapes.pair(ctx.alloc, recorded, a_lines),
-            .strict = hasShape(recorded) or hasSecret(prov_segments) or secretRecord(st, live_path),
+            .strict = try st.wroteSecret(live_path),
         };
         const a_shown = try shownLines(ctx.alloc, a_lines, hunks, .live, m, LiveMask.show);
         try ctx.out.writeAll(try renderFile(ctx.alloc, live_path, a_shown, b_shown, hunks, sty));
     }
 }
 
-/// The outline the live file of `live_path` was last written with: the one its
-/// provenance records, none when it records no secret line, or, when it was
-/// written without one or is missing while the file may hold a secret, this
-/// render's when it reproduces what was written. Null when none of these says
-/// where the file's secrets are.
+/// The outline the live file of `live_path` was last written with: the one
+/// its provenance records; none when mox last wrote it with no secret; or,
+/// when it was written with one but its provenance is missing, this
+/// render's when it reproduces what was written. Null when none of these
+/// says where the file's secrets are.
 fn recordedOutline(
     ctx: *app.Ctx,
     st: *State,
@@ -594,29 +594,11 @@ fn recordedOutline(
 ) !?[]const shapes.Entry {
     const prior = try st.provenance(live_path);
     if (prior) |m| if (m.secretOutline()) |o| return o;
-    const may_hold = live.len > 0 and (hasSecret(prov_segments) or secretRecord(st, live_path) or prior != null);
-    if (!may_hold) return &.{};
+    if (live.len == 0 or !try st.wroteSecret(live_path)) return &.{};
     const f = st.fileRecord(live_path) orelse return null;
-    if (!hasSecret(prov_segments) or !std.mem.eql(u8, &f.sha256, &mox.apply.applied.contentHashHex(composed_bytes))) return null;
+    if (!mox.provenance.map.hasSecret(prov_segments) or !std.mem.eql(u8, &f.sha256, &mox.apply.applied.contentHashHex(composed_bytes))) return null;
     const values = if (st.secrets) |c| try c.values(ctx.alloc) else &.{};
     return try shapes.outlineOf(ctx.alloc, composed_bytes, prov_segments, values);
-}
-
-fn hasShape(outline: []const shapes.Entry) bool {
-    for (outline) |e| if (e == .shape) return true;
-    return false;
-}
-
-fn hasSecret(segments: []const mox.provenance.map.Segment) bool {
-    for (segments) |seg| if (seg.origin == .secret) return true;
-    return false;
-}
-
-/// The whole-file record of `live_path` was written for a composition that
-/// resolved a secret: such a record keeps no content cache.
-fn secretRecord(st: *State, live_path: []const u8) bool {
-    const f = st.fileRecord(live_path) orelse return false;
-    return f.cache_blob == null;
 }
 
 /// Diff one partial file's owned subtree: canonical composed-owned vs

@@ -2122,6 +2122,48 @@ test "remove --purge: a file mox wrote a secret into is not kept, and it says so
     try std.testing.expect(contains(listed.out, ".cfg file not kept: its content held a secret\n"));
 }
 
+test "diff: a value of several lines whose first line is `{` masks no `{` in another file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    const key = try std.fs.path.join(a, &.{ h.root, "sa.json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = key, .data = "{\n  \"k\": \"v4lue-of-the-key\"\n}" });
+    try writeRepo(io, &tmp, "repo/src/a.cfg", try std.fmt.allocPrint(a, "creds=<secret:file://{s}>\n", .{key}));
+    try writeRepo(io, &tmp, "repo/src/b.sh", "f() {\n  echo hi\n}\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("b.sh"), .data = "g() {\n  echo hi\n}\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(contains(d.out, "-g() {\n"));
+    try std.testing.expect(contains(d.out, "+f() {\n"));
+    try std.testing.expect(!contains(d.out, "v4lue"));
+}
+
+test "diff: a file whose source gains its first secret shows the lines the user changed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "FIRST-SECRET-3b" }});
+    try writeRepo(io, &tmp, "repo/src/.conf", "a=1\ntoken=plain\nz=2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.conf", "a=1\ntoken=<secret:env:MOX_TEST_TOKEN>\nz=2\n");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".conf"), .data = "a=1\ntoken=plain\nz=3\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.err, "not shown"));
+    try std.testing.expect(contains(d.out, "-token=plain\n"));
+    try std.testing.expect(contains(d.out, "-z=3\n"));
+    try std.testing.expect(contains(d.out, "+token=" ++ redacted_secret ++ "\n"));
+    try std.testing.expect(!contains(d.out, "3b"));
+}
+
 test "apply --overwrite: a value one file resolves masks nothing in the snapshot of another" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

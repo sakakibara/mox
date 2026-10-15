@@ -58,7 +58,9 @@ pub const Span = struct { start: usize, end: usize };
 /// YAML-quoted (`text`, longest first), and, for a form of several lines,
 /// its first and last lines, which share an output line with other text
 /// (also in `text`), and its other lines, which fill an output line alone
-/// (`lines`).
+/// (`lines`). A line of a form of several lines is one only from
+/// `min_fragment` bytes: a shorter one, as common as `{`, is found in its
+/// own file by the outline's slots.
 pub const Forms = struct {
     text: []const []const u8 = &.{},
     lines: std.StringHashMapUnmanaged(void) = .empty,
@@ -102,12 +104,12 @@ fn addForm(arena: std.mem.Allocator, set: *std.StringArrayHashMapUnmanaged(void)
     const last = form[std.mem.lastIndexOfScalar(u8, form, '\n').? + 1 ..];
     for ([_][]const u8{ first, last }) |l| {
         const t = std.mem.trimEnd(u8, l, "\r");
-        if (t.len > 0) try set.put(arena, t, {});
+        if (t.len >= min_fragment) try set.put(arena, t, {});
     }
     var it = std.mem.splitScalar(u8, form, '\n');
     while (it.next()) |l| {
         const t = std.mem.trimEnd(u8, l, "\r");
-        if (t.len > 0) try lines.put(arena, t, {});
+        if (t.len >= min_fragment) try lines.put(arena, t, {});
     }
 }
 
@@ -858,28 +860,34 @@ test "alignBy: pairs equal lines in order, as many as the line diff keeps" {
     }
 }
 
-test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a form of several lines as text, its inner lines whole" {
+test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a form of several lines as text, its inner lines whole, a short line of either kind none" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const forms = try writtenForms(a, &.{ "a\"b\\c", "l1\nmid\nl3", "" });
+    const forms = try writtenForms(a, &.{ "a\"b\\c", "line-one\nmiddle-line\nline-three", "{\nmid\n}", "" });
     var has_json = false;
     var has_outer = false;
     for (forms.text) |f| {
         if (std.mem.eql(u8, f, "a\\\"b\\\\c")) has_json = true;
-        if (std.mem.eql(u8, f, "l3")) has_outer = true;
+        if (std.mem.eql(u8, f, "line-three")) has_outer = true;
         try testing.expect(f.len > 0);
-        try testing.expect(!std.mem.eql(u8, f, "mid"));
+        try testing.expect(!std.mem.eql(u8, f, "middle-line"));
+        try testing.expect(!std.mem.eql(u8, f, "{"));
+        try testing.expect(!std.mem.eql(u8, f, "}"));
     }
     try testing.expect(has_json);
     try testing.expect(has_outer);
-    try testing.expect(forms.lines.contains("mid"));
+    try testing.expect(forms.lines.contains("middle-line"));
+    try testing.expect(!forms.lines.contains("mid"));
+    try testing.expect(!forms.lines.contains("{"));
     for (forms.text[1..], forms.text[0 .. forms.text.len - 1]) |f, prev| try testing.expect(f.len <= prev.len);
     var spans: std.ArrayList(Span) = .empty;
-    try formSpans(a, "mid", forms, &spans);
+    try formSpans(a, "middle-line", forms, &spans);
     try testing.expectEqual(@as(usize, 1), spans.items.len);
     spans.clearRetainingCapacity();
-    try formSpans(a, "amid", forms, &spans);
+    try formSpans(a, "a middle-line", forms, &spans);
+    try testing.expectEqual(@as(usize, 0), spans.items.len);
+    try formSpans(a, "f() {", forms, &spans);
     try testing.expectEqual(@as(usize, 0), spans.items.len);
 }
 

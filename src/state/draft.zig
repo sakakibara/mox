@@ -259,13 +259,21 @@ pub const Draft = struct {
     /// with names a secret line, its record was written for a secret, or
     /// `content` holds a written form of a value this run resolved.
     pub fn priorHoldsSecret(d: *Draft, live: []const u8, content: []const u8) !bool {
+        if (try d.wroteSecret(live)) return true;
+        return prov_shapes.holdsAny(d.arena, content, if (d.secrets) |c| try c.values(d.arena) else &.{});
+    }
+
+    /// Whether mox last wrote `live` with a secret: the provenance it kept
+    /// names a secret line (a `.secret` segment, an outline with a shape),
+    /// or the record was written for a secret.
+    pub fn wroteSecret(d: *Draft, live: []const u8) !bool {
         if (try d.provenance(live)) |m| {
             if (prov_map.hasSecret(m.segments)) return true;
             if (m.secretOutline()) |o| for (o) |e| if (e == .shape) return true;
         }
         if (d.fileRecord(live)) |f| if (f.cache_blob == null) return true;
         if (d.ownedRec(live)) |o| if (o.secret) return true;
-        return prov_shapes.holdsAny(d.arena, content, if (d.secrets) |c| try c.values(d.arena) else &.{});
+        return false;
     }
 
     /// Every written form of every value this run resolved.
