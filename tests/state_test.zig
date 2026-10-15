@@ -1756,6 +1756,23 @@ test "state: nothing derived from a secret value is stored, by apply, an overwri
     try std.testing.expect(!exists(io, try statePath(h, &.{ "v2", "secret-lines.key" })));
 }
 
+test "apply and doctor --rebuild-provenance: a line no secret was written into that holds a resolved value keeps no value in the outline" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "LITERAL-5e1f" }});
+    try writeRepo(io, &tmp, "repo/src/.conf", "export TOK=<env.MOX_TEST_TOKEN>\ntoken=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("export TOK=LITERAL-5e1f\ntoken=LITERAL-5e1f\n", try read(io, a, try h.liveOf(".conf")));
+    try std.testing.expect(!try stateHolds(h, "5e1f"));
+    const doc = try h.run(&.{ "mox", "doctor", "--rebuild-provenance" });
+    try std.testing.expect(contains(doc.out, "rebuilt provenance for 1 recorded file(s)"));
+    try std.testing.expect(!try stateHolds(h, "5e1f"));
+}
+
 /// A PEM-like text of about `size` bytes, its body drawn from `seed`.
 fn pemOf(a: std.mem.Allocator, seed: u64, size: usize) ![]const u8 {
     var prng = std.Random.DefaultPrng.init(seed);

@@ -321,18 +321,25 @@ pub fn shapeOf(arena: std.mem.Allocator, line: []const u8, spans: []Span) !Shape
 
 /// The outline of `content`, whose provenance is `segments`, with `values`
 /// the secret values its compose resolved: one entry per line. Empty when no
-/// segment is a secret.
+/// segment is a secret. A line no secret segment covers that holds a form
+/// of one of `values` is a shape too, with a slot at each form, so no value
+/// is kept in a line entry.
 pub fn outlineOf(arena: std.mem.Allocator, content: []const u8, segments: []const map.Segment, values: []const []const u8) ![]const Entry {
     if (!map.hasSecret(segments)) return &.{};
     const lines = try splitLines(arena, content);
-    const spans = try secretSpans(arena, lines, segments, try writtenForms(arena, values));
+    const forms = try writtenForms(arena, values);
+    const spans = try secretSpans(arena, lines, segments, forms);
     const out = try arena.alloc(Entry, lines.len);
     for (lines, spans, out) |l, sp, *o| {
+        var found: std.ArrayList(Span) = .empty;
+        if (sp == null) try formSpans(arena, l, forms, &found);
         // An outline is kept as JSON text, which holds only UTF-8.
         o.* = if (!std.unicode.utf8ValidateSlice(l))
             .{ .shape = whole_line }
         else if (sp) |slots|
             .{ .shape = try shapeOf(arena, l, slots) }
+        else if (found.items.len > 0)
+            .{ .shape = try shapeOf(arena, l, found.items) }
         else
             .{ .line = l };
     }
@@ -874,6 +881,23 @@ test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a for
     spans.clearRetainingCapacity();
     try formSpans(a, "amid", forms, &spans);
     try testing.expectEqual(@as(usize, 0), spans.items.len);
+}
+
+test "outlineOf: a line no secret segment covers that holds a resolved value is a shape with a slot at the value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 1, .origin = .secret },
+        .{ .out_start = 2, .out_len = 1, .origin = .{ .base = .{ .line = 3 } } },
+    };
+    const outline = try outlineOf(a, "export TOK=v4lue\ntoken=v4lue\nz\n", &segs, &.{"v4lue"});
+    try testing.expectEqual(@as(usize, 3), outline.len);
+    try testing.expectEqualStrings("export TOK=", outline[0].shape.pieces[0]);
+    try testing.expectEqualStrings("", outline[0].shape.pieces[1]);
+    try testing.expectEqualStrings("token=", outline[1].shape.pieces[0]);
+    try testing.expectEqualStrings("z", outline[2].line);
 }
 
 test "holdsAny: a whole form anywhere, and a line of a value of several lines only when it is long enough" {

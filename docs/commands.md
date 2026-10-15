@@ -773,8 +773,9 @@ for a per-file added/removed summary). A partially owned file diffs its
 canonical owned content only, with secret-bearing keys masked on both sides.
 A resolved secret is never printed. For a file it wrote a secret into,
 apply records the file's outline in its provenance: every line as written,
-except that a line holding a secret is kept as its shape, the text of the
-line around each secret, in order. The file's record also keeps, as for
+except that a line holding a secret, or a value the run resolved written
+there as a literal, is kept as its shape, the text of the line around each
+such value, in order. The file's record also keeps, as for
 every file, a sha256 of the whole file as written, to tell an edited file
 from the one mox wrote; someone holding the state and the rest of the file
 can test guesses of a short secret against it. A partially owned file whose

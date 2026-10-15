@@ -107,8 +107,9 @@ All notable changes to mox are documented here. The format follows
   cannot be opened, naming the file and what to do.
 - `mox diff` masks a secret in a live line wherever the line now sits:
   for a file it wrote a secret into, apply records the file's outline in
-  its provenance -- each line as written, a line holding a secret by its
-  shape, the text around the secret. diff pairs the live file with the
+  its provenance -- each line as written, a line holding a secret, or a
+  value the run resolved written there as a literal, by its shape, the
+  text around the value. diff pairs the live file with the
   outline as a line diff pairs two files, a shape with a live line that
   starts with its first piece, ends with its last and holds the others in
   order, then a shape left with the first free live line that matches it,
