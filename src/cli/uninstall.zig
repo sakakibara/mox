@@ -49,20 +49,10 @@ pub fn actionFor(name: []const u8, purge_private: bool) Action {
 }
 
 /// The entries of a state directory, beside the state module's own, that
-/// mox makes: the scripts' bin directory and PATH note, the coupling graph,
-/// commit's recovery copies, the trigger state, zypper's ledger, and a
-/// check hook's staging.
+/// mox makes: the scripts' bin directory and the others `isMadeByMox`
+/// names.
 fn madeByMox(name: []const u8) bool {
-    const fixed = [_][]const u8{
-        mox.apply.run_scripts.bin_dir_name,
-        "coupling",
-        "commit-recovery",
-        "mox-path",
-        mox.trigger.state.state_basename,
-        "zypper.txt",
-    };
-    for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
-    return mox.apply.run_scripts.isCheckStaging(name);
+    return std.mem.eql(u8, name, mox.apply.run_scripts.bin_dir_name) or mox.state.marker.isMadeByMox(name);
 }
 
 /// Why the entry `e` of the state directory is not mox's although its name

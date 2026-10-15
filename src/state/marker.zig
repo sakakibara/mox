@@ -11,6 +11,8 @@ const dirent = @import("../source/dirent.zig");
 const durable = @import("durable.zig");
 const lock = @import("lock.zig");
 const quote = @import("quote.zig");
+const run_scripts = @import("../apply/run_scripts.zig");
+const trigger_state = @import("../trigger/state.zig");
 
 pub const marker_name = ".mox-state";
 pub const marker_text = "mox state 1\n";
@@ -132,6 +134,22 @@ fn readMarker(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !Marker {
     return if (std.mem.eql(u8, n, "1")) .current else .{ .newer = line };
 }
 
+/// The entries of a state directory, beside the store, the lock files, the
+/// private layer and `bin/`, that mox makes: the coupling graph, commit's
+/// recovery copies, the scripts' PATH note, the trigger state, zypper's
+/// ledger, and a check hook's staging.
+pub fn isMadeByMox(name: []const u8) bool {
+    const fixed = [_][]const u8{
+        "coupling",
+        "commit-recovery",
+        "mox-path",
+        trigger_state.state_basename,
+        "zypper.txt",
+    };
+    for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
+    return run_scripts.isCheckStaging(name);
+}
+
 /// Why the entry at `path` is not mox's although its name is: null when it
 /// is absent, or a directory every entry of which but OS files `own`
 /// accepts, judged by name and kind without following a link.
@@ -211,6 +229,8 @@ test "accept: a directory holding only lock files and OS files is fresh, and an 
     for ([_][]const u8{ "mox.lock", "readers.lock", "readers.gate", ".DS_Store", "Thumbs.db", "desktop.ini" }) |n| {
         try tmp.dir.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ "s", n }), .data = "" });
     }
+    try testing.expectEqual(Kind.fresh, (try accept(a, io, dir, .explicit)).accepted);
+    try tmp.dir.writeFile(io, .{ .sub_path = "s/mox.lock", .data = "123 - 00000000-0000-0000-0000-000000000000 apply\n" });
     try testing.expectEqual(Kind.fresh, (try accept(a, io, dir, .explicit)).accepted);
     try tmp.dir.writeFile(io, .{ .sub_path = "s/notes.txt", .data = "mine\n" });
     try testing.expect((try accept(a, io, dir, .explicit)) == .refused);
