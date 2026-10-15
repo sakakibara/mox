@@ -16,11 +16,14 @@
 //!
 //! A live file is paired with its outline as a line diff pairs two files: an
 //! outline line with a live line equal to it, a shape with a live line that
-//! matches it. A shape the diff leaves unpaired is then paired with the
-//! nearest free live line that matches it, so a secret line moved is still
+//! matches it. A shape the diff
+//! leaves unpaired is then paired with the first free live line that
+//! matches it, searched from the line after the one the entry before it is
+//! paired with and then from the start, so a secret line moved is still
 //! found. A shape paired with no live line is a secret line lost: changed
 //! beyond its shape, its value may be anywhere, and every live line paired
-//! with nothing is then replaced whole.
+//! with nothing is then replaced whole. So is one paired with a live line
+//! equal to an outline line left unpaired, which took that line's place.
 
 const std = @import("std");
 const toml = @import("toml");
@@ -378,9 +381,9 @@ pub const Pairing = struct {
 };
 
 /// The most edits the line diff that pairs a file with its outline looks
-/// for, and the most line comparisons pairing makes: past either, the
-/// lines left are paired one shape at a time, and past the second, pairing
-/// stops and fails closed.
+/// for, past which its pairs are dropped and every shape is paired one at
+/// a time; and the most line comparisons pairing makes, past which it stops
+/// and fails closed.
 const max_edits: usize = 1024;
 const max_comparisons: usize = 64 * 1024 * 1024;
 
@@ -476,6 +479,16 @@ pub fn pair(arena: std.mem.Allocator, outline: []const Entry, lines: []const []c
     for (outline, line_of) |e, l| if (e == .shape and l == null) {
         fail_closed = true;
     };
+    // A shape paired with a live line equal to an outline line left
+    // unpaired took that line's place: the secret line it stands for may
+    // be one the user edited, and is lost.
+    if (!fail_closed) {
+        var left: std.StringHashMapUnmanaged(void) = .empty;
+        for (outline, line_of) |e, l| if (e == .line and l == null) try left.put(arena, e.line, {});
+        if (left.count() > 0) for (entry_of, lines) |e, l| {
+            if (e != null and outline[e.?] == .shape and left.contains(l)) fail_closed = true;
+        };
+    }
     var distinct: std.ArrayList(Shape) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var any_whole = false;
@@ -803,6 +816,20 @@ test "pair: two secret lines of one shape need a live line each" {
     const q = try pair(a, outline, &same);
     try testing.expect(!q.fail_closed);
     try testing.expectEqualStrings("added", try shown(a, outline, q, 4, same[4], .none));
+}
+
+test "pair: a shape paired with a live line equal to an outline line left unpaired fails closed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outline = try testOutline(a, "- token: \"OLD\"\n- token: \"public\"\n", &.{0}, &.{"OLD"});
+    const lines = [_][]const u8{ "- token: \"OLD\" # rotated", "- token: \"public\"" };
+    const p = try pair(a, outline, &lines);
+    try testing.expect(p.fail_closed);
+    try testing.expectEqualStrings(map.line_redaction, try shown(a, outline, p, 0, lines[0], .none));
+    try testing.expect(std.mem.indexOf(u8, try shown(a, outline, p, 0, lines[0], .none), "OLD") == null);
+    const kept = [_][]const u8{ "- token: \"NEW\"", "- token: \"public\"" };
+    try testing.expect(!(try pair(a, outline, &kept)).fail_closed);
 }
 
 test "pair: a secret line moved below the lines around it is still paired, and a copy of it is masked" {

@@ -784,15 +784,19 @@ piece, ends with its last, and holds the pieces between in order; a line
 that was a secret whole, as each middle line of a value of several lines is,
 matches every line. diff pairs the live file with the outline as a line diff
 pairs two files, a live line with an outline line equal to it or a shape it
-matches, then pairs each shape left with the nearest live line left that
-matches it, so a secret line that moved is still found. A live line paired
-with a shape is printed with the spans between its pieces replaced by
-`<mox:redacted-secret>`, and one paired with an outline line as it is. When
-a shape pairs with no live line, a secret line was changed beyond its shape
-and its value may be anywhere: every live line paired with nothing is
-printed as `<mox:redacted-line>`. Otherwise a line paired with nothing is
-masked at the spans of every shape of the outline it matches. Pairing is
-bounded in the work it does, and a file past the bound is treated as one
+matches, then pairs each shape left with the first free live line that
+matches it, searched from the line after the one the entry before it pairs
+with and then from the start, so a secret line that moved is still found. A
+live line paired with a shape is printed with the spans between its pieces
+replaced by `<mox:redacted-secret>`, and one paired with an outline line as
+it is. When a shape pairs with no live line, a secret line was changed
+beyond its shape and its value may be anywhere: every live line paired with
+nothing is printed as `<mox:redacted-line>`; so is it when a shape pairs
+with a live line equal to an outline line left unpaired, which took that
+line's place. Otherwise a line paired with nothing is masked at the spans of
+every shape of the outline it matches. Pairing is bounded: past 1024 edits
+the line diff's pairs are dropped and every shape is paired the second way,
+and past 64 Mi line comparisons pairing stops and the file is treated as one
 whose secret line is lost. Every value the current render of any managed
 file resolves (diff renders them all before it prints) is masked on both
 sides wherever it occurs, as it is written and in each form mox writes it in
@@ -809,7 +813,8 @@ masked by the same pairing, whatever displaces it (an overwrite, a removal,
 `mox remove --purge`, a rollback's own history): a line paired with a shape
 is masked at its slots, and when a shape pairs with no line, every line
 paired with nothing is kept as `<mox:redacted-line>`, which rollback puts
-back, saying how many lines of the file were not kept. Every value the run
+back, saying how many lines of the file were not kept, when the copy holds
+no `<mox:redacted-secret>` (one that does, it refuses). Every value the run
 resolved that sits in a paired slot, and every value the file's new render
 wrote, is masked wherever it occurs; any other line is kept as it is. A file
 whose provenance names secret lines but records no outline has the lines at
@@ -1221,12 +1226,13 @@ be restored is that entry's `ERROR`, naming where its content is, and the
 rest are still restored; one whose kept copy is missing or damaged is
 refused, naming it; one whose snapshot holds a redacted secret line is never
 written ("holds a secret mox does not store; run mox apply to resolve it
-again"); one whose snapshot kept some lines as `<mox:redacted-line>`,
-because a secret line had changed when it was taken, is written with them
-and named with how many lines were not kept; a link already as the snapshot
-has it is left alone and not counted. An `attributes.toml` that is not valid
-TOML or cannot be read is a warning here, not exit 2: whole files are still
-restored, and partial targets cannot be re-patched.
+again"); one whose snapshot holds no redacted secret but kept some lines as
+`<mox:redacted-line>`, because a secret line had changed when it was taken,
+is written with them and named with how many lines were not kept; a link
+already as the snapshot has it is left alone and not counted. An
+`attributes.toml` that is not valid TOML or cannot be read is a warning
+here, not exit 2: whole files are still restored, and partial targets cannot
+be re-patched.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10, at least 1); an
 apply that displaced or removed something prunes the oldest of the rest,

@@ -111,12 +111,14 @@ All notable changes to mox are documented here. The format follows
   shape, the text around the secret. diff pairs the live file with the
   outline as a line diff pairs two files, a shape with a live line that
   starts with its first piece, ends with its last and holds the others in
-  order, then a shape left with the nearest live line left that matches
-  it. A line paired with a shape is printed with the secret's place shown
-  as `<mox:redacted-secret>`, and every value the current render of any
+  order, then a shape left with the first free live line that matches it,
+  searched from where the entry before it pairs. A line paired with a
+  shape is printed with the secret's place shown as
+  `<mox:redacted-secret>`, and every value the current render of any
   managed file resolves is masked wherever it occurs, as written and
   JSON-escaped, TOML- or YAML-quoted. When a shape pairs with no live line,
-  a secret line was edited beyond it, and every live line paired with
+  or with a live line equal to an outline line left unpaired, a secret
+  line was edited beyond it, and every live line paired with
   nothing is printed as `<mox:redacted-line>`. A live file that may hold a
   secret and whose provenance is missing or records no outline is masked by
   the current render's outline when that render reproduces what the last

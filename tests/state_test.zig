@@ -2177,6 +2177,27 @@ test "remove --purge: a secret line whose CRLF the user changed to LF is not kep
     try std.testing.expect(!try stateHolds(h, "CRLFSECRET"));
 }
 
+test "diff and apply --overwrite: a secret line edited beyond its shape is not stood in for by a line mox wrote that matches the shape" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try withSecretFile(a, io, &tmp, "OLDSECRET1");
+    const h = s.h;
+    try writeRepo(io, &tmp, "repo/src/list.txt", try std.fmt.allocPrint(a, "- token: \"{s}\"\n- token: \"public\"\n", .{s.ref}));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try rotate(io, s.path, "NEWSECRET2");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("list.txt"), .data = "- token: \"OLDSECRET1\" # rotated\n- token: \"public\"\n" });
+    const d = try h.run(&.{ "mox", "diff" });
+    try std.testing.expectEqual(@as(u8, 0), d.rc);
+    try std.testing.expect(!contains(d.out, "OLDSECRET1"));
+    try std.testing.expect(!contains(d.out, "NEWSECRET2"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expect(!try stateHolds(h, "OLDSECRET1"));
+}
+
 test "diff: two secret lines of one shape under two INI sections, one edited beyond it, fail closed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
