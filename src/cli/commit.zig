@@ -231,6 +231,20 @@ const ClassCtx = struct {
     /// spelling's canonical path once found.
     ids: *PathIds,
     canon: *std.StringHashMap([]const u8),
+    /// Whether every managed file has been composed for the secrets it
+    /// resolves (`resolvedValues`).
+    resolved_all: *bool,
+
+    /// Every value this run resolved, once every managed file has been
+    /// composed for its secrets, so a value pasted into a file whose own
+    /// render names none is found too.
+    fn resolvedValues(cc: *const ClassCtx) ![]const []const u8 {
+        if (!cc.resolved_all.*) {
+            cc.resolved_all.* = true;
+            mox.compose.resolveAll(cc.arena, cc.io, cc.files, cc.resolver, cc.m_state, cc.secrets);
+        }
+        return cc.secrets.cache.values(cc.arena);
+    }
 
     fn canonicalOf(cc: *const ClassCtx, path: []const u8) ![]const u8 {
         if (cc.canon.get(path)) |c| return c;
@@ -1405,6 +1419,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
     var claims: Claims = .empty;
     var route_ids: PathIds = .init(ctx.alloc, ctx.io);
     var route_canon: std.StringHashMap([]const u8) = .init(ctx.alloc);
+    var resolved_all = false;
 
     const cc: ClassCtx = .{
         .arena = ctx.alloc,
@@ -1426,6 +1441,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         .files = tree.files,
         .ids = &route_ids,
         .canon = &route_canon,
+        .resolved_all = &resolved_all,
     };
 
     var line_edits: std.ArrayList(LineEdit) = .empty;
@@ -4502,7 +4518,17 @@ fn routeStructChanges(
     };
     const rel = try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path);
 
+    const forms = try shapes.writtenForms(cc.arena, try cc.resolvedValues());
     for (changes, 0..) |change, ki| {
+        const label = try keyPathLabel(cc.arena, change.path);
+        const new_text = if (change.new) |v| try commit_struct.valueInline(cc.arena, v) else "";
+        if (shapes.holdsForm(label, forms) or shapes.holdsForm(new_text, forms)) {
+            ra.manual_count.* += 1;
+            ra.manual_hunks[fidx] += 1;
+            ra.pending.* = true;
+            try cc.stdout.print("  manual: {f} {s}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), try maskedLine(cc.arena, label, forms), resolved_line_reason });
+            continue;
+        }
         const res = try commit_struct.resolveLayer(cc.arena, format, layers, change, baseline);
         if (res.action == .skip) {
             ra.manual_count.* += 1;
@@ -5268,8 +5294,8 @@ fn processGeneratorLeaf(
     };
     const guard = try guardOf(cc, a_lines, b_lines, outline);
     for (hunks, 0..) |hunk, hi| {
-        const outcome = if (guard.refuses(hunk))
-            try reportGeneratedManual(cc, ra, fidx, leaf, hunk, hi + 1, hunks.len, secret_lines, guard.a, guard.b, secret_line_reason, hunkTouchesSecret(leaf.prov, hunk))
+        const outcome = if (guard.refuses(hunk)) |why|
+            try reportGeneratedManual(cc, ra, fidx, leaf, hunk, hi + 1, hunks.len, secret_lines, guard.a, guard.b, why, hunkTouchesSecret(leaf.prov, hunk))
         else
             try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, guard, hunk, hi + 1, hunks.len, secret_lines, first_contact, stale, gen);
         switch (outcome) {
@@ -6452,8 +6478,9 @@ fn processHunk(
     /// Whether an interactive run may offer to split it.
     can_split: bool,
 ) !HunkOutcome {
-    const route: Route = if (lf.guard != null and lf.guard.?.refuses(hunk))
-        .{ .manual = secret_line_reason }
+    const refused: ?[]const u8 = if (lf.guard) |g| g.refuses(hunk) else null;
+    const route: Route = if (refused) |why|
+        .{ .manual = why }
     else
         try unlessConflicting(cc, ra, given orelse try routeHunk(cc, lf, hunk));
     const shown_a = if (lf.guard) |g| g.a else a_lines;
@@ -7680,25 +7707,31 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
 /// Why a hunk of a file mox last wrote with a secret is not routed.
 const secret_line_reason = "may hold a secret: a line mox did not write, in a file it wrote a secret into";
 
+/// Why a hunk holding a value this run resolved is not routed.
+const resolved_line_reason = "may hold a secret: a line holding a value this run resolved";
+
 /// A file's lines as commit prints them, and which of its live lines it may
 /// route.
 const Guard = struct {
     /// The baseline's lines and the live lines with every written form of
-    /// every value this run resolved masked, and, in a file mox last wrote
-    /// with a secret, each live line that pairs with no line of its outline
-    /// replaced by `<mox:redacted-line>`.
+    /// every value this run resolved masked, and each live line that may not
+    /// be routed replaced by `<mox:redacted-line>`.
     a: []const []const u8,
     b: []const []const u8,
     /// For a file mox last wrote with a secret: per live line, whether it
-    /// pairs with a line of the outline that no secret was written into, the
-    /// only live lines a hunk may route. Null for any other file.
+    /// pairs with a line of the outline that no secret was written into.
+    /// Null for any other file.
     literal: ?[]const bool,
+    /// Per live line, whether it holds a written form of at least
+    /// `min_fragment` bytes of a value this run resolved.
+    holds: []const bool,
 
-    fn refuses(g: Guard, hunk: Hunk) bool {
-        const lit = g.literal orelse return false;
-        var j = hunk.b_start;
-        while (j < hunk.b_start + hunk.b_len) : (j += 1) if (!lit[j]) return true;
-        return false;
+    /// Why `hunk` is not routed, or null when it may be.
+    fn refuses(g: Guard, hunk: Hunk) ?[]const u8 {
+        const end = hunk.b_start + hunk.b_len;
+        if (g.literal) |lit| for (lit[hunk.b_start..end]) |l| if (!l) return secret_line_reason;
+        for (g.holds[hunk.b_start..end]) |h| if (h) return resolved_line_reason;
+        return null;
     }
 };
 
@@ -7707,12 +7740,16 @@ const Guard = struct {
 /// the outline it wrote it with, empty when none is known: every live line
 /// then pairs with nothing.
 fn guardOf(cc: *const ClassCtx, a_lines: []const []const u8, b_lines: []const []const u8, outline: ?[]const shapes.Entry) !Guard {
-    const forms = try shapes.writtenForms(cc.arena, try cc.secrets.cache.values(cc.arena));
+    const forms = try shapes.writtenForms(cc.arena, try cc.resolvedValues());
     const a = try cc.arena.alloc([]const u8, a_lines.len);
     for (a_lines, a) |l, *o| o.* = try maskedLine(cc.arena, l, forms);
     const b = try cc.arena.alloc([]const u8, b_lines.len);
-    for (b_lines, b) |l, *o| o.* = try maskedLine(cc.arena, l, forms);
-    const o = outline orelse return .{ .a = a, .b = b, .literal = null };
+    const holds = try cc.arena.alloc(bool, b_lines.len);
+    for (b_lines, b, holds) |l, *o, *h| {
+        h.* = shapes.holdsForm(l, forms);
+        o.* = if (h.*) mox.provenance.map.line_redaction else try maskedLine(cc.arena, l, forms);
+    }
+    const o = outline orelse return .{ .a = a, .b = b, .literal = null, .holds = holds };
     const literal = try cc.arena.alloc(bool, b_lines.len);
     @memset(literal, false);
     if (o.len > 0) {
@@ -7722,7 +7759,7 @@ fn guardOf(cc: *const ClassCtx, a_lines: []const []const u8, b_lines: []const []
     for (literal, b) |lit, *line| if (!lit) {
         line.* = mox.provenance.map.line_redaction;
     };
-    return .{ .a = a, .b = b, .literal = literal };
+    return .{ .a = a, .b = b, .literal = literal, .holds = holds };
 }
 
 fn maskedLine(arena: std.mem.Allocator, line: []const u8, forms: shapes.Forms) ![]const u8 {
@@ -9903,6 +9940,12 @@ test "routeHunk: a base file in a sibling directory whose name extends the priva
     try testing.expect(!route.line.edit.private);
 }
 
+fn testFlag(a: std.mem.Allocator) !*bool {
+    const f = try a.create(bool);
+    f.* = false;
+    return f;
+}
+
 /// A routing context over `m_state` with no bindings, secrets or input.
 fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.MachineState) !*const ClassCtx {
     const bindings = try a.create(std.StringHashMap([]const u8));
@@ -9942,6 +9985,7 @@ fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.
         .files = &.{},
         .ids = try testPathIds(a, io),
         .canon = try testCanon(a),
+        .resolved_all = try testFlag(a),
     };
     return cc;
 }
@@ -10114,6 +10158,7 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
         .files = &.{},
         .ids = try testPathIds(a, io),
         .canon = try testCanon(a),
+        .resolved_all = try testFlag(a),
     };
 
     const file_edits = &[_]CouplingEdit{.{ .path = path, .old = "sharedtok", .new = "sharedtok@bad" }};

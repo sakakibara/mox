@@ -77,6 +77,28 @@ pub fn composeFileTracked(
     }
 }
 
+/// Compose every one of `files` that renders, generators included, for the
+/// secrets they resolve into `secrets.cache`: what a caller that masks or
+/// refuses by every value the source names does first. A file that does not
+/// compose is skipped.
+pub fn resolveAll(
+    arena: std.mem.Allocator,
+    io: Io,
+    files: []const ManagedFile,
+    bindings: *const dsl.resolver.Resolver,
+    machine_state_opt: ?*const machine.state.MachineState,
+    secrets: catB.SecretCtx,
+) void {
+    for (files) |file| {
+        if (file.head_error.len > 0 or file.create_once or file.is_symlink) continue;
+        if (catB.composeGenerator(arena, io, file, bindings, machine_state_opt, secrets, null)) |outputs| {
+            if (outputs != null) continue;
+        } else |_| continue;
+        var sink: std.ArrayList(Segment) = .empty;
+        _ = composeFileTracked(arena, io, file, bindings, machine_state_opt, secrets, &sink, null) catch {};
+    }
+}
+
 /// The category `composeFileTracked` will route `file` through: sniffed from
 /// a sample of its base, or of its first overlay when it has no base. Null
 /// when there is neither, which is the one case that composes to nothing

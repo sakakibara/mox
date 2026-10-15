@@ -470,8 +470,15 @@ live line, edited or added, may hold a value no resolved secret finds, so
 its hunk is reported `manual: <path>:<line> may hold a secret: a line mox
 did not write, in a file it wrote a secret into`, by `--dry-run`, `--yes`
 and the prompt alike, and the prompt shows such a line as
-`<mox:redacted-line>`. Every line a hunk prints has every value the run
-resolved masked as `<mox:redacted-secret>`. A source reached through two
+`<mox:redacted-line>`. In any file, a live line holding a value the run
+resolved, in any form mox writes it in that is at least 8 bytes long, is
+never routed: its hunk is reported `manual: <path>:<line> may hold a
+secret: a line holding a value this run resolved`, and the line is shown as
+`<mox:redacted-line>`; a structured key whose live value holds one is
+reported the same way. Before routing anything, commit renders every
+managed file once for the secrets it resolves, so a value pasted into a
+file whose own source names none is found. Every line a hunk prints has
+every value the run resolved masked as `<mox:redacted-secret>`. A source reached through two
 spellings -- a symlink, a `./`, a hard link -- is one file, planned and
 written once.
 

@@ -16,6 +16,7 @@ pub const ini_merge = @import("ini_merge.zig");
 pub const categoryOf = @import("compose.zig").categoryOf;
 pub const composeFile = @import("compose.zig").composeFile;
 pub const composeFileTracked = @import("compose.zig").composeFileTracked;
+pub const resolveAll = @import("compose.zig").resolveAll;
 pub const wholeFileGateAxisExpr = @import("compose.zig").wholeFileGateAxisExpr;
 
 test {

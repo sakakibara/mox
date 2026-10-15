@@ -642,6 +642,16 @@ pub fn holdsAny(arena: std.mem.Allocator, content: []const u8, values: []const [
     return false;
 }
 
+/// Whether `line` holds one of `forms` of at least `min_fragment` bytes.
+pub fn holdsForm(line: []const u8, forms: Forms) bool {
+    if (forms.lines.contains(std.mem.trimEnd(u8, line, "\r"))) return true;
+    for (forms.text) |f| {
+        if (f.len < min_fragment) break;
+        if (std.mem.indexOf(u8, line, f) != null) return true;
+    }
+    return false;
+}
+
 /// `content` with every one of `forms` masked wherever it occurs.
 pub fn maskForms(arena: std.mem.Allocator, content: []const u8, forms: Forms) ![]const u8 {
     const lines = try splitLines(arena, content);
@@ -917,6 +927,18 @@ test "holdsAny: a whole form anywhere and a line of a value of several lines, ea
     try testing.expect(!try holdsAny(a, "f() {\n}\n", &.{"{\n  \"k\": \"v\"\n}"}));
     try testing.expect(try holdsAny(a, "pasted MIIBlongline\n", &.{"-----BEGIN-----\nMIIBlongline\n-----END-----"}));
     try testing.expect(!try holdsAny(a, "nothing\n", &.{ "", "absent" }));
+}
+
+test "holdsForm: a form of at least 8 bytes within the line, or a middle line of a value of several lines as the whole line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const forms = try writtenForms(a, &.{ "admin", "PASTED-9f3e1a", "-----BEGIN-----\nMIIBlongline\n-----END-----" });
+    try testing.expect(holdsForm("copy=PASTED-9f3e1a # x", forms));
+    try testing.expect(!holdsForm("role = admin", forms));
+    try testing.expect(holdsForm("MIIBlongline\r", forms));
+    try testing.expect(!holdsForm("x MIIBlongline", forms));
+    try testing.expect(holdsForm("key: -----BEGIN-----", forms));
 }
 
 test "maskForms: every form masked on every line, the rest kept byte for byte" {

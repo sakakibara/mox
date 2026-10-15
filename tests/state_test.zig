@@ -1817,6 +1817,65 @@ test "commit: a live line of a secret-bearing file that mox did not write is nev
     }
 }
 
+test "commit: a live line holding a value this run resolved is never routed, in a file mox wrote no secret into, by --dry-run, the prompt or a plain run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "PASTED-9f3e1a" }});
+    try writeRepo(io, &tmp, "repo/src/.conf", "token=<secret:env:MOX_TEST_TOKEN>\n");
+    try writeRepo(io, &tmp, "repo/src/notes.txt", "a=1\nz=2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const edited = "a=1\ncopy=PASTED-9f3e1a\nz=2\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("notes.txt"), .data = edited });
+    const src = "a=1\nz=2\n";
+
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expect(!contains(dry.out, "9f3e1a"));
+    try std.testing.expect(!contains(dry.err, "9f3e1a"));
+    try std.testing.expect(contains(dry.out, "manual: "));
+    try std.testing.expect(contains(dry.out, "may hold a secret"));
+    try std.testing.expect(!contains(dry.out, "would edit"));
+
+    const asked = try h.runWithInput(&.{ "mox", "commit", try h.liveOf("notes.txt") }, "y\ny\ny\ny\n");
+    try std.testing.expect(!contains(asked.out, "9f3e1a"));
+    try std.testing.expect(!contains(asked.err, "9f3e1a"));
+    try std.testing.expect(contains(asked.out, redacted_line));
+    try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf("notes.txt")));
+
+    const plain = try h.run(&.{ "mox", "commit", try h.liveOf("notes.txt") });
+    try std.testing.expect(!contains(plain.out, "9f3e1a"));
+    try std.testing.expect(!contains(plain.err, "9f3e1a"));
+    try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf("notes.txt")));
+    try std.testing.expectEqualStrings(edited, try read(io, a, try h.liveOf("notes.txt")));
+}
+
+test "commit: a structured key whose live value holds a value this run resolved is never routed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try testutil.setup(a, io, &tmp, .{ .create_repo_src = true, .os = "darwin", .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "PASTED-9f3e1a" }} });
+    try writeRepo(io, &tmp, "repo/src/.conf", "token=<secret:env:MOX_TEST_TOKEN>\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml", "theme = \"light\"\n");
+    try writeRepo(io, &tmp, "repo/src/config.toml.d/os=darwin.toml", "theme = \"dark\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("config.toml"), .data = "theme = \"PASTED-9f3e1a\"\n" });
+
+    for ([_][]const []const u8{ &.{ "mox", "commit", "--dry-run" }, &.{ "mox", "commit", "--yes" } }) |argv| {
+        const r = try h.run(argv);
+        try std.testing.expect(!contains(r.out, "9f3e1a"));
+        try std.testing.expect(!contains(r.err, "9f3e1a"));
+        try std.testing.expect(contains(r.out, "may hold a secret"));
+    }
+    try std.testing.expectEqualStrings("theme = \"dark\"\n", try read(io, a, try h.srcOf("config.toml.d/os=darwin.toml")));
+    try std.testing.expectEqualStrings("theme = \"light\"\n", try read(io, a, try h.srcOf("config.toml")));
+}
+
 /// A PEM-like text of about `size` bytes, its body drawn from `seed`.
 fn pemOf(a: std.mem.Allocator, seed: u64, size: usize) ![]const u8 {
     var prng = std.Random.DefaultPrng.init(seed);

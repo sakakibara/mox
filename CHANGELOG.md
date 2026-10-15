@@ -342,6 +342,14 @@ All notable changes to mox are documented here. The format follows
   the secret line (`old=<value>`) used to be printed and, once accepted,
   written into the source. This also leaves a loop row edited in such a
   file to be kept by hand.
+- `mox commit` routes no live line, in any file, that holds a value the
+  run resolved in a form of at least 8 bytes, nor a structured key whose
+  live value holds one: the hunk or key is manual ("may hold a secret: a
+  line holding a value this run resolved"), and the line is shown as
+  `<mox:redacted-line>`. Before routing, commit renders every managed file
+  once for the secrets it resolves. A secret pasted into a file mox wrote
+  no secret into used to be routed into its source, and printed when no
+  file commit composed had resolved it.
 - A partially owned file's snapshot masks every value the run resolved,
   wherever it sits, beside the values under its secret-bearing owned keys;
   a copy of a value in a section mox does not own was kept in clear.
