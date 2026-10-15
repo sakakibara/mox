@@ -4,6 +4,7 @@
 const std = @import("std");
 const app = @import("app.zig");
 const lock_mod = @import("lock.zig");
+const display = @import("display.zig");
 const mox = @import("../root.zig");
 const state = mox.state;
 
@@ -98,7 +99,12 @@ pub fn commit(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOption
         },
         else => return e,
     };
-    if (committed != null) if (st.cleanup_warning) |w| try ctx.err.print("mox: warning: {s}\n", .{w});
+    if (committed != null) {
+        if (st.cleanup_warning) |w| try ctx.err.print("mox: warning: {s}\n", .{w});
+        const home = if (ctx.context) |c| c.paths.home else "";
+        for (st.not_kept.items) |live| try ctx.out.print("  {f}: its previous content held a secret and was not kept\n", .{display.of(live, home)});
+        st.not_kept.clearRetainingCapacity();
+    }
     return true;
 }
 

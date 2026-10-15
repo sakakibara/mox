@@ -7154,7 +7154,7 @@ test "rollback: re-patching a partial target keeps the live file in rollback's o
     try std.testing.expect(try testutil.snapshotHolds(h, undo_id, "app.toml", "a = 2\nb = \"prog\"\n"));
 }
 
-test "rollback: an entry that holds a redacted secret is refused, never written" {
+test "rollback: a file whose content held a secret was not kept, and is refused, never written" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -7171,7 +7171,7 @@ test "rollback: an entry that holds a redacted secret is refused, never written"
     const before = try read(io, a, live);
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(lineWith(rb.err, try tilde(a, "~/.netrc"), "holds a secret mox does not store; run mox apply to resolve it again"));
+    try std.testing.expect(lineWith(rb.err, try tilde(a, "~/.netrc"), "not restored: its content held a secret and was not kept"));
     try std.testing.expectEqualStrings(before, try read(io, a, live));
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "redacted") == null);
 }

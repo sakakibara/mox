@@ -493,6 +493,11 @@ mox rollback <id>       # restore the live files from a specific one
 A run interrupted part way keeps what it had done; the next command picks it
 up, so its snapshot is there to roll back.
 
+A file that may hold a secret -- one mox wrote a secret into, or one holding a
+value the run resolved -- is not kept: the run names it, `mox snapshot <id>`
+lists it as not kept, and rollback reports it as not restored and restores the
+rest.
+
 A [partially owned file](#a-file-a-program-also-writes) is not whole-file
 restored -- that would clobber what the program wrote since the snapshot.
 Rollback re-patches the snapshot's owned content onto the *current* live

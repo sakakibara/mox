@@ -30,8 +30,8 @@ fn list(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
 }
 
 /// Every entry generation `id` displaced, one per line: its key, its type,
-/// and the blob path of its content or the target of its link; a
-/// directory's members follow it, indented.
+/// and the blob path of its content, that its content was not kept, or the
+/// target of its link; a directory's members follow it, indented.
 fn entries(ctx: *app.Ctx, st: *const mox.state.Draft, id: []const u8) !u8 {
     const g = (try st.displacedOf(id)) orelse {
         try ctx.err.print("mox snapshot: no snapshot '{s}' (see 'mox snapshot')\n", .{id});
@@ -55,7 +55,10 @@ fn entries(ctx: *app.Ctx, st: *const mox.state.Draft, id: []const u8) !u8 {
 
 fn line(ctx: *app.Ctx, st: *const mox.state.Draft, indent: []const u8, key: []const u8, d: mox.state.generation.Displaced) !void {
     switch (d.type) {
-        .file => try ctx.out.print("{s}{s} file {s}\n", .{ indent, key, try st.blobPath(d.blob.?) }),
+        .file => if (d.not_kept != null)
+            try ctx.out.print("{s}{s} file not kept: its content held a secret\n", .{ indent, key })
+        else
+            try ctx.out.print("{s}{s} file {s}\n", .{ indent, key, try st.blobPath(d.blob orelse return) }),
         .link => try ctx.out.print("{s}{s} link -> {s}\n", .{ indent, key, d.target orelse "" }),
         .dir => try ctx.out.print("{s}{s} dir\n", .{ indent, key }),
     }

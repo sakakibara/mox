@@ -111,33 +111,6 @@ fn addForm(arena: std.mem.Allocator, set: *std.StringArrayHashMapUnmanaged(void)
     }
 }
 
-/// The values of `values` this render wrote: those with a form in a line
-/// of `content` a `.secret` segment of `segments` covers.
-pub fn renderValues(arena: std.mem.Allocator, content: []const u8, segments: []const map.Segment, values: []const []const u8) ![]const []const u8 {
-    if (!map.hasSecret(segments) or values.len == 0) return &.{};
-    const lines = try splitLines(arena, content);
-    var text: std.ArrayList(u8) = .empty;
-    for (segments) |sg| {
-        if (sg.origin != .secret) continue;
-        var i: usize = sg.out_start;
-        while (i < @as(usize, sg.out_start) + sg.out_len and i < lines.len) : (i += 1) {
-            try text.appendSlice(arena, lines[i]);
-            try text.append(arena, '\n');
-        }
-    }
-    var out: std.ArrayList([]const u8) = .empty;
-    for (values) |v| {
-        if (v.len == 0) continue;
-        for (try formsOf(arena, v)) |f| {
-            if (f.len > 0 and std.mem.indexOf(u8, text.items, f) != null) {
-                try out.append(arena, v);
-                break;
-            }
-        }
-    }
-    return out.items;
-}
-
 /// `v` as TOML's encoder writes it as a string, without its quotes.
 fn tomlForm(arena: std.mem.Allocator, v: []const u8) !?[]const u8 {
     var tbl: toml.Value.Table = .empty;
@@ -616,7 +589,7 @@ fn shapeKey(arena: std.mem.Allocator, s: Shape) ![]const u8 {
 }
 
 /// Live line `j`, `line`, of a file paired with `outline` by `p`, as diff
-/// shows it and a stored copy keeps it: masked at the slots of the shape it
+/// shows it: masked at the slots of the shape it
 /// is paired with, kept as it is when paired with a line, and, paired with
 /// nothing, replaced whole when `p` fails closed, else masked at the slots
 /// of every shape of the outline it matches. Every one of `forms` is masked
@@ -636,73 +609,40 @@ pub fn shown(arena: std.mem.Allocator, outline: []const Entry, p: Pairing, j: us
     return mask(arena, line, spans.items, map.secret_redaction);
 }
 
-/// `content`, prior content of a file mox last wrote with `outline`, as a
-/// stored copy keeps it: each line as `shown` gives it, with the forms of
-/// `values` and of every one of `known` found in a slot of a paired shape
-/// (a value the file was last written with) masked wherever they occur.
-pub fn redactStored(arena: std.mem.Allocator, content: []const u8, outline: []const Entry, known: []const []const u8, values: []const []const u8) ![]const u8 {
-    const lines = try splitLines(arena, content);
-    const p = try pair(arena, outline, lines);
-    var slots: std.ArrayList(u8) = .empty;
-    for (lines, p.entry_of) |l, e| {
-        const sh = switch (outline[e orelse continue]) {
-            .shape => |sh| sh,
-            .line => continue,
-        };
-        var spans: std.ArrayList(Span) = .empty;
-        _ = try match(arena, sh, l, &spans);
-        for (spans.items) |sp| {
-            try slots.appendSlice(arena, l[sp.start..sp.end]);
-            try slots.append(arena, '\n');
-        }
-    }
-    var masked: std.ArrayList([]const u8) = .empty;
-    try masked.appendSlice(arena, values);
-    if (slots.items.len > 0) for (known) |v| {
+/// The shortest line of a value of several lines that counts, on its own,
+/// as a written form of the value outside the slots of its own file.
+pub const min_fragment: usize = 8;
+
+/// Whether `content` holds a written form of one of `values`: a whole form
+/// anywhere, or a line of a form of several lines at least `min_fragment`
+/// bytes long.
+pub fn holdsAny(arena: std.mem.Allocator, content: []const u8, values: []const []const u8) !bool {
+    for (values) |v| {
         if (v.len == 0) continue;
         for (try formsOf(arena, v)) |f| {
-            if (f.len > 0 and std.mem.indexOf(u8, slots.items, f) != null) {
-                try masked.append(arena, v);
-                break;
+            if (f.len == 0) continue;
+            if (std.mem.indexOf(u8, content, f) != null) return true;
+            if (std.mem.indexOfScalar(u8, f, '\n') == null) continue;
+            var it = std.mem.splitScalar(u8, f, '\n');
+            while (it.next()) |l| {
+                const t = std.mem.trimEnd(u8, l, "\r");
+                if (t.len >= min_fragment and std.mem.indexOf(u8, content, t) != null) return true;
             }
         }
-    };
-    const all = try writtenForms(arena, masked.items);
+    }
+    return false;
+}
+
+/// `content` with every one of `forms` masked wherever it occurs.
+pub fn maskForms(arena: std.mem.Allocator, content: []const u8, forms: Forms) ![]const u8 {
+    const lines = try splitLines(arena, content);
     var out: std.ArrayList(u8) = .empty;
     var changed = false;
     for (lines, 0..) |l, j| {
         if (j > 0) try out.append(arena, '\n');
-        const kept = try shown(arena, outline, p, j, l, all);
-        if (kept.ptr != l.ptr) changed = true;
-        try out.appendSlice(arena, kept);
-    }
-    if (!changed) return content;
-    if (content.len > 0 and content[content.len - 1] == '\n') try out.append(arena, '\n');
-    return out.items;
-}
-
-/// `content` with every line at the positions `segments` names a secret
-/// replaced whole, and every one of `forms` masked wherever it occurs: how
-/// a copy is stored when the file's provenance names its secret lines but
-/// holds no outline.
-pub fn redactAt(arena: std.mem.Allocator, content: []const u8, segments: []const map.Segment, forms: Forms) ![]const u8 {
-    const lines = try splitLines(arena, content);
-    const secret = try arena.alloc(bool, lines.len);
-    @memset(secret, false);
-    for (segments) |sg| {
-        if (sg.origin != .secret) continue;
-        var i: usize = sg.out_start;
-        while (i < @as(usize, sg.out_start) + sg.out_len and i < lines.len) : (i += 1) secret[i] = true;
-    }
-    var out: std.ArrayList(u8) = .empty;
-    var changed = false;
-    for (lines, secret, 0..) |l, at, j| {
-        if (j > 0) try out.append(arena, '\n');
-        const kept = if (at) map.secret_redaction else blk: {
-            var spans: std.ArrayList(Span) = .empty;
-            try formSpans(arena, l, forms, &spans);
-            break :blk try mask(arena, l, spans.items, map.secret_redaction);
-        };
+        var spans: std.ArrayList(Span) = .empty;
+        try formSpans(arena, l, forms, &spans);
+        const kept = try mask(arena, l, spans.items, map.secret_redaction);
         if (kept.ptr != l.ptr) changed = true;
         try out.appendSlice(arena, kept);
     }
@@ -911,31 +851,6 @@ test "alignBy: pairs equal lines in order, as many as the line diff keeps" {
     }
 }
 
-test "redactStored: paired shapes masked at their slots, a value found in a slot masked anywhere, and a lost secret line replaces every line paired with nothing" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const outline = try testOutline(a, "keep\ntoken=v4lue\n", &.{1}, &.{"v4lue"});
-    const kept = try redactStored(a, "keep\ntoken=old # c\ncopy: old!\n", outline, &.{"old"}, &.{});
-    try testing.expectEqualStrings("keep\ntoken=" ++ map.secret_redaction ++ "\ncopy: " ++ map.secret_redaction ++ "!\n", kept);
-    const lost = try redactStored(a, "keep\ntoken = old\nnote\n", outline, &.{}, &.{});
-    try testing.expectEqualStrings("keep\n" ++ map.line_redaction ++ "\n" ++ map.line_redaction ++ "\n", lost);
-    const same = "keep\n";
-    try testing.expect((try redactStored(a, same, &.{.{ .line = "keep" }}, &.{}, &.{})).ptr == same.ptr);
-}
-
-test "redactAt: the lines at a secret's recorded positions are replaced whole, values masked anywhere" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const segs = [_]map.Segment{
-        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
-        .{ .out_start = 1, .out_len = 1, .origin = .secret },
-    };
-    const got = try redactAt(a, "a\ntoken = x\nz cur\n", &segs, try writtenForms(a, &.{"cur"}));
-    try testing.expectEqualStrings("a\n" ++ map.secret_redaction ++ "\nz " ++ map.secret_redaction ++ "\n", got);
-}
-
 test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a form of several lines as text, its inner lines whole" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -961,15 +876,22 @@ test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a for
     try testing.expectEqual(@as(usize, 0), spans.items.len);
 }
 
-test "renderValues: only the values a render wrote into its secret lines" {
+test "holdsAny: a whole form anywhere, and a line of a value of several lines only when it is long enough" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const segs = [_]map.Segment{
-        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
-        .{ .out_start = 1, .out_len = 1, .origin = .secret },
-    };
-    const got = try renderValues(a, "other\n{\"k\": \"x\\\"y\"}\n", &segs, &.{ "other", "x\"y", "absent" });
-    try testing.expectEqual(@as(usize, 1), got.len);
-    try testing.expectEqualStrings("x\"y", got[0]);
+    try testing.expect(try holdsAny(a, "x = \"a\\\"b\"\n", &.{"a\"b"}));
+    try testing.expect(!try holdsAny(a, "f() {\n}\n", &.{"{\n  \"k\": \"v\"\n}"}));
+    try testing.expect(try holdsAny(a, "pasted MIIBlongline\n", &.{"-----BEGIN-----\nMIIBlongline\n-----END-----"}));
+    try testing.expect(!try holdsAny(a, "nothing\n", &.{ "", "absent" }));
+}
+
+test "maskForms: every form masked on every line, the rest kept byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const forms = try writtenForms(a, &.{"s3cr3t"});
+    try testing.expectEqualStrings("a = " ++ map.secret_redaction ++ "\nb\n", try maskForms(a, "a = s3cr3t\nb\n", forms));
+    const same = "plain\n";
+    try testing.expect((try maskForms(a, same, forms)).ptr == same.ptr);
 }

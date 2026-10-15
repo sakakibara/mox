@@ -146,9 +146,6 @@ fn rollbackOpened(ctx: *app.Ctx, a: cli.Args(Spec), st: *mox.state.Draft) anyerr
 
     var repatched: usize = 0;
     var failed: usize = 0;
-    for (restored.partial) |p| {
-        try ctx.out.print("  {f}: {d} line(s) were not kept: a secret line had changed when the snapshot was taken, so each line it could not tell was free of the secret is {s}\n", .{ display.of(p.live_path, context.paths.home), p.lines, mox.provenance.map.line_redaction });
-    }
     for (restored.refused) |r| {
         const shown = display.of(r.live_path, context.paths.home);
         switch (r.why) {
@@ -158,6 +155,7 @@ fn rollbackOpened(ctx: *app.Ctx, a: cli.Args(Spec), st: *mox.state.Draft) anyerr
             .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; {f})\n", .{ shown, r.reason, r.copy }),
             .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; {f})\n", .{ shown, r.copy }),
             .missing => try ctx.err.print("  ERROR   {f} (not restored: the snapshot copy at {s} is missing or damaged)\n", .{ shown, r.copy.blob }),
+            .not_kept => try ctx.err.print("  ERROR   {f} (not restored: its content held a secret and was not kept)\n", .{shown}),
         }
         failed += 1;
     }
@@ -330,7 +328,8 @@ fn repatchPartial(
         break :blk mox.apply.write.modeOf(stat.permissions);
     };
     // What the re-patch replaces is kept, as a whole-file restore keeps it,
-    // its secret-bearing owned values masked as apply's snapshot masks them.
+    // its secret-bearing owned values and every value this run resolved
+    // masked as apply's snapshot masks them.
     if (live) |held| if (!std.mem.eql(u8, held, candidate)) keep: {
         const rec = try st.readOwned(live_path);
         const secret_paths: []const mox.source.tree.OwnPath = if (rec) |r| try mox.apply.owned.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
@@ -342,7 +341,7 @@ fn repatchPartial(
                 return false;
             },
         };
-        mox.apply.snapshot.keepBytes(st, ctx.context.?.paths.home, live_target, kept) catch |e| switch (e) {
+        mox.apply.snapshot.keepBytes(st, ctx.context.?.paths.home, live_target, try st.maskResolved(kept)) catch |e| switch (e) {
             // A partial target linked outside HOME has no place in a snapshot.
             error.LiveFileOutsideHome => break :keep,
             else => {

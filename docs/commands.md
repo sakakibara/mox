@@ -810,41 +810,35 @@ names one) whose provenance is missing or records no outline is masked by
 this render's outline when the render reproduces what the last apply wrote,
 and is otherwise not shown: stderr says so, and that `mox apply` records
 what diff needs, or, for a file with edits, `mox apply --overwrite <path>`,
-which writes it again and keeps the edits in a snapshot. What a snapshot
-keeps of content apply displaces is masked by the same pairing, whatever
-displaces it (an overwrite, a removal, `mox remove --purge`, a rollback's
-own history, or a directory apply removes or replaces with a link, each file
-of which is paired with its own provenance): a line paired with a shape is
-masked at its slots, a line paired with nothing is masked at the spans of
-every shape of the outline it matches, and when a secret line is lost, every
-line paired with nothing is kept as `<mox:redacted-line>`, which rollback
-puts back, saying how many lines of the file were not kept, when the copy
-holds no `<mox:redacted-secret>` (one that does, it refuses). Every value
-the run resolved that sits in a paired slot, and every value the file's new
-render wrote, is masked wherever it occurs; any other line is kept as it is,
-so rollback puts back the lines you edited. While no secret line is lost, a
-line you edited that holds a value the run neither wrote into the file nor
-resolved into one of its paired secret lines is kept with that value in the
-snapshot, in the state directory. A file whose provenance names secret lines
-but records no outline has the lines at the positions it names masked whole,
-and one whose provenance is missing while its record was written for a
-secret has every line masked. A file whose source left the tree, which apply
-would remove, shows its live content on the removed side, and such a symlink
-the line `symlink -> <target>`, as does an unedited file of a generator that
-left the tree; a file that does not parse in its format is an `ERROR` line
-on stderr, as apply reports it. Read-only: it takes no writer lock, only the
-readers lock. A difference is not an error, so a run that completes exits 0
-whether or not anything differs. An `attributes.toml`, the repo's or the
-private layer's, that is not valid TOML or cannot be read stops the run with
-exit 2, as it does in every command that reads attributes (add, apply,
-commit, doctor, edit, export, facts, mv, remove and status); rollback warns
-instead. A refusal exits 1: a path that is not managed, a head ownership
-declaration that does not parse, and an attributes entry that breaks the
-schema, with or without a source. A file's own `ERROR` that does not come
-from an attributes file -- a head directive on an unstructured target, one
-spelled with another file's comment marker, a mox directive in strict JSON,
-or a layer or output that does not parse -- is reported and the run still
-exits 0.
+which writes it again and keeps the edits in a snapshot. A snapshot keeps
+none of a whole file's prior content when it may hold a secret: its
+provenance names a secret line, its record was written for one, or it holds
+a value the run resolved, in any form mox writes it in (a line of a value of
+several lines counts when it is at least 8 bytes long). Whatever displaces
+the file (an overwrite, a removal, `mox remove --purge`, a rollback's own
+history, or a directory apply removes or replaces with a link, each file of
+which is judged on its own), the command prints `<path>: its previous
+content held a secret and was not kept`, `mox snapshot <id>` lists it as not
+kept, and rollback reports it as not restored and restores the rest: the
+edits in such a file are not recoverable from mox. A partially owned file's
+snapshot keeps the file with the values under its secret-bearing owned keys
+masked, and every value the run resolved masked wherever it occurs. A file
+whose source left the tree, which apply would remove, shows its live content
+on the removed side, and such a symlink the line `symlink -> <target>`, as
+does an unedited file of a generator that left the tree; a file that does
+not parse in its format is an `ERROR` line on stderr, as apply reports it.
+Read-only: it takes no writer lock, only the readers lock. A difference is
+not an error, so a run that completes exits 0 whether or not anything
+differs. An `attributes.toml`, the repo's or the private layer's, that is
+not valid TOML or cannot be read stops the run with exit 2, as it does in
+every command that reads attributes (add, apply, commit, doctor, edit,
+export, facts, mv, remove and status); rollback warns instead. A refusal
+exits 1: a path that is not managed, a head ownership declaration that does
+not parse, and an attributes entry that breaks the schema, with or without a
+source. A file's own `ERROR` that does not come from an attributes file -- a
+head directive on an unstructured target, one spelled with another file's
+comment marker, a mox directive in strict JSON, or a layer or output that
+does not parse -- is reported and the run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |
@@ -1233,15 +1227,13 @@ chain of snapshots it undoes (it may undo another such snapshot) ends at one
 that is pruned; a chain with a missing link keeps it. An entry that cannot
 be restored is that entry's `ERROR`, naming where its content is, and the
 rest are still restored; one whose kept copy is missing or damaged is
-refused, naming it; one whose snapshot holds a redacted secret line is never
-written ("holds a secret mox does not store; run mox apply to resolve it
-again"); one whose snapshot holds no redacted secret but kept some lines as
-`<mox:redacted-line>`, because a secret line had changed when it was taken,
-is written with them and named with how many lines were not kept; a link
-already as the snapshot has it is left alone and not counted. An
-`attributes.toml` that is not valid TOML or cannot be read is a warning
-here, not exit 2: whole files are still restored, and partial targets cannot
-be re-patched.
+refused, naming it; a file whose content was not kept because it held a
+secret is refused ("its content held a secret and was not kept"); one whose
+snapshot holds a redacted secret line is never written ("holds a secret mox
+does not store; run mox apply to resolve it again"); a link already as the
+snapshot has it is left alone and not counted. An `attributes.toml` that is
+not valid TOML or cannot be read is a warning here, not exit 2: whole files
+are still restored, and partial targets cannot be re-patched.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10, at least 1); an
 apply that displaced or removed something prunes the oldest of the rest,

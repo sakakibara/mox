@@ -311,24 +311,24 @@ All notable changes to mox are documented here. The format follows
   release's history.
 
 ### Fixed
-- A snapshot of a file mox wrote a secret into masks the secret by
-  pairing the file with the outline the last apply recorded, as diff does:
-  a line paired with a secret line's shape is masked at the secret's place,
-  wherever the line has moved, and every value the file's new render wrote,
-  or the run resolved and found in a paired secret line, is masked wherever
-  it occurs. When a secret line pairs with no line, every line paired with
-  nothing is kept as `<mox:redacted-line>`, and rollback says how many
-  lines of the file it did not keep. It used to mask the lines at the
-  places the last apply wrote secrets to, so a secret line the user had
-  moved was kept in clear and the line now in its place was masked. A file
-  whose provenance records no outline has the lines at those places masked
-  as before, and one whose provenance is missing every line.
-- `mox remove --purge` masks the secrets of the file it removes in its
-  snapshot; it kept them in clear.
-- A directory apply removes or replaces with a link is kept in the
-  snapshot with each file mox wrote a secret into masked as a file's own
-  snapshot is; the tree's files were kept in clear. A FIFO or device at the path is removed
-  without being opened; the run used to wait on it forever.
+- A snapshot keeps none of a whole file's prior content when it may hold
+  a secret: mox wrote a secret into the file, or the content holds a value
+  the run resolved, in any form mox writes it in. That holds whatever
+  displaces the file: an overwrite, a removal, `mox remove --purge`, a
+  rollback, or a directory apply removes or replaces with a link, each file
+  of which is judged on its own. The run prints a line naming each such
+  file ("its previous content held a secret and was not kept"), `mox
+  snapshot <id>` lists it as not kept, and rollback reports it as not
+  restored and restores the rest. The edits in such a file are not
+  recoverable from mox. A snapshot used to mask only the lines at the places
+  the last apply wrote secrets to, so a secret line the user had moved, or a
+  copy of the value elsewhere in the file, was kept in clear; `mox remove
+  --purge` and a directory's files kept the secrets in clear.
+- A partially owned file's snapshot masks every value the run resolved,
+  wherever it sits, beside the values under its secret-bearing owned keys;
+  a copy of a value in a section mox does not own was kept in clear.
+- `mox remove --purge` removes a FIFO or device at the path without
+  opening it; the run used to wait on it forever.
 - A value of several lines resolved into a TOML, YAML, INI or gitconfig
   file marks every line it fills as a secret line; only its first line was
   marked, and each later line's mark was shifted onto the lines after it.

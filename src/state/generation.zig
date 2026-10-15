@@ -68,11 +68,19 @@ pub const Planted = struct {
     part: Hex,
 };
 
+/// Why a displaced file's content was not kept.
+pub const NotKept = enum {
+    /// It may have held a secret.
+    secret,
+};
+
 /// One displaced entry, flat: `root` is the key of the directory tree it was
-/// captured in, null for an entry of its own.
+/// captured in, null for an entry of its own. A file has a `blob`, or a
+/// `not_kept` reason and none.
 pub const Displaced = struct {
     type: EntryType,
     blob: ?Hex = null,
+    not_kept: ?NotKept = null,
     target: ?[]const u8 = null,
     mode: ?u32 = null,
     planted: ?Planted = null,
@@ -246,6 +254,7 @@ fn parseDisplaced(arena: std.mem.Allocator, o: json.ObjectMap, root: ?[]const u8
     var d: Displaced = .{
         .type = enumOf(EntryType, o.get("type")) orelse return error.Malformed,
         .blob = try optHex(o.get("blob")),
+        .not_kept = if (o.get("not_kept")) |v| enumOf(NotKept, v) orelse return error.Malformed else null,
         .target = try optPath(arena, o.get("target")),
         .mode = if (o.get("mode")) |m| switch (m) {
             .null => null,
@@ -404,6 +413,7 @@ fn displacedFields(arena: std.mem.Allocator, d: Displaced) !json.ObjectMap {
     var o: json.ObjectMap = .empty;
     try o.put(arena, "type", .{ .string = @tagName(d.type) });
     if (d.blob) |b| try o.put(arena, "blob", .{ .string = try arena.dupe(u8, &b) });
+    if (d.not_kept) |n| try o.put(arena, "not_kept", .{ .string = @tagName(n) });
     if (d.target) |t| try o.put(arena, "target", .{ .string = try applied.pctEncode(arena, t) });
     if (d.mode) |m| try o.put(arena, "mode", .{ .integer = m });
     if (d.planted) |p| {
@@ -569,6 +579,7 @@ test "generation: serialize then parse round-trips every map, members grouped un
     try g.generators.put(a, "/h/gen", .{ .part = h, .produced = &.{ "/h/a", "/h/b" } });
     try g.displaced.put(a, "d", .{ .type = .dir, .mode = 0o700 });
     try g.displaced.put(a, "d/f", .{ .type = .file, .blob = h, .mode = 0o644, .root = "d" });
+    try g.displaced.put(a, "d/s", .{ .type = .file, .not_kept = .secret, .mode = 0o600, .root = "d" });
     try g.displaced.put(a, "l", .{ .type = .link, .target = "/x", .planted = .{ .live = "/h/l", .target = "/x", .part = h } });
 
     const bytes = try serialize(a, g);
@@ -576,6 +587,8 @@ test "generation: serialize then parse round-trips every map, members grouped un
     try std.testing.expectEqualStrings(bytes, try serialize(a, back));
     try std.testing.expectEqualStrings("d", back.displaced.get("d/f").?.root.?);
     try std.testing.expectEqual(@as(u32, 0o700), back.displaced.get("d").?.mode.?);
+    try std.testing.expect(back.displaced.get("d/s").?.not_kept.? == .secret);
+    try std.testing.expect(back.displaced.get("d/s").?.blob == null);
     try std.testing.expectEqualStrings("/r e", back.parts.get(&h).?.repo);
     try std.testing.expect(back.paths.get("/h/link").?.kind == .link);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"tree\"") != null);

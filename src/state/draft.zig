@@ -33,8 +33,8 @@ pub const max_provenance_bytes: usize = 32 * 1024 * 1024;
 
 /// The provenance of a secret-bearing `content`, or, when that would be
 /// longer than `cap`, one that names every line a secret line, with an
-/// outline of the one whole-line shape: diff then masks every live line,
-/// and a snapshot every line, of the file.
+/// outline of the one whole-line shape: diff then masks every live line of
+/// the file.
 pub fn boundedProvenance(arena: std.mem.Allocator, live: []const u8, content: []const u8, segments: []const prov_map.Segment, outline: []const prov_map.Entry, cap: usize) ![]u8 {
     const full = try prov_map.serialize(arena, live, segments, outline);
     if (full.len <= cap) return full;
@@ -42,12 +42,6 @@ pub fn boundedProvenance(arena: std.mem.Allocator, live: []const u8, content: []
     const coarse = [_]prov_map.Segment{.{ .out_start = 0, .out_len = @max(n, 1), .origin = .secret }};
     return prov_map.serialize(arena, live, &coarse, &.{.{ .shape = prov_shapes.whole_line }});
 }
-
-/// A file as this run composed it: its bytes and their provenance.
-pub const Render = struct {
-    bytes: []const u8,
-    segments: []const prov_map.Segment,
-};
 
 pub const Store = struct {
     state_dir: []const u8,
@@ -137,9 +131,12 @@ pub const Draft = struct {
     changed: bool = false,
     committed: bool = false,
     /// The secret values this run resolved: a provenance with a secret
-    /// segment finds its slots by them, and stored prior content is masked
-    /// with them.
+    /// segment finds its slots by them, and prior content holding one is
+    /// not kept.
     secrets: ?*const secret_cache.Cache = null,
+    /// The live paths whose prior content this run did not keep because it
+    /// may have held a secret, in the order it met them.
+    not_kept: std.ArrayList([]const u8) = .empty,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
     /// What a step that waits for the readers says first.
@@ -257,29 +254,31 @@ pub const Draft = struct {
         return prov_map.deserialize(d.arena, bytes) catch null;
     }
 
-    /// `content`, what was at `live` before this run replaces it, as a
-    /// snapshot keeps it. Paired with the outline the last apply wrote the
-    /// file with, each line that pairs with a secret line's shape is masked at
-    /// its slots, and, when a secret line pairs with none, every line paired
-    /// with nothing is replaced whole. Every value this run resolved that sits
-    /// in a paired slot, and, when this run rendered the file anew (`render`),
-    /// every value that render wrote, is masked wherever it occurs. When the
-    /// provenance names secret lines but holds no outline, the lines at the
-    /// positions it names are replaced whole; when it is missing for a record
-    /// written for a secret, every line is: the values the file was written
-    /// with are not known.
-    pub fn redactPrior(d: *Draft, live: []const u8, content: []const u8, render: ?Render) ![]const u8 {
-        const all = if (d.secrets) |c| try c.values(d.arena) else &.{};
-        const values = if (render) |r| try prov_shapes.renderValues(d.arena, r.bytes, r.segments, all) else &.{};
+    /// Whether `content`, what is at `live` before this run replaces or
+    /// removes it, may hold a secret: the provenance mox last wrote `live`
+    /// with names a secret line, its record was written for a secret, or
+    /// `content` holds a written form of a value this run resolved.
+    pub fn priorHoldsSecret(d: *Draft, live: []const u8, content: []const u8) !bool {
         if (try d.provenance(live)) |m| {
-            if (m.secretOutline()) |outline| return prov_shapes.redactStored(d.arena, content, outline, all, values);
-            return prov_shapes.redactAt(d.arena, content, m.segments, try prov_shapes.writtenForms(d.arena, values));
+            if (prov_map.hasSecret(m.segments)) return true;
+            if (m.secretOutline()) |o| for (o) |e| if (e == .shape) return true;
         }
-        if (d.fileRecord(live)) |f| if (f.cache_blob == null) {
-            const whole = [_]prov_map.Segment{.{ .out_start = 0, .out_len = std.math.maxInt(u32), .origin = .secret }};
-            return prov_shapes.redactAt(d.arena, content, &whole, .none);
-        };
-        return prov_shapes.redactStored(d.arena, content, &.{}, &.{}, values);
+        if (d.fileRecord(live)) |f| if (f.cache_blob == null) return true;
+        if (d.ownedRec(live)) |o| if (o.secret) return true;
+        return prov_shapes.holdsAny(d.arena, content, if (d.secrets) |c| try c.values(d.arena) else &.{});
+    }
+
+    /// Every written form of every value this run resolved.
+    pub fn resolvedForms(d: *const Draft) !prov_shapes.Forms {
+        const all = if (d.secrets) |c| try c.values(d.arena) else &.{};
+        return prov_shapes.writtenForms(d.arena, all);
+    }
+
+    /// `content` with every written form of every value this run resolved
+    /// masked: how a partially owned file's prior content is kept, beside
+    /// its owned secret paths.
+    pub fn maskResolved(d: *const Draft, content: []const u8) ![]const u8 {
+        return prov_shapes.maskForms(d.arena, content, try d.resolvedForms());
     }
 
     /// The generator at `gen_live`'s produced set.
@@ -649,6 +648,28 @@ pub const Draft = struct {
         return (try source_path.liveKeyUnderHome(d.arena, home, live)) orelse error.LiveFileOutsideHome;
     }
 
+    /// Keep `content`, what the whole file at `live` holds now, before the
+    /// run replaces or removes it; when it may hold a secret
+    /// (`priorHoldsSecret`), keep none of it (`saveNotKept`).
+    pub fn keepPrior(d: *Draft, home: []const u8, live: []const u8, content: []const u8) !void {
+        if (try d.priorHoldsSecret(live, content)) return d.saveNotKept(home, live);
+        return d.save(home, live, content);
+    }
+
+    /// Note that the file at `live` is displaced with none of its content
+    /// kept, since it may hold a secret.
+    pub fn saveNotKept(d: *Draft, home: []const u8, live: []const u8) !void {
+        const key = try d.displacedKey(home, live);
+        const st = try Io.Dir.cwd().statFile(d.io, live, .{});
+        try d.setDisplaced(key, .{ .type = .file, .not_kept = .secret, .mode = write_mod.modeOf(st.permissions) });
+        try d.noteNotKept(live);
+    }
+
+    fn noteNotKept(d: *Draft, live: []const u8) !void {
+        for (d.not_kept.items) |l| if (std.mem.eql(u8, l, live)) return;
+        try d.not_kept.append(d.arena, try d.arena.dupe(u8, live));
+    }
+
     /// Keep `content`, what `live` holds now, before the run replaces it.
     pub fn save(d: *Draft, home: []const u8, live: []const u8, content: []const u8) !void {
         const key = try d.displacedKey(home, live);
@@ -680,7 +701,8 @@ pub const Draft = struct {
     }
 
     /// Keep a captured directory tree: its root `dir_live`, and every member
-    /// by its full key, each file as `redactPrior` keeps it.
+    /// by its full key, a file that may hold a secret with none of its
+    /// content, as `keepPrior` keeps it.
     pub fn saveTree(d: *Draft, home: []const u8, dir_live: []const u8, captured: Captured) !void {
         const root = try d.displacedKey(home, dir_live);
         for (captured.dirs) |c| {
@@ -689,7 +711,12 @@ pub const Draft = struct {
         }
         for (captured.files) |c| {
             const key = try d.displacedKey(home, c.live);
-            const h = try blob.put(d.arena, d.io, d.store.blobs, try d.redactPrior(c.live, c.content, null));
+            if (try d.priorHoldsSecret(c.live, c.content)) {
+                try d.setDisplaced(key, .{ .type = .file, .not_kept = .secret, .mode = c.mode, .root = root });
+                try d.noteNotKept(c.live);
+                continue;
+            }
+            const h = try blob.put(d.arena, d.io, d.store.blobs, c.content);
             try d.setDisplaced(key, .{ .type = .file, .blob = h, .mode = c.mode, .root = root });
         }
         for (captured.symlinks) |c| {
@@ -750,7 +777,7 @@ pub const Draft = struct {
                     const v = op.value orelse continue;
                     const x = generation.parseFlatDisplaced(d.arena, v) catch continue;
                     try entries.append(d.arena, .{ .key = op.key, .type = x.type, .where = switch (x.type) {
-                        .file => try blob.pathOf(d.arena, d.store.blobs, x.blob orelse continue),
+                        .file => if (x.not_kept != null) "not kept: its content held a secret" else try blob.pathOf(d.arena, d.store.blobs, x.blob orelse continue),
                         .link => x.target orelse "",
                         .dir => "",
                     } });
@@ -1055,8 +1082,12 @@ test "boundedProvenance: one longer than the cap becomes a whole-file secret of 
     try std.testing.expect(m.segments[0].origin == .secret);
     try std.testing.expectEqual(@as(usize, 1), m.secretOutline().?.len);
     try std.testing.expect(m.secretOutline().?[0].shape.wholeLine());
-    const kept = try prov_shapes.redactStored(a, content.items, m.secretOutline().?, &.{}, &.{});
-    try std.testing.expect(std.mem.indexOf(u8, kept, "plain") == null);
-    try std.testing.expect(std.mem.indexOf(u8, kept, "token") == null);
+    const lines = try @import("../diff/lines.zig").splitLines(a, content.items);
+    const p = try prov_shapes.pair(a, m.secretOutline().?, lines);
+    for (lines, 0..) |l, j| {
+        const shown = try prov_shapes.shown(a, m.secretOutline().?, p, j, l, .none);
+        try std.testing.expect(std.mem.indexOf(u8, shown, "plain") == null);
+        try std.testing.expect(std.mem.indexOf(u8, shown, "token") == null);
+    }
     try std.testing.expectEqualStrings(full, try boundedProvenance(a, "/h/f", content.items, segs.items, outline, full.len));
 }

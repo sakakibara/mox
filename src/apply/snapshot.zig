@@ -98,35 +98,28 @@ pub fn saveTree(arena: std.mem.Allocator, io: Io, st: *state.Draft, home: []cons
 
 pub const Restored = struct {
     count: usize = 0,
-    /// Files restored with lines their snapshot did not keep: a secret line
-    /// had changed when it was taken, and each line it could not tell was
-    /// free of the secret is `prov_map.line_redaction`.
-    partial: []const Partial = &.{},
     /// Entries not restored: each names its live path and where the
     /// generation keeps it.
     refused: []const Refused = &.{},
 };
 
 /// Where a refused entry's content is: a file's kept copy, the target a
-/// link held, or the generation and key a directory is kept under.
+/// link held, or the generation and key a directory is kept under; for a
+/// file whose content was not kept, nowhere.
 pub const Copy = union(enum) {
+    none,
     blob: []const u8,
     target: []const u8,
     entry: struct { gen: []const u8, key: []const u8 },
 
     pub fn format(c: Copy, w: *Io.Writer) Io.Writer.Error!void {
         switch (c) {
+            .none => try w.writeAll("its content was not kept"),
             .blob => |p| try w.print("the snapshot copy is at {s}", .{p}),
             .target => |t| try w.print("the link it held points to {s}", .{t}),
             .entry => |e| try w.print("generation {s} keeps it under key {s}", .{ e.gen, e.key }),
         }
     }
-};
-
-pub const Partial = struct {
-    live_path: []const u8,
-    /// The lines not kept.
-    lines: usize,
 };
 
 pub const Refused = struct {
@@ -151,6 +144,8 @@ pub const Refused = struct {
         redacted,
         /// The kept content is missing or no longer matches its name.
         missing,
+        /// Its content may have held a secret, and was not kept.
+        not_kept,
     };
 };
 
@@ -198,7 +193,7 @@ fn keepReplaced(arena: std.mem.Allocator, io: Io, st: *state.Draft, home: []cons
             if (write_mod.guardLiveRead(io, live) == .special) return;
             const bytes = try Io.Dir.cwd().readFileAlloc(io, live, arena, .limited(64 * 1024 * 1024));
             if (incoming) |in| if (std.mem.eql(u8, in, bytes)) return;
-            try st.save(home, live, try st.redactPrior(live, bytes, null));
+            try st.keepPrior(home, live, bytes);
         },
     }
 }
@@ -227,7 +222,6 @@ pub fn restoreExcept(
 ) !Restored {
     var result: Restored = .{};
     var refused: std.ArrayList(Refused) = .empty;
-    var partial: std.ArrayList(Partial) = .empty;
     var planted = std.StringHashMap(state.generation.Planted).init(arena);
     for (src.displaced.values()) |d| if (d.planted) |p| try planted.put(p.live, p);
 
@@ -247,8 +241,12 @@ pub fn restoreExcept(
                 try dirs.append(arena, .{ .live = live, .mode = d.mode orelse 0o755 });
             },
             .file => {
+                if (d.not_kept != null) {
+                    try refused.append(arena, .{ .live_path = live, .copy = .none, .why = .not_kept });
+                    continue;
+                }
                 const copy: Copy = .{ .blob = try st.blobPath(d.blob orelse continue) };
-                restoreFile(arena, io, st, d, live, home, skip, skipped, &result, &refused, &partial) catch |e| switch (e) {
+                restoreFile(arena, io, st, d, live, home, skip, skipped, &result, &refused) catch |e| switch (e) {
                     error.OutOfMemory => return e,
                     else => try refused.append(arena, .{ .live_path = live, .copy = copy, .why = .failed, .reason = @errorName(e) }),
                 };
@@ -268,7 +266,6 @@ pub fn restoreExcept(
         try write_mod.setMode(dirs.items[i].live, dirs.items[i].mode);
     }
     result.refused = try refused.toOwnedSlice(arena);
-    result.partial = try partial.toOwnedSlice(arena);
     return result;
 }
 
@@ -303,7 +300,6 @@ fn restoreFile(
     skipped: ?*std.ArrayList(Withheld),
     result: *Restored,
     refused: *std.ArrayList(Refused),
-    partial: *std.ArrayList(Partial),
 ) !void {
     const copy: Copy = .{ .blob = try st.blobPath(d.blob.?) };
     // A withheld partial target is re-patched by the caller, through a link
@@ -333,19 +329,6 @@ fn restoreFile(
     try write_mod.writeAtomic(io, live, content, d.mode orelse 0o644);
     try st.forgetSymlink(live);
     result.count += 1;
-    const lost = linesNotKept(content);
-    if (lost > 0) try partial.append(arena, .{ .live_path = live, .lines = lost });
-}
-
-/// The lines of `content` a snapshot replaced whole for a changed secret
-/// line.
-fn linesNotKept(content: []const u8) usize {
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, content, '\n');
-    while (it.next()) |l| {
-        if (std.mem.eql(u8, std.mem.trimEnd(u8, l, "\r"), prov_map.line_redaction)) n += 1;
-    }
-    return n;
 }
 
 fn restoreLink(

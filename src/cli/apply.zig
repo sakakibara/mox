@@ -2308,11 +2308,11 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
         try ctx.out.print("  would write {s}\n", .{shown});
         return;
     }
-    // About to replace existing content: snapshot it first (secret lines
-    // redacted), and refuse the overwrite if the snapshot cannot be taken.
+    // About to replace existing content: snapshot it first (none of it when
+    // it may hold a secret), and refuse the overwrite if the snapshot cannot
+    // be taken.
     if (disposition != .fresh_write) {
-        const snap_content = try st.redactPrior(in.live_path, live.?, .{ .bytes = in.bytes, .segments = in.prov_items });
-        st.save(context.paths.home, in.live_path, snap_content) catch |e| {
+        st.keepPrior(context.paths.home, in.live_path, live.?) catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             try ctx.err.flush();
             counts.fail += 1;
@@ -2698,8 +2698,9 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
 
     if (live != null) {
         // Snapshot the whole pre-write live file, with values under
-        // secret-bearing owned paths (recorded or current) masked so the
-        // snapshot never stores a resolved secret.
+        // secret-bearing owned paths (recorded or current) and every value
+        // this run resolved masked, so the snapshot never stores a resolved
+        // secret.
         const recorded_secret: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
         var current_secret: std.ArrayList(mox.source.tree.OwnPath) = .empty;
         for (secret_scope, secret_flags) |p, flagged| {
@@ -2715,7 +2716,7 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
                 return;
             },
         };
-        st.save(context.paths.home, live_path, snap_content) catch |e| {
+        st.save(context.paths.home, live_path, try st.maskResolved(snap_content)) catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             try ctx.err.flush();
             counts.fail += 1;

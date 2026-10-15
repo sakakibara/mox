@@ -177,9 +177,9 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
     // cache, symlink target, owned record) and its provenance: mox stopped
     // tracking it, and a stale record would make a later re-add at the same
     // path compare against state from the previous management era instead of
-    // going through first contact. A file --purge removes is read and its
-    // snapshot masked first, while the records that say where its secrets
-    // are still exist.
+    // going through first contact. A file --purge removes is read, and
+    // whether it may hold a secret judged, first, while the records that
+    // say so still exist.
     // A FIFO or device is never opened: it would block, and holds nothing
     // to keep.
     const readable = purge and mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path) == .other and
@@ -188,7 +188,7 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
         try ctx.err.print("mox remove: cannot read {f} to back it up, not deleting: {s}\n", .{ display.of(live_path, context.paths.home), @errorName(e) });
         return 1;
     } else null;
-    const purged_kept: ?[]const u8 = if (purged) |b| try st.redactPrior(live_path, b, null) else null;
+    const purged_secret = if (purged) |b| try st.priorHoldsSecret(live_path, b) else false;
     try st.forget(live_path);
     try st.forgetProvenance(live_path);
 
@@ -269,7 +269,7 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
             .other => blk: {
                 if (purged) |b| {
                     expect = b;
-                    break :blk .{ .file = purged_kept.? };
+                    break :blk if (purged_secret) .secret_file else .{ .file = b };
                 }
                 if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) break :blk .special;
                 const live = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
