@@ -2404,10 +2404,34 @@ test "apply: a file mox wrote a secret into, replaced by a symlink, is kept mask
     const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "LINKEDSECRET" }});
     try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntok=<secret:env:MOX_TEST_TOKEN>\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try Io.Dir.cwd().deleteFile(io, try h.srcOf(".cfg"));
-    try tmp.dir.symLink(io, "/nonexistent-target", "repo/src/.cfg", .{});
-    _ = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try writeRepo(io, &tmp, "repo/src/.cfg", "/nonexistent-target\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".cfg\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
     try std.testing.expect(!try stateHolds(h, "LINKEDSECRET"));
+    try std.testing.expect(try stateHolds(h, "a\ntok=" ++ redacted_secret ++ "\n"));
+}
+
+test "apply: a directory holding a file mox wrote a secret into, replaced by a symlink, is kept masked in the snapshot" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "TREESECRET" }});
+    try writeRepo(io, &tmp, "repo/src/.conf.d/app.cfg", "a\ntok=<secret:env:MOX_TEST_TOKEN>\n");
+    try writeRepo(io, &tmp, "repo/src/.conf.d/plain.cfg", "plain\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("a\ntok=TREESECRET\n", try read(io, a, try h.liveOf(".conf.d/app.cfg")));
+    try tmp.dir.deleteTree(io, "repo/src/.conf.d");
+    try writeRepo(io, &tmp, "repo/src/.conf.d", "/nonexistent-target\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".conf.d\"]\nsymlink = true\n");
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!try stateHolds(h, "TREESECRET"));
+    try std.testing.expect(try stateHolds(h, "a\ntok=" ++ redacted_secret ++ "\n"));
+    try std.testing.expect(try stateHolds(h, "plain\n"));
 }
 
 test "uninstall: a state directory holding nothing mox made is refused, and nothing in it is followed, created or removed" {

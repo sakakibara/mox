@@ -324,7 +324,10 @@ All notable changes to mox are documented here. The format follows
   whose provenance records no outline has the lines at those places masked
   as before, and one whose provenance is missing every line.
 - `mox remove --purge` masks the secrets of the file it removes in its
-  snapshot; it kept them in clear. A FIFO or device at the path is removed
+  snapshot; it kept them in clear.
+- A directory apply removes or replaces with a link is kept in the
+  snapshot with each file mox wrote a secret into masked as a file's own
+  snapshot is; the tree's files were kept in clear. A FIFO or device at the path is removed
   without being opened; the run used to wait on it forever.
 - A value of several lines resolved into a TOML, YAML, INI or gitconfig
   file marks every line it fills as a secret line; only its first line was

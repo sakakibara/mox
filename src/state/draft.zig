@@ -680,7 +680,7 @@ pub const Draft = struct {
     }
 
     /// Keep a captured directory tree: its root `dir_live`, and every member
-    /// by its full key.
+    /// by its full key, each file as `redactPrior` keeps it.
     pub fn saveTree(d: *Draft, home: []const u8, dir_live: []const u8, captured: Captured) !void {
         const root = try d.displacedKey(home, dir_live);
         for (captured.dirs) |c| {
@@ -689,7 +689,7 @@ pub const Draft = struct {
         }
         for (captured.files) |c| {
             const key = try d.displacedKey(home, c.live);
-            const h = try blob.put(d.arena, d.io, d.store.blobs, c.content);
+            const h = try blob.put(d.arena, d.io, d.store.blobs, try d.redactPrior(c.live, c.content, null));
             try d.setDisplaced(key, .{ .type = .file, .blob = h, .mode = c.mode, .root = root });
         }
         for (captured.symlinks) |c| {

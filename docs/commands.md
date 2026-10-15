@@ -813,15 +813,16 @@ what diff needs, or, for a file with edits, `mox apply --overwrite <path>`,
 which writes it again and keeps the edits in a snapshot. What a snapshot
 keeps of content apply displaces is masked by the same pairing, whatever
 displaces it (an overwrite, a removal, `mox remove --purge`, a rollback's
-own history): a line paired with a shape is masked at its slots, a line
-paired with nothing is masked at the spans of every shape of the outline it
-matches, and when a secret line is lost, every line paired with nothing is
-kept as `<mox:redacted-line>`, which rollback puts back, saying how many
-lines of the file were not kept, when the copy holds no
-`<mox:redacted-secret>` (one that does, it refuses). Every value the run
-resolved that sits in a paired slot, and every value the file's new render
-wrote, is masked wherever it occurs; any other line is kept as it is, so
-rollback puts back the lines you edited. While no secret line is lost, a
+own history, or a directory apply removes or replaces with a link, each file
+of which is paired with its own provenance): a line paired with a shape is
+masked at its slots, a line paired with nothing is masked at the spans of
+every shape of the outline it matches, and when a secret line is lost, every
+line paired with nothing is kept as `<mox:redacted-line>`, which rollback
+puts back, saying how many lines of the file were not kept, when the copy
+holds no `<mox:redacted-secret>` (one that does, it refuses). Every value
+the run resolved that sits in a paired slot, and every value the file's new
+render wrote, is masked wherever it occurs; any other line is kept as it is,
+so rollback puts back the lines you edited. While no secret line is lost, a
 line you edited that holds a value the run neither wrote into the file nor
 resolved into one of its paired secret lines is kept with that value in the
 snapshot, in the state directory. A file whose provenance names secret lines
