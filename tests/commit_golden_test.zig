@@ -1289,7 +1289,7 @@ test "commit golden: a bare field capture under a loop variable not named entry"
     try expectGolden(a, io, h, res, &.{}, want);
 }
 
-test "commit golden: a loop row edited beside a row whose data value resolves a secret" {
+test "commit golden: a loop row edited beside a row whose data value resolves a secret is not routed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1305,12 +1305,11 @@ test "commit golden: a loop row edited beside a row whose data value resolves a 
 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     const want =
-        \\rc 0
+        \\rc 1
         \\--- stdout
-        \\  update <ROOT>/repo/data/exports.toml row 1
-        \\  committed ~/.exports
+        \\  manual: ~/.exports:2 may hold a secret: a line mox did not write, in a file it wrote a secret into
         \\
-        \\mox commit: 1 routed, 0 coupled, 0 manual
+        \\mox commit: 0 routed, 0 coupled, 1 manual
         \\--- stderr
         \\--- repo
         \\data/
@@ -1321,7 +1320,7 @@ test "commit golden: a loop row edited beside a row whose data value resolves a 
         \\
         \\[[exports]]
         \\name = "EDITOR"
-        \\value = "nvim"
+        \\value = "vim"
         \\src/
         \\== src/.exports
         \\# mox: for entry in "data/exports.toml"
@@ -1332,8 +1331,8 @@ test "commit golden: a loop row edited beside a row whose data value resolves a 
         \\coupling/graph.json 353b9360c0adad2a
         \\part 0 expects-private no
         \\path {~/.exports}
-        \\  file 7128997af61f937c0e69ef1d0627e5ce9c27596971727bab41cce7ba6609eec7 cache none
-        \\  provenance bf745686c9d01a6fe878e173e5c0a2a2eb9a708e5ee90f1275ca6cd426efed2c
+        \\  file 288448d195720e1cec9b43ebb2559af673526925bbd1e714a002d6bcbb8ea394 cache none
+        \\  provenance 74b61a8a0bf9383efc5f1865060ea5b34f1326ca3de25391f9e528705bf5e204
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);
@@ -1390,7 +1389,7 @@ test "commit golden: a first-contact loop file confirmed at the prompt with a ro
     try expectGolden(a, io, h, res, &.{}, want);
 }
 
-test "commit golden: a loop row edited in a file that resolves a secret" {
+test "commit golden: a loop row edited in a file that resolves a secret is not routed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1406,12 +1405,11 @@ test "commit golden: a loop row edited in a file that resolves a secret" {
 
     const res = try h.run(&.{ "mox", "commit", "--yes", "--color=never" });
     const want =
-        \\rc 0
+        \\rc 1
         \\--- stdout
-        \\  update <ROOT>/repo/data/abbrs.toml row 1
-        \\  committed ~/.abbrs
+        \\  manual: ~/.abbrs:3 may hold a secret: a line mox did not write, in a file it wrote a secret into
         \\
-        \\mox commit: 1 routed, 0 coupled, 0 manual
+        \\mox commit: 0 routed, 0 coupled, 1 manual
         \\--- stderr
         \\--- repo
         \\data/
@@ -1422,7 +1420,7 @@ test "commit golden: a loop row edited in a file that resolves a secret" {
         \\
         \\[[abbrs]]
         \\key = "gs"
-        \\expansion = "git status -sb"
+        \\expansion = "git status"
         \\src/
         \\== src/.abbrs
         \\export TOKEN=<secret:env:MOX_GOLDEN_TOKEN>
@@ -1434,8 +1432,8 @@ test "commit golden: a loop row edited in a file that resolves a secret" {
         \\coupling/graph.json 353b9360c0adad2a
         \\part 0 expects-private no
         \\path {~/.abbrs}
-        \\  file 4f0c77cb7fa7df587c833d082580d74d7ef38d52bfa651e4f52aed83bc2f8af1 cache none
-        \\  provenance 5800f3a7e0aa9dce91ee62fa5bcec531886f0b8b2788994368c01e4d6670eb64
+        \\  file 9478a298253034d11c599e3e1f5ae8f7caac285577d3068106469e0d07bb5879 cache none
+        \\  provenance 860034378adfa7f37d54a24c8d6541e3cb567f839797d900cbf89ae8cfa6db1b
         \\
     ;
     try expectGolden(a, io, h, res, &.{}, want);

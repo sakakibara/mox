@@ -248,7 +248,7 @@ pub const Draft = struct {
     }
 
     /// The provenance kept for `live`, or null when none or malformed.
-    pub fn provenance(d: *Draft, live: []const u8) !?prov_map.Map {
+    pub fn provenance(d: *const Draft, live: []const u8) !?prov_map.Map {
         const h = d.provenanceBlob(live) orelse return null;
         const bytes = (try blob.get(d.arena, d.io, d.store.blobs, h)) orelse return null;
         return prov_map.deserialize(d.arena, bytes) catch null;
@@ -266,7 +266,7 @@ pub const Draft = struct {
     /// Whether mox last wrote `live` with a secret: the provenance it kept
     /// names a secret line (a `.secret` segment, an outline with a shape),
     /// or the record was written for a secret.
-    pub fn wroteSecret(d: *Draft, live: []const u8) !bool {
+    pub fn wroteSecret(d: *const Draft, live: []const u8) !bool {
         if (try d.provenance(live)) |m| {
             if (prov_map.hasSecret(m.segments)) return true;
             if (m.secretOutline()) |o| for (o) |e| if (e == .shape) return true;

@@ -326,6 +326,15 @@ All notable changes to mox are documented here. The format follows
   the last apply wrote secrets to, so a secret line the user had moved, or a
   copy of the value elsewhere in the file, was kept in clear; `mox remove
   --purge` and a directory's files kept the secrets in clear.
+- `mox commit` routes no live line of a file mox wrote a secret into
+  unless the line is one mox wrote that holds no secret: an edited or
+  added line, which may hold a value no resolved secret finds, makes its
+  hunk manual, by `--dry-run`, `--yes` and the prompt alike, and the prompt
+  shows it as `<mox:redacted-line>`. Every line a hunk prints has every
+  value the run resolved masked. A line holding the resolved value beside
+  the secret line (`old=<value>`) used to be printed and, once accepted,
+  written into the source. This also leaves a loop row edited in such a
+  file to be kept by hand.
 - A partially owned file's snapshot masks every value the run resolved,
   wherever it sits, beside the values under its secret-bearing owned keys;
   a copy of a value in a section mox does not own was kept in clear.

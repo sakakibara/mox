@@ -458,7 +458,15 @@ and one that aborts releases nothing.
 Base lines go to `src/`, fragment lines to their fragment, loop-row edits
 to the loop's data source (see Loop rows). Private-origin edits go only to
 the private layer, never repo `src/`. A value derived from a secret or an
-interpolation is reported, never routed. A source reached through two
+interpolation is reported, never routed. In a file mox last wrote with a
+secret (as `mox diff` decides it), a hunk is routed only when every live
+line in it is a line mox wrote that no secret was written into: any other
+live line, edited or added, may hold a value no resolved secret finds, so
+its hunk is reported `manual: <path>:<line> may hold a secret: a line mox
+did not write, in a file it wrote a secret into`, by `--dry-run`, `--yes`
+and the prompt alike, and the prompt shows such a line as
+`<mox:redacted-line>`. Every line a hunk prints has every value the run
+resolved masked as `<mox:redacted-secret>`. A source reached through two
 spellings -- a symlink, a `./`, a hard link -- is one file, planned and
 written once.
 

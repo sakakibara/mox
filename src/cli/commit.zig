@@ -61,6 +61,7 @@ const interp = mox.compose.interp;
 const Io = std.Io;
 const Segment = mox.provenance.map.Segment;
 const Hunk = mox.diff.lines.Hunk;
+const shapes = mox.provenance.shapes;
 const candidates = mox.classify.candidates;
 const impact = mox.classify.impact;
 const config_space = mox.classify.config_space;
@@ -1622,7 +1623,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
             // but mox never wrote it here (first contact -- e.g. inherited
             // from another tool during a migration). `keep` is universal, so
             // this recomposes a fresh baseline instead of skipping outright.
-            switch (try processFallbackFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, live, .first_contact)) {
+            switch (try processFallbackFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, live, .first_contact, try secretOutlineOf(st, file.live_path))) {
                 .cont => {},
                 .abort => {
                     aborted = true;
@@ -1644,7 +1645,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
             // A record (content hash) exists, but a secret-bearing
             // composition's cleartext is deliberately never cached: recompose
             // to rebuild a verifiable baseline instead of skipping outright.
-            switch (try processFallbackFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, live, .{ .secret = recorded.? })) {
+            switch (try processFallbackFile(&cc, &ra, file, fidx, spaces, context.paths.repo_dir, live, .{ .secret = recorded.? }, try secretOutlineOf(st, file.live_path))) {
                 .cont => {},
                 .abort => {
                     aborted = true;
@@ -1752,6 +1753,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         const space = spaces[fidx].?;
 
         var lf: LoopFile = .{ .file = file, .stored = true, .segments = prov.segments, .a_lines = a_lines, .b_lines = b_lines };
+        lf.guard = try guardOf(&cc, a_lines, b_lines, try secretOutlineOf(st, file.live_path));
         // The stored-baseline path never carries a `.secret` segment (its
         // cleartext is never cached in the first place, so a secret-bearing
         // file never reaches here with a `last_content` to diff against);
@@ -4738,6 +4740,8 @@ fn processFallbackFile(
     repo_dir: []const u8,
     live: []const u8,
     kind: FallbackKind,
+    /// `secretOutlineOf` the live path.
+    outline: ?[]const shapes.Entry,
 ) !HunkOutcome {
     if (kind == .secret and std.mem.eql(u8, &kind.secret, &mox.apply.applied.contentHashHex(live))) {
         // Unedited: live still holds exactly what mox last wrote. No need to
@@ -4809,7 +4813,7 @@ fn processFallbackFile(
     // format -- a non-secret key elsewhere in the same overlaid file reports
     // manual ("came from a structural merge") rather than routing by key,
     // which is conservative, not unsafe.
-    if (!has_secret) {
+    if (!has_secret and outline == null) {
         if (file.format) |sf| {
             if (containsOverlayOrigin(prov.items)) {
                 spaces[fidx] = try structFileSpace(cc.arena, cc.io, cc.this_bindings, file, repo_dir);
@@ -4856,6 +4860,13 @@ fn processFallbackFile(
     // another tool (whitespace, trailing newline, key order) shows up as a
     // spurious hunk the user skips there, exactly like any other hunk.
     var lf: LoopFile = .{ .file = file, .stored = false, .segments = prov.items, .a_lines = a_lines, .b_lines = b_lines };
+    // The baseline of a `.secret` fallback hashes to what mox last wrote, so
+    // its own outline stands in for one the provenance does not record.
+    const guard_outline = if (outline) |o|
+        (if (o.len == 0 and kind == .secret) try shapes.outlineOf(cc.arena, baseline, prov.items, try cc.secrets.cache.values(cc.arena)) else o)
+    else
+        null;
+    lf.guard = try guardOf(cc, a_lines, b_lines, guard_outline);
     return processFileHunks(cc, ra, file, fidx, space, hunks, secret_lines, kind == .first_contact, &lf);
 }
 
@@ -5249,8 +5260,19 @@ fn processGeneratorLeaf(
         return .cont;
     }
 
+    // A leaf whose provenance records no outline is paired with its render's
+    // when that render is what mox last wrote.
+    var outline = try secretOutlineOf(st, leaf.live_path);
+    if (outline) |o| if (o.len == 0) if (recorded) |hash| if (std.mem.eql(u8, &hash, &mox.apply.applied.contentHashHex(leaf.content))) {
+        outline = try shapes.outlineOf(cc.arena, leaf.content, leaf.prov, try cc.secrets.cache.values(cc.arena));
+    };
+    const guard = try guardOf(cc, a_lines, b_lines, outline);
     for (hunks, 0..) |hunk, hi| {
-        switch (try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, hunk, hi + 1, hunks.len, secret_lines, first_contact, stale, gen)) {
+        const outcome = if (guard.refuses(hunk))
+            try reportGeneratedManual(cc, ra, fidx, leaf, hunk, hi + 1, hunks.len, secret_lines, guard.a, guard.b, secret_line_reason, hunkTouchesSecret(leaf.prov, hunk))
+        else
+            try processGeneratedHunk(cc, ra, gen_file, fidx, leaf, a_lines, b_lines, guard, hunk, hi + 1, hunks.len, secret_lines, first_contact, stale, gen);
+        switch (outcome) {
             .cont => {},
             .abort => return .abort,
             .abort_strict => return .abort_strict,
@@ -5277,6 +5299,8 @@ fn processGeneratedHunk(
     leaf: mox.compose.catB.GeneratedFile,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
+    /// How `a_lines` and `b_lines` print.
+    guard: Guard,
     hunk: Hunk,
     hunk_no: usize,
     hunk_total: usize,
@@ -5286,12 +5310,12 @@ fn processGeneratedHunk(
     gen: *LeafRowEdits,
 ) !HunkOutcome {
     if (hunkTouchesSecret(leaf.prov, hunk)) {
-        return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, secret_lines, a_lines, b_lines, "came from a secret", true);
+        return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, secret_lines, guard.a, guard.b, "came from a secret", true);
     }
-    if (stale) return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, "data row no longer matches what the last apply wrote", false);
+    if (stale) return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, guard.a, guard.b, "data row no longer matches what the last apply wrote", false);
 
     if (leaf.template.len > 0) {
-        if (a_lines.len > 1) return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, "data row spans several lines", false);
+        if (a_lines.len > 1) return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, guard.a, guard.b, "data row spans several lines", false);
         if (hunk.a_len == 1 and hunk.b_len == 1) {
             const site: RowSite = .{
                 .data_source = leaf.data_source,
@@ -5303,7 +5327,7 @@ fn processGeneratedHunk(
             };
             switch (try planRowWrite(cc, gen_file, site, b_lines[hunk.b_start])) {
                 .no_match => {},
-                .manual => |reason| return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, reason, false),
+                .manual => |reason| return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, guard.a, guard.b, reason, false),
                 .write => |w| {
                     if (first_contact and !cc.interactive) return firstContactLeafManual(cc, ra, fidx, leaf, hunk);
                     const edit: RowEdit = .{
@@ -5322,8 +5346,8 @@ fn processGeneratedHunk(
                         .site = site,
                     };
                     if (try conflictOf(cc, ra, &.{rowFootprint(edit)})) |reason|
-                        return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, a_lines, b_lines, reason, false);
-                    return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, a_lines, b_lines, edit, gen);
+                        return reportGeneratedManual(cc, ra, fidx, leaf, hunk, hunk_no, hunk_total, null, guard.a, guard.b, reason, false);
+                    return acceptGeneratedRow(cc, ra, gen_file, fidx, leaf, hunk, hunk_no, hunk_total, guard.a, guard.b, edit, gen);
                 },
             }
         }
@@ -5338,8 +5362,8 @@ fn processGeneratedHunk(
         hunk_no,
         hunk_total,
         null,
-        a_lines,
-        b_lines,
+        guard.a,
+        guard.b,
         try std.fmt.allocPrint(
             cc.arena,
             "comes from the generator's shared template -- this generator produces one file per row, and every one of them shares this text; edit the generator's source directly ({s})",
@@ -6428,7 +6452,12 @@ fn processHunk(
     /// Whether an interactive run may offer to split it.
     can_split: bool,
 ) !HunkOutcome {
-    const route = try unlessConflicting(cc, ra, given orelse try routeHunk(cc, lf, hunk));
+    const route: Route = if (lf.guard != null and lf.guard.?.refuses(hunk))
+        .{ .manual = secret_line_reason }
+    else
+        try unlessConflicting(cc, ra, given orelse try routeHunk(cc, lf, hunk));
+    const shown_a = if (lf.guard) |g| g.a else a_lines;
+    const shown_b = if (lf.guard) |g| g.b else b_lines;
     switch (route) {
         .manual => |reason| {
             // A hunk covering (or straddling into) a `.secret` segment's
@@ -6450,9 +6479,9 @@ fn processHunk(
             }
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
             if (touches_secret) {
-                try printSecretNotice(cc, secret_lines, hunk, b_lines);
+                try printSecretNotice(cc, secret_lines, hunk, shown_b);
             } else {
-                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
             }
             const legend_line = try legend(cc.arena, &sx_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &sx_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -6546,7 +6575,7 @@ fn processHunk(
             if (cc.report_mode) {
                 ra.pending.* = true;
                 try cc.stdout.print("  would edit {s}\n", .{r.desc});
-                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
                 // Collected so report mode can also surface coupling
                 // divergences; never written (report mode returns before the
                 // write phase).
@@ -6554,7 +6583,7 @@ fn processHunk(
                 try ra.line_owners.append(cc.arena, fidx);
             } else if (cc.interactive) {
                 try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
-                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
                 const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
                 switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
                     .chosen => |i| switch (i) {
@@ -6591,14 +6620,14 @@ fn processHunk(
             if (cc.report_mode) {
                 ra.pending.* = true;
                 try cc.stdout.print("  would update {s}\n", .{r.desc});
-                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
                 // Collected so report mode predicts the coupling updates a
                 // real commit would drop over it; never written.
                 try ra.row_edits.append(cc.arena, r.edit);
                 try ra.row_owners.append(cc.arena, fidx);
             } else if (cc.interactive) {
                 try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
-                try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+                try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
                 const legend_line = try legend(cc.arena, &ys_choices, 0, cc.sty);
                 switch (try prompt.ask(cc.ask_mode, &ys_choices, 0, legend_line, cc.input, cc.stdout)) {
                     .chosen => |i| switch (i) {
@@ -6641,7 +6670,7 @@ fn processHunk(
                 return .cont;
             }
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
-            try printMiniDiff(cc.sty, cc.stdout, hunk, a_lines, b_lines);
+            try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
             try cc.stdout.print("  This value comes from machine.{s}.\n", .{r.name});
             const legend_line = try legend(cc.arena, &fact_choices, 0, cc.sty);
             switch (try prompt.ask(cc.ask_mode, &fact_choices, 0, legend_line, cc.input, cc.stdout)) {
@@ -7648,6 +7677,68 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
 /// provenance, the live lines and their realignment, and a compose of the
 /// sources as they stand, secrets as placeholders, made when a loop hunk
 /// first needs it.
+/// Why a hunk of a file mox last wrote with a secret is not routed.
+const secret_line_reason = "may hold a secret: a line mox did not write, in a file it wrote a secret into";
+
+/// A file's lines as commit prints them, and which of its live lines it may
+/// route.
+const Guard = struct {
+    /// The baseline's lines and the live lines with every written form of
+    /// every value this run resolved masked, and, in a file mox last wrote
+    /// with a secret, each live line that pairs with no line of its outline
+    /// replaced by `<mox:redacted-line>`.
+    a: []const []const u8,
+    b: []const []const u8,
+    /// For a file mox last wrote with a secret: per live line, whether it
+    /// pairs with a line of the outline that no secret was written into, the
+    /// only live lines a hunk may route. Null for any other file.
+    literal: ?[]const bool,
+
+    fn refuses(g: Guard, hunk: Hunk) bool {
+        const lit = g.literal orelse return false;
+        var j = hunk.b_start;
+        while (j < hunk.b_start + hunk.b_len) : (j += 1) if (!lit[j]) return true;
+        return false;
+    }
+};
+
+/// The guard of a file whose baseline is `a_lines` and live copy `b_lines`.
+/// `outline` is null for a file mox did not last write with a secret, else
+/// the outline it wrote it with, empty when none is known: every live line
+/// then pairs with nothing.
+fn guardOf(cc: *const ClassCtx, a_lines: []const []const u8, b_lines: []const []const u8, outline: ?[]const shapes.Entry) !Guard {
+    const forms = try shapes.writtenForms(cc.arena, try cc.secrets.cache.values(cc.arena));
+    const a = try cc.arena.alloc([]const u8, a_lines.len);
+    for (a_lines, a) |l, *o| o.* = try maskedLine(cc.arena, l, forms);
+    const b = try cc.arena.alloc([]const u8, b_lines.len);
+    for (b_lines, b) |l, *o| o.* = try maskedLine(cc.arena, l, forms);
+    const o = outline orelse return .{ .a = a, .b = b, .literal = null };
+    const literal = try cc.arena.alloc(bool, b_lines.len);
+    @memset(literal, false);
+    if (o.len > 0) {
+        const p = try shapes.pair(cc.arena, o, b_lines);
+        for (p.entry_of, literal) |e, *lit| lit.* = if (e) |i| o[i] == .line else false;
+    }
+    for (literal, b) |lit, *line| if (!lit) {
+        line.* = mox.provenance.map.line_redaction;
+    };
+    return .{ .a = a, .b = b, .literal = literal };
+}
+
+fn maskedLine(arena: std.mem.Allocator, line: []const u8, forms: shapes.Forms) ![]const u8 {
+    var spans: std.ArrayList(shapes.Span) = .empty;
+    try shapes.formSpans(arena, line, forms, &spans);
+    return shapes.mask(arena, line, spans.items, mox.provenance.map.secret_redaction);
+}
+
+/// Null when mox did not last write `live` with a secret; else the outline
+/// it recorded, empty when it recorded none.
+fn secretOutlineOf(st: *const State, live: []const u8) !?[]const shapes.Entry {
+    if (!try st.wroteSecret(live)) return null;
+    if (try st.provenance(live)) |m| if (m.secretOutline()) |o| return o;
+    return &.{};
+}
+
 const LoopFile = struct {
     file: mox.source.tree.ManagedFile,
     /// Routed against the baseline the last apply recorded, not a fresh
@@ -7656,6 +7747,8 @@ const LoopFile = struct {
     segments: []const Segment,
     a_lines: []const []const u8,
     b_lines: []const []const u8,
+    /// How the lines print, and which live lines may be routed.
+    guard: ?Guard = null,
     /// Set for a file in realignment scope (see `realignScope`) that is not
     /// too large.
     alignment: ?Alignment = null,

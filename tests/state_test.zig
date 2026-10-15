@@ -1773,6 +1773,48 @@ test "apply and doctor --rebuild-provenance: a line no secret was written into t
     try std.testing.expect(!try stateHolds(h, "5e1f"));
 }
 
+/// A file mox wrote `token=<secret>` into, applied, then edited live to
+/// `edited`; the source as it was before the commit.
+fn secretCommitCase(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, edited: []const u8) !Harness {
+    const h = try setupEnv(a, io, tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "SEKRIT1" }});
+    try writeRepo(io, tmp, "repo/src/.conf", "a=1\ntoken=<secret:env:MOX_TEST_TOKEN>\nz=2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".conf"), .data = edited });
+    return h;
+}
+
+test "commit: a live line of a secret-bearing file that mox did not write is never routed, by --dry-run, the prompt or a plain run, and no value is printed" {
+    const io = std.testing.io;
+    for ([_][]const u8{ "a=1\ntoken=SEKRIT1\nz=3\nold=SEKRIT1\n", "a=1\n#token=SEKRIT1\ntoken=SEKRIT1\nz=2\n" }) |edited| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try secretCommitCase(a, io, &tmp, edited);
+        const src = "a=1\ntoken=<secret:env:MOX_TEST_TOKEN>\nz=2\n";
+
+        const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+        try std.testing.expect(!contains(dry.out, "SEKRIT1"));
+        try std.testing.expect(!contains(dry.err, "SEKRIT1"));
+        try std.testing.expect(contains(dry.out, "manual: "));
+        try std.testing.expect(contains(dry.out, "may hold a secret"));
+        try std.testing.expect(!contains(dry.out, "would edit"));
+
+        const asked = try h.runWithInput(&.{ "mox", "commit", try h.liveOf(".conf") }, "y\ny\ny\ny\n");
+        try std.testing.expect(!contains(asked.out, "SEKRIT1"));
+        try std.testing.expect(!contains(asked.err, "SEKRIT1"));
+        try std.testing.expect(contains(asked.out, redacted_line));
+        try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf(".conf")));
+
+        const plain = try h.run(&.{ "mox", "commit", try h.liveOf(".conf") });
+        try std.testing.expect(!contains(plain.out, "SEKRIT1"));
+        try std.testing.expect(!contains(plain.err, "SEKRIT1"));
+        try std.testing.expectEqualStrings(src, try read(io, a, try h.srcOf(".conf")));
+        try std.testing.expectEqualStrings(edited, try read(io, a, try h.liveOf(".conf")));
+    }
+}
+
 /// A PEM-like text of about `size` bytes, its body drawn from `seed`.
 fn pemOf(a: std.mem.Allocator, seed: u64, size: usize) ![]const u8 {
     var prng = std.Random.DefaultPrng.init(seed);

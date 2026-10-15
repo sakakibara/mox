@@ -1128,10 +1128,10 @@ test "commit: a hunk contained in one secret segment is shown without its old re
 
     const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "s\n");
 
-    // The new (live) value and the secret's store URI are shown -- but the
-    // OLD resolved secret value never appears anywhere in the output, on
-    // either stream.
-    try std.testing.expect(std.mem.indexOf(u8, res.out, "changed") != null);
+    // The edited line is shown as a redacted line and the secret's store
+    // URI is named -- but the OLD resolved secret value never appears
+    // anywhere in the output, on either stream.
+    try std.testing.expect(std.mem.indexOf(u8, res.out, mox.provenance.map.line_redaction) != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "env:MOX_TEST_TOKEN") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.out, "s3cr3t") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.err, "s3cr3t") == null);
