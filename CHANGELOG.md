@@ -84,8 +84,8 @@ All notable changes to mox are documented here. The format follows
   0700, under the system's temp directory, removed when the call is done,
   rather than in `<state dir>/tmp/`. A command that only reads, `mox status`
   among them, no longer creates or marks the state directory when it reads
-  the packages. uninstall lists a `tmp/` an earlier mox left in the state
-  directory as kept, for you to delete.
+  the packages. uninstall lists a `<state dir>/tmp/` as kept, for you to
+  delete.
 - The setup scripts' `<state dir>/bin` is refreshed by replacing only the
   running `mox` there. When it holds anything else, mox removes nothing,
   keeps the directory off `PATH` for that run and warns; it used to remove
