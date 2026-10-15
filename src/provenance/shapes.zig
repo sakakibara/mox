@@ -619,18 +619,18 @@ pub fn shown(arena: std.mem.Allocator, outline: []const Entry, p: Pairing, j: us
 }
 
 /// The shortest line of a value of several lines that counts, on its own,
-/// as a written form of the value outside the slots of its own file.
+/// as a written form of the value outside the slots of its own file, and the
+/// shortest form that counts in a file mox wrote no secret into.
 pub const min_fragment: usize = 8;
 
-/// Whether `content` holds a written form of one of `values`: a whole form
-/// anywhere, or a line of a form of several lines at least `min_fragment`
-/// bytes long.
+/// Whether `content` holds a written form of one of `values` of at least
+/// `min_fragment` bytes: a whole form anywhere, or a line of a form of
+/// several lines.
 pub fn holdsAny(arena: std.mem.Allocator, content: []const u8, values: []const []const u8) !bool {
     for (values) |v| {
         if (v.len == 0) continue;
         for (try formsOf(arena, v)) |f| {
-            if (f.len == 0) continue;
-            if (std.mem.indexOf(u8, content, f) != null) return true;
+            if (f.len >= min_fragment and std.mem.indexOf(u8, content, f) != null) return true;
             if (std.mem.indexOfScalar(u8, f, '\n') == null) continue;
             var it = std.mem.splitScalar(u8, f, '\n');
             while (it.next()) |l| {
@@ -908,11 +908,12 @@ test "outlineOf: a line no secret segment covers that holds a resolved value is 
     try testing.expectEqualStrings("z", outline[2].line);
 }
 
-test "holdsAny: a whole form anywhere, and a line of a value of several lines only when it is long enough" {
+test "holdsAny: a whole form anywhere and a line of a value of several lines, each only when it is long enough" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expect(try holdsAny(a, "x = \"a\\\"b\"\n", &.{"a\"b"}));
+    try testing.expect(try holdsAny(a, "x = \"pa\\\"ssword\"\n", &.{"pa\"ssword"}));
+    try testing.expect(!try holdsAny(a, "role = admin\n", &.{"admin"}));
     try testing.expect(!try holdsAny(a, "f() {\n}\n", &.{"{\n  \"k\": \"v\"\n}"}));
     try testing.expect(try holdsAny(a, "pasted MIIBlongline\n", &.{"-----BEGIN-----\nMIIBlongline\n-----END-----"}));
     try testing.expect(!try holdsAny(a, "nothing\n", &.{ "", "absent" }));

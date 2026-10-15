@@ -1919,6 +1919,31 @@ test "apply --overwrite: a file holding a value this run resolved is not kept, t
     try std.testing.expect(!try stateHolds(h, "pasted"));
 }
 
+test "apply --overwrite: in a file mox wrote no secret into, a resolved value counts only from 8 bytes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{
+        .{ .name = "MOX_TEST_USER", .value = "admin" },
+        .{ .name = "MOX_TEST_TOKEN", .value = "TEN-b7c2e1" },
+    });
+    try writeRepo(io, &tmp, "repo/src/.cfg", "user=<secret:env:MOX_TEST_USER>\ntok=<secret:env:MOX_TEST_TOKEN>\n");
+    try writeRepo(io, &tmp, "repo/src/roles.txt", "guest\n");
+    try writeRepo(io, &tmp, "repo/src/notes.txt", "hello\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("roles.txt"), .data = "guest\nadmin edited-5e3f\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("notes.txt"), .data = "hello\npasted TEN-b7c2e1\n" });
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!contains(r.out, "roles.txt: its previous content"));
+    try std.testing.expect(try stateHolds(h, "admin edited-5e3f\n"));
+    try std.testing.expect(contains(r.out, "notes.txt: its previous content held a secret and was not kept\n"));
+    try std.testing.expect(!try stateHolds(h, "b7c2e1"));
+}
+
 test "apply --overwrite: a partially owned file's snapshot masks a resolved value outside what mox owns" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

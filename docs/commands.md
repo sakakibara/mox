@@ -829,32 +829,34 @@ apply --overwrite <path>`, which writes it again and keeps the edits in a
 snapshot. A snapshot keeps none of a whole file's prior content when it may
 hold a secret: its provenance names a secret line, its record was written
 for one, or it holds a value the run resolved, in any form mox writes it in
-(a line of a value of several lines counts when it is at least 8 bytes
-long). Whatever displaces the file (an overwrite, a removal, `mox remove
---purge`, a rollback's own history, or a directory apply removes or replaces
-with a link, each file of which is judged on its own), the command prints
-`<path>: its previous content held a secret and was not kept`, `mox snapshot
-<id>` lists it as not kept, and rollback reports it as not restored and
-restores the rest: the edits in such a file are not recoverable from mox. A
-partially owned file's snapshot keeps the file with the values under its
-secret-bearing owned keys masked, and every value the run resolved masked
-wherever it occurs. A file whose source left the tree, which apply would
-remove, shows its live content on the removed side, and such a symlink the
-line `symlink -> <target>`, as does an unedited file of a generator that
-left the tree; a file that does not parse in its format is an `ERROR` line
-on stderr, as apply reports it. Read-only: it takes no writer lock, only the
-readers lock. A difference is not an error, so a run that completes exits 0
-whether or not anything differs. An `attributes.toml`, the repo's or the
-private layer's, that is not valid TOML or cannot be read stops the run with
-exit 2, as it does in every command that reads attributes (add, apply,
-commit, doctor, edit, export, facts, mv, remove and status); rollback warns
-instead. A refusal exits 1: a path that is not managed, a head ownership
-declaration that does not parse, and an attributes entry that breaks the
-schema, with or without a source. A file's own `ERROR` that does not come
-from an attributes file -- a head directive on an unstructured target, one
-spelled with another file's comment marker, a mox directive in strict JSON,
-or a layer or output that does not parse -- is reported and the run still
-exits 0.
+that is at least 8 bytes long (a whole form, or a line of a value of several
+lines). A shorter value, as common as a word, does not stop another file's
+copy from being kept, so a short secret pasted into a file mox wrote no
+secret into is kept in its copy. Whatever displaces the file (an overwrite,
+a removal, `mox remove --purge`, a rollback's own history, or a directory
+apply removes or replaces with a link, each file of which is judged on its
+own), the command prints `<path>: its previous content held a secret and was
+not kept`, `mox snapshot <id>` lists it as not kept, and rollback reports it
+as not restored and restores the rest: the edits in such a file are not
+recoverable from mox. A partially owned file's snapshot keeps the file with
+the values under its secret-bearing owned keys masked, and every value the
+run resolved masked wherever it occurs. A file whose source left the tree,
+which apply would remove, shows its live content on the removed side, and
+such a symlink the line `symlink -> <target>`, as does an unedited file of a
+generator that left the tree; a file that does not parse in its format is an
+`ERROR` line on stderr, as apply reports it. Read-only: it takes no writer
+lock, only the readers lock. A difference is not an error, so a run that
+completes exits 0 whether or not anything differs. An `attributes.toml`, the
+repo's or the private layer's, that is not valid TOML or cannot be read
+stops the run with exit 2, as it does in every command that reads attributes
+(add, apply, commit, doctor, edit, export, facts, mv, remove and status);
+rollback warns instead. A refusal exits 1: a path that is not managed, a
+head ownership declaration that does not parse, and an attributes entry that
+breaks the schema, with or without a source. A file's own `ERROR` that does
+not come from an attributes file -- a head directive on an unstructured
+target, one spelled with another file's comment marker, a mox directive in
+strict JSON, or a layer or output that does not parse -- is reported and the
+run still exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |

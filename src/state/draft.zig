@@ -257,7 +257,8 @@ pub const Draft = struct {
     /// Whether `content`, what is at `live` before this run replaces or
     /// removes it, may hold a secret: the provenance mox last wrote `live`
     /// with names a secret line, its record was written for a secret, or
-    /// `content` holds a written form of a value this run resolved.
+    /// `content` holds a written form of at least `min_fragment` bytes of a
+    /// value this run resolved.
     pub fn priorHoldsSecret(d: *Draft, live: []const u8, content: []const u8) !bool {
         if (try d.wroteSecret(live)) return true;
         return prov_shapes.holdsAny(d.arena, content, if (d.secrets) |c| try c.values(d.arena) else &.{});

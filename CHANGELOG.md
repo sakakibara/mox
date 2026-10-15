@@ -319,7 +319,10 @@ All notable changes to mox are documented here. The format follows
 ### Fixed
 - A snapshot keeps none of a whole file's prior content when it may hold
   a secret: mox wrote a secret into the file, or the content holds a value
-  the run resolved, in any form mox writes it in. That holds whatever
+  the run resolved, in any form mox writes it in that is at least 8 bytes
+  long. A shorter value, as common as a word, does not stop another file's
+  copy from being kept, so a short secret pasted into a file mox wrote no
+  secret into is kept in its copy. That holds whatever
   displaces the file: an overwrite, a removal, `mox remove --purge`, a
   rollback, or a directory apply removes or replaces with a link, each file
   of which is judged on its own. The run prints a line naming each such
