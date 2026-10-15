@@ -710,13 +710,13 @@ pub fn checkTimeoutMs(environ_map: ?*const EnvironMap, stderr: *std.Io.Writer) i
 /// Bytes of the child's combined output kept for the refusal report.
 const check_tail_bytes: usize = 4096;
 
-/// Remove leftover check-hook staging from the state dir: `check-*` dirs
-/// (they hold candidate cleartext, possibly with a resolved secret) and
-/// their `check-*.out` captures. A crash between materializing a candidate
+/// Remove leftover check-hook staging from the state dir: `check-<16 hex>`
+/// dirs (they hold candidate cleartext, possibly with a resolved secret)
+/// and their `.out` captures. A crash between materializing a candidate
 /// and the deferred cleanup would otherwise leave the cleartext on disk
 /// indefinitely; apply sweeps before composing, so a leftover never
-/// survives past the next run. Best-effort: an unreadable state dir is not
-/// this sweep's problem.
+/// survives past the next run. Any other entry is left as it is.
+/// Best-effort: an unreadable state dir is not this sweep's problem.
 pub fn sweepCheckDirs(arena: std.mem.Allocator, io: Io, state_dir: []const u8) void {
     var dir = Io.Dir.cwd().openDir(io, state_dir, .{ .iterate = true }) catch return;
     defer dir.close(io);
@@ -725,9 +725,10 @@ pub fn sweepCheckDirs(arena: std.mem.Allocator, io: Io, state_dir: []const u8) v
     var stale: std.ArrayList(Entry) = .empty;
     var it = dir.iterate();
     while (it.next(io) catch return) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, "check-")) continue;
-        const is_dir = entry.kind == .directory;
-        if (!is_dir and !std.mem.endsWith(u8, entry.name, ".out")) continue;
+        const is_dir = switch (checkStaging(entry.name) orelse continue) {
+            .dir => if (entry.kind == .directory) true else continue,
+            .out => if (entry.kind == .file) false else continue,
+        };
         const name = arena.dupe(u8, entry.name) catch return;
         stale.append(arena, .{ .name = name, .is_dir = is_dir }) catch return;
     }
@@ -738,6 +739,25 @@ pub fn sweepCheckDirs(arena: std.mem.Allocator, io: Io, state_dir: []const u8) v
             dir.deleteFile(io, e.name) catch {};
         }
     }
+}
+
+const Staging = enum { dir, out };
+
+/// What `name` is of a check hook's staging: its candidate directory
+/// `check-<16 hex>`, or that directory's `.out` capture; null for neither.
+fn checkStaging(name: []const u8) ?Staging {
+    if (!std.mem.startsWith(u8, name, "check-")) return null;
+    const rest = name["check-".len..];
+    const out = std.mem.endsWith(u8, rest, ".out");
+    const hex = if (out) rest[0 .. rest.len - ".out".len] else rest;
+    if (hex.len != 16) return null;
+    for (hex) |c| if (!std.ascii.isHex(c)) return null;
+    return if (out) .out else .dir;
+}
+
+/// `check-<16 hex>`, a check hook's candidate, or its `.out` capture.
+pub fn isCheckStaging(name: []const u8) bool {
+    return checkStaging(name) != null;
 }
 
 /// Outcome of one check-hook run. `refusal` is null on acceptance (exit 0)
@@ -1679,4 +1699,25 @@ test "verdictForScript: no matching discovery record is treated as no contract, 
     const c = try buildContracts(a, &.{}, &.{}, &.{}, &.{}, &.{}, &env);
     const v = try verdictForScript(a, null, &c);
     try testing.expectEqual(.runs, v.lane);
+}
+
+test "sweepCheckDirs: removes only check-<16 hex> directories and their .out captures" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    try tmp.dir.createDirPath(io, "check-0123456789abcdef");
+    try tmp.dir.writeFile(io, .{ .sub_path = "check-0123456789abcdef/cand", .data = "x\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "check-0123456789abcdef.out", .data = "out\n" });
+    const kept_dirs = [_][]const u8{ "check-notes", "check-0123456789abcdeg", "check-0123456789abcdef0", "check-fedcba9876543210.out" };
+    for (kept_dirs) |d| try tmp.dir.createDirPath(io, d);
+    const kept_files = [_][]const u8{ "check-list.out", "check-0123456789abcde.out", "check-fedcba9876543210" };
+    for (kept_files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f, .data = "mine\n" });
+    sweepCheckDirs(a, io, root);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "check-0123456789abcdef", .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "check-0123456789abcdef.out", .{}));
+    for (kept_dirs ++ kept_files) |n| try tmp.dir.access(io, n, .{});
 }

@@ -62,7 +62,7 @@ fn madeByMox(name: []const u8) bool {
         "zypper.txt",
     };
     for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
-    return isCheckStaging(name);
+    return mox.apply.run_scripts.isCheckStaging(name);
 }
 
 /// Why the entry `e` of the state directory is not mox's although its name
@@ -83,16 +83,6 @@ fn notMoxs(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent.En
 
 fn isTrashGeneration(h: dirent.Entry) bool {
     return h.kind == .directory and mox.state.id.isId(h.name);
-}
-
-/// `check-<16 hex>`, a check hook's candidate, or its `.out` capture.
-fn isCheckStaging(name: []const u8) bool {
-    if (!std.mem.startsWith(u8, name, "check-")) return false;
-    const rest = name["check-".len..];
-    const hex = if (std.mem.endsWith(u8, rest, ".out")) rest[0 .. rest.len - ".out".len] else rest;
-    if (hex.len != 16) return false;
-    for (hex) |c| if (!std.ascii.isHex(c)) return false;
-    return true;
 }
 
 const Spec = struct {
