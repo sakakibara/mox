@@ -48,6 +48,51 @@ pub const joinKeyOnto = env_path.joinRel;
 /// under `home`.
 pub const liveKeyUnderHome = env_path.relUnder;
 
+/// `p` with a leading `~` naming the home replaced by `home`: `~` alone, or
+/// `~` and a separator, `/` on every platform and `\` too on Windows, where
+/// mox prints a path under the home as `~\`. The tail's segments are joined
+/// with `os_tag`'s separator, empty ones skipped. Any other `p` is returned
+/// as it is: `~user/x`, and on POSIX `~\x`, whose backslash is a filename
+/// byte there.
+pub fn expandHome(allocator: std.mem.Allocator, home: []const u8, p: []const u8, os_tag: std.Target.Os.Tag) error{OutOfMemory}![]const u8 {
+    if (p.len == 0 or p[0] != '~') return p;
+    const windows = os_tag == .windows;
+    const seps: []const u8 = if (windows) "/\\" else "/";
+    if (p.len > 1 and std.mem.indexOfScalar(u8, seps, p[1]) == null) return p;
+    const sep: u8 = if (windows) '\\' else '/';
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(allocator, home);
+    var it = std.mem.tokenizeAny(u8, p[1..], seps);
+    while (it.next()) |seg| {
+        if (out.items.len > 0 and std.mem.indexOfScalar(u8, seps, out.items[out.items.len - 1]) == null) try out.append(allocator, sep);
+        try out.appendSlice(allocator, seg);
+    }
+    return out.items;
+}
+
+test "expandHome: `~` and `~/x` everywhere, `~\\x` on Windows only, and nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { std.Target.Os.Tag, []const u8, []const u8, []const u8 }{
+        .{ .windows, "C:\\Users\\me", "~", "C:\\Users\\me" },
+        .{ .windows, "C:\\Users\\me", "~\\", "C:\\Users\\me" },
+        .{ .windows, "C:\\Users\\me", "~\\.config\\nvim\\init.lua", "C:\\Users\\me\\.config\\nvim\\init.lua" },
+        .{ .windows, "C:\\Users\\me", "~/.config/nvim/init.lua", "C:\\Users\\me\\.config\\nvim\\init.lua" },
+        .{ .windows, "C:\\Users\\me", "~\\.config/nvim//init.lua", "C:\\Users\\me\\.config\\nvim\\init.lua" },
+        .{ .windows, "C:\\", "~\\x", "C:\\x" },
+        .{ .windows, "C:\\Users\\me", "~other\\x", "~other\\x" },
+        .{ .windows, "C:\\Users\\me", "x\\~\\y", "x\\~\\y" },
+        .{ .linux, "/home/me", "~", "/home/me" },
+        .{ .linux, "/home/me", "~/.cargo/", "/home/me/.cargo" },
+        .{ .linux, "/", "~/x", "/x" },
+        .{ .linux, "/home/me", "~\\.zshrc", "~\\.zshrc" },
+        .{ .macos, "/Users/me", "~\\.zshrc", "~\\.zshrc" },
+        .{ .macos, "/Users/me", "~other/x", "~other/x" },
+    };
+    for (cases) |c| try std.testing.expectEqualStrings(c[3], try expandHome(a, c[1], c[2], c[0]));
+}
+
 /// True when the filesystem path `path` is `dir` itself or lies beneath it.
 /// Membership ends at the separator: the byte after `dir` must be one, or a
 /// sibling whose name merely extends `dir` (`<dir>-backup/x`) reads as being

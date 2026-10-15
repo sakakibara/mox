@@ -6,16 +6,17 @@
 //! DERIVES, machine STATES, same noun because same concept.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const toml = @import("../data/toml.zig");
 const data_source = @import("../data/source.zig");
 const source_axes = @import("../source/axes.zig");
 const source_tuple = @import("../source/tuple.zig");
+const source_path = @import("../source/path.zig");
 const diag_mod = @import("diag.zig");
 const state_mod = @import("state.zig");
 
 const Io = std.Io;
 const Environ = @import("env").Env;
-const dirs = @import("env").dirs;
 
 pub const Diag = diag_mod.Diag;
 
@@ -254,7 +255,7 @@ fn resolveRow(
         }
     }
     for (candidates) |c| {
-        const expanded = try dirs.expandTildeIn(arena, home, c);
+        const expanded = try source_path.expandHome(arena, home, c, builtin.os.tag);
         if (dirExists(io, expanded)) return .{ .value = expanded, .source = .{ .candidate = c } };
     }
     return null;

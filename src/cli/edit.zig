@@ -22,11 +22,9 @@ fn keyPath(arena: std.mem.Allocator, path: []const u8) []const u8 {
     std.mem.replaceScalar(u8, dup, std.fs.path.sep, '/');
     return dup;
 }
-const env_mod = @import("env");
 const apply_cmd = @import("apply.zig");
 
 const Io = std.Io;
-const Env = env_mod.Env;
 const AxisTuple = mox.source.tree.AxisTuple;
 
 /// Why a `<name>` names no live path. Separate from the allocation failure
@@ -40,9 +38,9 @@ pub const TargetError = TargetFailure || error{OutOfMemory};
 
 /// Canonical absolute live path a `<name>` refers to.
 ///
-/// `~` and `~/x` expand against the environment's home -- a shell expands
-/// those itself, but a quoted `"~/x"`, a PowerShell argument to a native
-/// executable, and a non-shell caller all deliver the tilde verbatim. Every
+/// `~` and `~/x`, and on Windows `~\x`, expand against mox's home -- a shell
+/// expands those itself, but a quoted `"~/x"`, a PowerShell argument to a
+/// native executable, and a non-shell caller all deliver the tilde verbatim. Every
 /// other name is a filesystem path: used as given when absolute, resolved
 /// against `cwd` when not. `.` and `..` are resolved, so `../fish/config.fish`
 /// names from `~/.config/nvim` what it names in a shell, and a spelling
@@ -72,14 +70,10 @@ pub fn liveTargetFor(
     os_tag: std.Target.Os.Tag,
 ) TargetError![]const u8 {
     const windows = os_tag == .windows;
-    // `expandTildeIn`, not `expandTilde`: mox already resolved its own home
-    // (`Paths.home`, with `home_named` recording whether the environment
-    // named one), and letting the tilde derive a second one from the Env
-    // would be a second answer to a question already settled.
-    const expanded = try env_mod.dirs.expandTildeIn(arena, home, name);
-    // expandTilde passes `~user/x` -- and, on Windows, `~\x` -- through
-    // untouched. Resolving either would silently name a directory whose first
-    // component is a literal `~`, so neither reaches the filesystem.
+    const expanded = try mox.source.path.expandHome(arena, home, name, os_tag);
+    // `~user/x` -- and, on POSIX, `~\x` -- pass through untouched. Resolving
+    // either would silently name a directory whose first component is a
+    // literal `~`, so neither reaches the filesystem.
     if (expanded.len > 0 and expanded[0] == '~') return error.UnsupportedTilde;
     const absolute = if (windows)
         std.fs.path.isAbsoluteWindows(expanded)
@@ -356,12 +350,12 @@ test "liveTargetFor: a Windows path resolves to what the source walk derived" {
     const home = "C:\\Users\\me";
     const walked = "C:\\Users\\me\\.config\\nvim\\init.lua";
 
-    // Every spelling a user reaches the file by, minus the tilde ones: those
-    // turn on `expandTildeIn`, which reads the HOST's separator rule, so this
-    // seam cannot pose the question for another platform. env-zig owns that
-    // half and pins it per-platform in its own suite, on a real Windows
-    // runner; what is mox's own is the resolution below.
+    // Every spelling a user reaches the file by, `~\` among them: mox prints
+    // a Windows path under the home as `~\`.
     for ([_][]const u8{
+        "~/.config/nvim/init.lua",
+        "~\\.config\\nvim\\init.lua",
+        "~\\.config/nvim/init.lua",
         "C:\\Users\\me\\.config\\nvim\\init.lua",
         "C:/Users/me/.config/nvim/init.lua",
         ".\\init.lua",
@@ -371,6 +365,22 @@ test "liveTargetFor: a Windows path resolves to what the source walk derived" {
         const got = try liveTargetFor(a, home, "C:\\Users\\me\\.config\\nvim", spelling, .windows);
         try testing.expectEqualStrings(walked, got);
     }
+}
+
+test "liveTargetFor: `~` is the home on every platform, `~\\x` a home path only on Windows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("C:\\Users\\me", try liveTargetFor(a, "C:\\Users\\me", null, "~", .windows));
+    try testing.expectEqualStrings("C:\\Users\\me", try liveTargetFor(a, "C:\\Users\\me", null, "~\\", .windows));
+    try testing.expectError(error.UnsupportedTilde, liveTargetFor(a, "C:\\Users\\me", null, "~other\\.zshrc", .windows));
+
+    // On POSIX a backslash is a filename byte: `~\.zshrc` is a relative
+    // name whose first component starts with `~`, and is refused as one.
+    try testing.expectEqualStrings("/home/me/.zshrc", try liveTargetFor(a, "/home/me", null, "~/.zshrc", .linux));
+    try testing.expectError(error.UnsupportedTilde, liveTargetFor(a, "/home/me", "/home/me", "~\\.zshrc", .linux));
+    try testing.expectError(error.UnsupportedTilde, liveTargetFor(a, "/Users/me", "/Users/me", "~\\.zshrc", .macos));
 }
 
 test "liveTargetFor: a drive letter is canonicalized, so the home's own spelling must be too" {

@@ -92,9 +92,11 @@ the file it names.
 The tilde is expanded by mox as well as by the shell, because a shell
 does not always get there first: quoting stops it (`"~/x"`), PowerShell
 passes `~` through to a native program verbatim, and a script may build
-the argument without a shell at all. `~user` is not expanded and is
-refused rather than read as a directory named `~user`; on Windows, spell
-the tail with `/`.
+the argument without a shell at all. On Windows `~\x` is expanded as
+`~/x` is, since that is how mox prints a path under the home there; on
+macOS and Linux a backslash is part of a file name, so `~\x` is refused.
+`~user` is not expanded and is refused rather than read as a directory
+named `~user`.
 
 This is the live-path rule, and it covers the commands above.
 `export --facts <path>` names a file outside the live tree and is
