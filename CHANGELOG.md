@@ -361,8 +361,9 @@ All notable changes to mox are documented here. The format follows
   while it may still hold that secret, naming its lines by number and
   adding nothing; `--cleartext-secrets` adds it as it is. `mox remove`, a
   tombstone and a source that left the tree keep the record of that secret
-  for this. A removed file holding a secret mox wrote used to be added
-  into the repo, value and all.
+  for this, and a provenance that cannot be read counts as one naming a
+  secret. A removed file holding a secret mox wrote used to be added into
+  the repo, value and all.
 - `mox remove --purge` removes a FIFO or device at the path without
   opening it; the run used to wait on it forever.
 - A value of several lines resolved into a TOML, YAML, INI or gitconfig

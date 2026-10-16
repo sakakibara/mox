@@ -1254,7 +1254,9 @@ line, one you added or edited, as `<mox:redacted-line>`, since it may hold a
 value mox wrote that it cannot find (`#token=OLD` beside a new
 `token=mine`). A file whose provenance is missing or records no outline
 keeps no line, and neither does an owned-secret file inside a directory a
-removal takes. When a copy leaves something out, the command names the file
+removal takes. A provenance that cannot be read is taken as naming a secret,
+so its file is masked, and refused by `add`, as one mox wrote a secret into.
+When a copy leaves something out, the command names the file
 once the run commits: `<path>: not kept in the snapshot, since each may hold
 a secret mox wrote: N line(s) and the value in M secret slot(s); rollback
 cannot restore this file`, each count only when above zero. The slots are

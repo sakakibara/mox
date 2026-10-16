@@ -254,9 +254,10 @@ pub const Draft = struct {
     }
 
     /// Whether the provenance kept for `live`, its record's or residue,
-    /// names a secret line.
+    /// names a secret line. One that cannot be read may, so it does.
     pub fn provenanceNamesSecret(d: *const Draft, live: []const u8) !bool {
-        const m = (try d.provenance(live)) orelse return false;
+        if (d.provenanceBlob(live) == null) return false;
+        const m = (try d.provenance(live)) orelse return true;
         if (prov_map.hasSecret(m.segments)) return true;
         if (m.secretOutline()) |o| for (o) |e| if (e == .shape) return true;
         return false;

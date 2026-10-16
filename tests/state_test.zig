@@ -3710,6 +3710,49 @@ test "add: a file mox wrote a secret into whose residue holds no outline is refu
     try std.testing.expect(!exists(io, try h.srcOf("r.toml")));
 }
 
+test "add: a file mox wrote a secret into whose provenance cannot be read is refused whole, and its snapshot keeps no line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "UNREADABLE-7" }});
+    try writeRepo(io, &tmp, "repo/src/r.conf", "a\ntok=<secret:env:MOX_TEST_TOKEN>\nz\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf("r.conf");
+    for ([_]bool{ false, true }) |gone| {
+        raced_state = h.state;
+        damage_gone = gone;
+        try editCurrent(h, struct {
+            fn damage(arena_: std.mem.Allocator, g: *mox.state.generation.Generation, p: []const u8) !void {
+                const store = try mox.state.Store.init(arena_, raced_state);
+                const h_ = try mox.state.blob.put(arena_, std.testing.io, store.blobs, "not provenance\n");
+                if (damage_gone) try Io.Dir.cwd().deleteFile(std.testing.io, try mox.state.blob.pathOf(arena_, store.blobs, h_));
+                g.paths.getPtr(p).?.file.?.provenance_blob = h_;
+            }
+        }.damage, live);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = live, .data = "a\ntok=UNREADABLE-7\nmine\nz\n" });
+        const over = try h.run(&.{ "mox", "apply", "--overwrite" });
+        try std.testing.expectEqual(@as(u8, 0), over.rc);
+        try std.testing.expect(contains(over.out, "not kept in the snapshot"));
+        try std.testing.expect(!testutil.containsAnywhere(a, io, h.state, "UNREADABLE-7"));
+    }
+    try editCurrent(h, struct {
+        fn damage(arena_: std.mem.Allocator, g: *mox.state.generation.Generation, p: []const u8) !void {
+            const store = try mox.state.Store.init(arena_, raced_state);
+            g.paths.getPtr(p).?.file.?.provenance_blob = try mox.state.blob.put(arena_, std.testing.io, store.blobs, "not provenance\n");
+        }
+    }.damage, live);
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", "r.conf" })).rc);
+    const r = try h.runIn(h.home, &.{ "mox", "add", "r.conf" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(contains(r.err, "r.conf: mox wrote a secret into this file, so adding it would put the value in the repo"));
+    try std.testing.expect(!exists(io, try h.srcOf("r.conf")));
+}
+
+var damage_gone = false;
+
 test "add: a file mox wrote a secret into whose source was deleted, before an apply forgets it, is still refused" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
