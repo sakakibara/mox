@@ -234,6 +234,42 @@ const ClassCtx = struct {
     /// Whether every managed file has been composed for the secrets it
     /// resolves (`resolvedValues`).
     resolved_all: *bool,
+    /// Each resolved value's reference with its written forms, built on
+    /// first use.
+    held: *?[]const Held,
+
+    /// Why a line holding `text` is not routed when it holds a written form
+    /// of a value this run resolved, naming every reference whose value it
+    /// holds, never the value; null when it holds none.
+    fn heldReason(cc: *const ClassCtx, text: []const u8) !?[]const u8 {
+        if (cc.held.* == null) {
+            _ = try cc.resolvedValues();
+            var all: std.ArrayList(Held) = .empty;
+            var it = cc.secrets.cache.map.iterator();
+            while (it.next()) |e| try all.append(cc.arena, .{ .ref = e.key_ptr.*, .forms = try shapes.writtenForms(cc.arena, &.{e.value_ptr.*}) });
+            cc.held.* = all.items;
+        }
+        if (cc.held.*.?.len == 0) return null;
+        var refs: std.ArrayList(u8) = .empty;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (cc.held.*.?) |h| {
+            var spans: std.ArrayList(shapes.Span) = .empty;
+            try shapes.formSpans(cc.arena, text, h.forms, &spans);
+            if (spans.items.len > 0) try names.append(cc.arena, h.ref);
+        }
+        if (names.items.len == 0) return null;
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        try refs.appendSlice(cc.arena, "may hold a secret: a line holding the value of ");
+        for (names.items, 0..) |n, i| {
+            if (i > 0) try refs.appendSlice(cc.arena, ", ");
+            try refs.print(cc.arena, "<secret:{s}>", .{n});
+        }
+        return refs.items;
+    }
 
     /// Every value this run resolved, once every managed file has been
     /// composed for its secrets, so a value pasted into a file whose own
@@ -1175,8 +1211,7 @@ pub fn commitImpl(
 /// live file keeps its edit and mox stops tracking it on this machine.
 fn releaseStale(ctx: *app.Ctx, st: *State, paths: []const []const u8, home: []const u8, orphans: *const std.StringHashMap([]const []const u8)) !void {
     for (paths) |lp| {
-        try st.forget(lp);
-        try st.forgetProvenance(lp);
+        try st.release(lp);
         if (orphans.get(lp)) |ms| {
             for (ms) |m| try st.dropLeaf(m, lp);
             try ctx.out.print("  released {f} on this machine: its generator left the tree, so mox forgets it and keeps the file\n", .{display.of(lp, home)});
@@ -1420,6 +1455,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
     var route_ids: PathIds = .init(ctx.alloc, ctx.io);
     var route_canon: std.StringHashMap([]const u8) = .init(ctx.alloc);
     var resolved_all = false;
+    var held: ?[]const Held = null;
 
     const cc: ClassCtx = .{
         .arena = ctx.alloc,
@@ -1442,6 +1478,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         .ids = &route_ids,
         .canon = &route_canon,
         .resolved_all = &resolved_all,
+        .held = &held,
     };
 
     var line_edits: std.ArrayList(LineEdit) = .empty;
@@ -4522,11 +4559,11 @@ fn routeStructChanges(
     for (changes, 0..) |change, ki| {
         const label = try keyPathLabel(cc.arena, change.path);
         const new_text = if (change.new) |v| try commit_struct.valueInline(cc.arena, v) else "";
-        if (shapes.holdsForm(label, forms) or shapes.holdsForm(new_text, forms)) {
+        if (try cc.heldReason(label) orelse try cc.heldReason(new_text)) |why| {
             ra.manual_count.* += 1;
             ra.manual_hunks[fidx] += 1;
             ra.pending.* = true;
-            try cc.stdout.print("  manual: {f} {s}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), try maskedLine(cc.arena, label, forms), resolved_line_reason });
+            try cc.stdout.print("  manual: {f} {s}: {s}\n", .{ display.of(file.live_path, cc.m_state.home), try maskedLine(cc.arena, label, forms), why });
             continue;
         }
         const res = try commit_struct.resolveLayer(cc.arena, format, layers, change, baseline);
@@ -7700,15 +7737,16 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
     return caps;
 }
 
+/// A value this run resolved, by its reference, and the forms it is written
+/// in.
+const Held = struct { ref: []const u8, forms: shapes.Forms };
+
 /// A file's hunks as loop routing reads them: the baseline and its
 /// provenance, the live lines and their realignment, and a compose of the
 /// sources as they stand, secrets as placeholders, made when a loop hunk
 /// first needs it.
 /// Why a hunk of a file mox last wrote with a secret is not routed.
 const secret_line_reason = "may hold a secret: a line mox did not write, in a file it wrote a secret into";
-
-/// Why a hunk holding a value this run resolved is not routed.
-const resolved_line_reason = "may hold a secret: a line holding a value this run resolved";
 
 /// A file's lines as commit prints them, and which of its live lines it may
 /// route.
@@ -7722,15 +7760,15 @@ const Guard = struct {
     /// pairs with a line of the outline that no secret was written into.
     /// Null for any other file.
     literal: ?[]const bool,
-    /// Per live line, whether it holds a written form of at least
-    /// `min_fragment` bytes of a value this run resolved.
-    holds: []const bool,
+    /// Per live line, why it is not routed when it holds a written form of
+    /// a value this run resolved: commit never routes what it masks.
+    holds: []const ?[]const u8,
 
     /// Why `hunk` is not routed, or null when it may be.
     fn refuses(g: Guard, hunk: Hunk) ?[]const u8 {
         const end = hunk.b_start + hunk.b_len;
         if (g.literal) |lit| for (lit[hunk.b_start..end]) |l| if (!l) return secret_line_reason;
-        for (g.holds[hunk.b_start..end]) |h| if (h) return resolved_line_reason;
+        for (g.holds[hunk.b_start..end]) |h| if (h) |why| return why;
         return null;
     }
 };
@@ -7744,10 +7782,10 @@ fn guardOf(cc: *const ClassCtx, a_lines: []const []const u8, b_lines: []const []
     const a = try cc.arena.alloc([]const u8, a_lines.len);
     for (a_lines, a) |l, *o| o.* = try maskedLine(cc.arena, l, forms);
     const b = try cc.arena.alloc([]const u8, b_lines.len);
-    const holds = try cc.arena.alloc(bool, b_lines.len);
+    const holds = try cc.arena.alloc(?[]const u8, b_lines.len);
     for (b_lines, b, holds) |l, *o, *h| {
-        h.* = shapes.holdsForm(l, forms);
-        o.* = if (h.*) mox.provenance.map.line_redaction else try maskedLine(cc.arena, l, forms);
+        h.* = try cc.heldReason(l);
+        o.* = if (h.* != null) mox.provenance.map.line_redaction else try maskedLine(cc.arena, l, forms);
     }
     const o = outline orelse return .{ .a = a, .b = b, .literal = null, .holds = holds };
     const literal = try cc.arena.alloc(bool, b_lines.len);
@@ -9940,6 +9978,12 @@ test "routeHunk: a base file in a sibling directory whose name extends the priva
     try testing.expect(!route.line.edit.private);
 }
 
+fn testHeld(a: std.mem.Allocator) !*?[]const Held {
+    const h = try a.create(?[]const Held);
+    h.* = null;
+    return h;
+}
+
 fn testFlag(a: std.mem.Allocator) !*bool {
     const f = try a.create(bool);
     f.* = false;
@@ -9986,6 +10030,7 @@ fn testClassCtx(a: std.mem.Allocator, io: Io, m_state: *const mox.machine.state.
         .ids = try testPathIds(a, io),
         .canon = try testCanon(a),
         .resolved_all = try testFlag(a),
+        .held = try testHeld(a),
     };
     return cc;
 }
@@ -10159,6 +10204,7 @@ fn runCouplingSim(a: std.mem.Allocator, tmp: *std.testing.TmpDir, fail_on: usize
         .ids = try testPathIds(a, io),
         .canon = try testCanon(a),
         .resolved_all = try testFlag(a),
+        .held = try testHeld(a),
     };
 
     const file_edits = &[_]CouplingEdit{.{ .path = path, .old = "sharedtok", .new = "sharedtok@bad" }};

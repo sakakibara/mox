@@ -493,10 +493,16 @@ mox rollback <id>       # restore the live files from a specific one
 A run interrupted part way keeps what it had done; the next command picks it
 up, so its snapshot is there to roll back.
 
-A file that may hold a secret -- one mox wrote a secret into, or one holding a
-value the run resolved -- is not kept: the run names it, `mox snapshot <id>`
-lists it as not kept, and rollback reports it as not restored and restores the
-rest.
+A snapshot keeps no secret mox wrote through a secret reference. A file mox
+wrote a secret into is kept with each secret replaced by
+`<mox:redacted-secret>`, and rollback fills those back from the file it
+replaces when that file is the one mox last wrote and holds the same secret
+lines. Lines you added or edited in such a file are left out of the
+snapshot, since mox cannot tell them from a line holding a value it wrote,
+and a file mox kept no outline for keeps no line; the run names the file and
+what it left out, `apply --dry-run` says so first for a file apply
+overwrites, and rollback refuses such a copy, naming where it is. Every
+other file is kept as it is.
 
 A [partially owned file](#a-file-a-program-also-writes) is not whole-file
 restored -- that would clobber what the program wrote since the snapshot.

@@ -7162,7 +7162,7 @@ test "rollback: re-patching a partial target keeps the live file in rollback's o
     try std.testing.expect(try testutil.snapshotHolds(h, undo_id, "app.toml", "a = 2\nb = \"prog\"\n"));
 }
 
-test "rollback: a file whose content held a secret was not kept, and is refused, never written" {
+test "rollback: a file whose secret mox does not store is restored with the secret filled from the file it replaces" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -7176,12 +7176,11 @@ test "rollback: a file whose content held a secret was not kept, and is refused,
     try writeRepo(io, &tmp, "repo/src/.netrc", "user y\n# mox: secret \"cmd:printf hunter2\"\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     const live = try h.liveOf(".netrc");
-    const before = try read(io, a, live);
+    try std.testing.expectEqualStrings("user y\nhunter2\n", try read(io, a, live));
     const rb = try h.run(&.{ "mox", "rollback" });
-    try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(lineWith(rb.err, try tilde(a, "~/.netrc"), "not restored: its content held a secret and was not kept"));
-    try std.testing.expectEqualStrings(before, try read(io, a, live));
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "redacted") == null);
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    try std.testing.expect(lineWith(rb.out, try tilde(a, "~/.netrc"), "secret slots filled from the file it replaced"));
+    try std.testing.expectEqualStrings("user x\nhunter2\n", try read(io, a, live));
 }
 
 test "snapshot ids: MOX_TEST_CLOCK sets them in a -Dtest-clock build and nowhere else" {

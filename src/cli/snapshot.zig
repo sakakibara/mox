@@ -56,7 +56,13 @@ fn entries(ctx: *app.Ctx, st: *const mox.state.Draft, id: []const u8) !u8 {
 fn line(ctx: *app.Ctx, st: *const mox.state.Draft, indent: []const u8, key: []const u8, d: mox.state.generation.Displaced) !void {
     switch (d.type) {
         .file => if (d.not_kept != null)
-            try ctx.out.print("{s}{s} file not kept: its content held a secret\n", .{ indent, key })
+            try ctx.out.print("{s}{s} file not kept: every line may hold a secret mox wrote\n", .{ indent, key })
+        else if (d.masked) |m|
+            try ctx.out.print("{s}{s} file {s} ({s})\n", .{ indent, key, try st.blobPath(d.blob orelse return), switch (m) {
+                .owned => "masked at its owned secret paths",
+            } })
+        else if (d.slots.len > 0 or d.lines_not_kept > 0)
+            try ctx.out.print("{s}{s} file {s} (masked: {d} secret slot(s), {d} line(s) not kept)\n", .{ indent, key, try st.blobPath(d.blob orelse return), d.slots.len, d.lines_not_kept })
         else
             try ctx.out.print("{s}{s} file {s}\n", .{ indent, key, try st.blobPath(d.blob orelse return) }),
         .link => try ctx.out.print("{s}{s} link -> {s}\n", .{ indent, key, d.target orelse "" }),

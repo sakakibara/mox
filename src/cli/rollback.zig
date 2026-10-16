@@ -146,16 +146,22 @@ fn rollbackOpened(ctx: *app.Ctx, a: cli.Args(Spec), st: *mox.state.Draft) anyerr
 
     var repatched: usize = 0;
     var failed: usize = 0;
+    for (restored.filled) |live| try ctx.out.print("  {f}: secret slots filled from the file it replaced\n", .{display.of(live, context.paths.home)});
     for (restored.refused) |r| {
         const shown = display.of(r.live_path, context.paths.home);
         switch (r.why) {
             .parent_link => try ctx.err.print("  ERROR   {f} (not restored: a parent directory is a symlink; {f})\n", .{ shown, r.copy }),
             .is_link => try ctx.err.print("  ERROR   {f} (not restored: it is a symlink mox did not plant; {f})\n", .{ shown, r.copy }),
-            .redacted => try ctx.err.print("  ERROR   {f} (not restored: it holds a secret mox does not store; run mox apply to resolve it again)\n", .{shown}),
+            .owned_masked => try ctx.err.print("  ERROR   {f} (not restored: its copy is masked at the owned secret paths of a file mox no longer manages in part; {f}, fill its {s} markers by hand)\n", .{ shown, r.copy, mox.provenance.map.secret_redaction }),
+            .lines_not_kept => try ctx.err.print("  ERROR   {f} (not restored: the copy leaves out {d} line(s) that may have held a secret; {f}, restore it by hand)\n", .{ shown, r.count, r.copy }),
+            .fill_gone => try ctx.err.print("  ERROR   {f} (not restored: the copy leaves out a secret, and no file is there to fill it from; {f}, fill its {s} markers by hand)\n", .{ shown, r.copy, mox.provenance.map.secret_redaction }),
+            .fill_link => try ctx.err.print("  ERROR   {f} (not restored: the copy leaves out a secret, and a symlink is there to fill it from; {f}, fill its {s} markers by hand)\n", .{ shown, r.copy, mox.provenance.map.secret_redaction }),
+            .fill_stale => try ctx.err.print("  ERROR   {f} (not restored: the copy leaves out a secret, and the file it would replace is not the one mox last wrote, so it cannot fill it from; {f}, fill its {s} markers by hand)\n", .{ shown, r.copy, mox.provenance.map.secret_redaction }),
+            .fill_changed => try ctx.err.print("  ERROR   {f} (not restored: the copy leaves out a secret, and the file it would replace does not hold the same secret lines to fill it from; {f}, fill its {s} markers by hand)\n", .{ shown, r.copy, mox.provenance.map.secret_redaction }),
             .failed => try ctx.err.print("  ERROR   {f} (not restored: {s}; {f})\n", .{ shown, r.reason, r.copy }),
             .dir_over_link => try ctx.err.print("  ERROR   {f} (not restored: a symlink sits where the snapshot has a directory; {f})\n", .{ shown, r.copy }),
             .missing => try ctx.err.print("  ERROR   {f} (not restored: the snapshot copy at {s} is missing or damaged)\n", .{ shown, r.copy.blob }),
-            .not_kept => try ctx.err.print("  ERROR   {f} (not restored: its content held a secret and was not kept)\n", .{shown}),
+            .not_kept => try ctx.err.print("  ERROR   {f} (not restored: no line of it was kept, since each may have held a secret mox wrote)\n", .{shown}),
         }
         failed += 1;
     }
@@ -328,8 +334,7 @@ fn repatchPartial(
         break :blk mox.apply.write.modeOf(stat.permissions);
     };
     // What the re-patch replaces is kept, as a whole-file restore keeps it,
-    // its secret-bearing owned values and every value this run resolved
-    // masked as apply's snapshot masks them.
+    // its secret-bearing owned values masked as apply's snapshot masks them.
     if (live) |held| if (!std.mem.eql(u8, held, candidate)) keep: {
         const rec = try st.readOwned(live_path);
         const secret_paths: []const mox.source.tree.OwnPath = if (rec) |r| try mox.apply.owned.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
@@ -341,7 +346,7 @@ fn repatchPartial(
                 return false;
             },
         };
-        mox.apply.snapshot.keepBytes(st, ctx.context.?.paths.home, live_target, try st.maskResolved(kept)) catch |e| switch (e) {
+        mox.apply.snapshot.keepBytes(st, ctx.context.?.paths.home, live_target, kept, !std.mem.eql(u8, kept, held)) catch |e| switch (e) {
             // A partial target linked outside HOME has no place in a snapshot.
             error.LiveFileOutsideHome => break :keep,
             else => {

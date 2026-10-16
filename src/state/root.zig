@@ -21,6 +21,8 @@ const quote = @import("quote.zig");
 
 pub const Draft = draft.Draft;
 pub const Store = draft.Store;
+pub const Copy = draft.Copy;
+pub const Next = draft.Next;
 pub const Hex = generation.Hex;
 
 pub const Options = struct {

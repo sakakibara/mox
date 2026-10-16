@@ -187,7 +187,7 @@ pub fn sweepOrphans(
     for (plan) |m| {
         if (m.released) {
             if (!opts.dry_run) {
-                for (m.leaves) |leaf| try forgetRecords(opts.st, leaf.path);
+                for (m.leaves) |leaf| try opts.st.release(leaf.path);
                 try opts.st.dropGenerator(m.key);
             }
             continue;
@@ -303,7 +303,7 @@ fn actOnLeaf(
             return;
         },
         .linked_parent => {
-            if (!opts.dry_run) try forgetRecords(opts.st, live_path);
+            if (!opts.dry_run) try opts.st.release(live_path);
             try stdout.print("  {s}: {s}\n", .{ shown, parent_link.reason });
             return;
         },
@@ -343,7 +343,7 @@ fn finishLeaf(arena: std.mem.Allocator, io: Io, opts: Options, live_path: []cons
             try stdout.print("  removed {s} (generated, no longer produced)\n", .{shown});
         },
         .left => |why| {
-            try forgetRecords(opts.st, live_path);
+            try opts.st.release(live_path);
             try stdout.print("  {s}: {s}\n", .{ shown, why });
         },
         .failed => |why| {

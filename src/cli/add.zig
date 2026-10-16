@@ -7,6 +7,7 @@ const lock_mod = @import("lock.zig");
 const mox = @import("../root.zig");
 const display = @import("display.zig");
 const addtree = @import("addtree.zig");
+const state_cli = @import("state.zig");
 const json = @import("json");
 
 const Io = std.Io;
@@ -660,6 +661,7 @@ const Spec = struct {
     own_absent: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "declare a key-path mox enforces as absent (repeatable; single file only)" }),
     disown: cli.Opt([]const u8, .{ .value_name = "key-path", .help = "manage the whole file except this key-path (repeatable; single file only)" }),
     gate: cli.Opt([]const u8, .{ .value_name = "axis-expr", .help = "gate the created partial source on this axis expression (single file only)" }),
+    cleartext_secrets: cli.Flag(.{ .help = "add a file mox wrote a secret into as it is, value and all" }),
 };
 
 /// Every value the repeated `--<long>` option was given, in command-line
@@ -708,6 +710,7 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
         .exit => |rc| return rc,
     };
     defer lk.release();
+    const draft = (try state_cli.open(ctx, .{ .writes = false, .locked = true })) orelse return 2;
 
     if (!a.force) {
         const m_state = try mox.machine.state.capture(ctx.alloc, ctx.io, context.env, context.paths.repo_dir, context.paths.private_dir);
@@ -731,7 +734,11 @@ fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
     // naming a key path inside one file are refused by the declared conflict
     // before this body runs. `--force` was already applied to the named path
     // by the ignore check above, and stops there -- see `runRecursive`.
-    if (a.recursive) return addtree.runRecursive(ctx, live_path, a.seed_once);
+    if (a.recursive) return addtree.runRecursive(ctx, live_path, a.seed_once, if (a.cleartext_secrets) null else draft);
+    if (!a.cleartext_secrets and try refusedForSecret(ctx, draft, live_path)) {
+        try ctx.err.writeAll("mox add: nothing was added\n");
+        return 1;
+    }
 
     // `--disown` vs `--own`/`--own-absent`, and `--gate`'s dependency on one
     // of them, are declared on the command (see `command` below) and refused
@@ -1003,10 +1010,102 @@ fn runDisown(
     }
 }
 
+/// Which lines of a file mox wrote a secret into would carry a secret into
+/// the repo: each paired with a secret line's shape whose slot holds
+/// something, and each paired with nothing, edited or added since. Null
+/// when mox wrote no secret into it, or none is left.
+pub const SecretLines = struct {
+    secret: []const usize,
+    edited: []const usize,
+    /// mox kept no outline to tell its lines apart.
+    no_outline: bool = false,
+};
+
+pub fn secretLinesOf(arena: std.mem.Allocator, st: *mox.state.Draft, live: []const u8, content: []const u8) !?SecretLines {
+    if (!try st.wroteSecret(live)) return null;
+    const m = try st.provenance(live);
+    const outline = (if (m) |mm| mm.outline else null) orelse return .{ .secret = &.{}, .edited = &.{}, .no_outline = true };
+    const shapes = mox.provenance.shapes;
+    const lines = try mox.diff.lines.splitLines(arena, content);
+    const p = try shapes.pair(arena, outline, lines);
+    var secret: std.ArrayList(usize) = .empty;
+    var edited: std.ArrayList(usize) = .empty;
+    for (lines, p.entry_of, 1..) |l, e, n| {
+        const i = e orelse {
+            try edited.append(arena, n);
+            continue;
+        };
+        switch (outline[i]) {
+            .line => {},
+            .shape => |sh| {
+                var spans: std.ArrayList(shapes.Span) = .empty;
+                _ = try shapes.match(arena, sh, l, &spans);
+                for (spans.items) |sp| if (sp.end > sp.start) {
+                    try secret.append(arena, n);
+                    break;
+                };
+            },
+        }
+    }
+    if (secret.items.len == 0 and edited.items.len == 0) return null;
+    return .{ .secret = secret.items, .edited = edited.items };
+}
+
+/// Refuse to add `live` when it would carry a secret mox wrote into the
+/// repo, naming its lines by number only. A path whose source exists is
+/// left for `addFile` to report as managed.
+pub fn refusedForSecret(ctx: *app.Ctx, st: *mox.state.Draft, live: []const u8) !bool {
+    const home = ctx.context.?.paths.home;
+    const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, live);
+    if (Io.Dir.cwd().access(ctx.io, try std.fs.path.join(ctx.alloc, &.{ ctx.context.?.paths.repo_dir, "src", rel }), .{})) |_| return false else |_| {}
+    switch (mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live)) {
+        .absent, .directory => return false,
+        .symlink, .other => {},
+    }
+    if (mox.apply.write.guardLiveRead(ctx.io, live) != .readable) return false;
+    const content = Io.Dir.cwd().readFileAlloc(ctx.io, live, ctx.alloc, .limited(64 * 1024 * 1024)) catch |e| {
+        if (!try st.wroteSecret(live)) return false;
+        try ctx.err.print("mox add: {f}: mox wrote a secret into this file, and it cannot be read to tell whether one is left: {s}\n", .{ display.of(live, home), @errorName(e) });
+        return true;
+    };
+    const found = (try secretLinesOf(ctx.alloc, st, live, content)) orelse return false;
+    const w = ctx.err;
+    try w.print("mox add: {f}: mox wrote a secret into this file, so adding it would put the value in the repo", .{display.of(live, home)});
+    if (found.no_outline) {
+        try w.writeAll("; mox kept no outline to tell which lines hold it");
+    } else {
+        if (found.secret.len > 0) {
+            try w.writeAll("; line");
+            try writeRanges(w, found.secret);
+            try w.writeAll(if (found.secret.len > 1) " hold a secret mox wrote" else " holds a secret mox wrote");
+        }
+        if (found.edited.len > 0) {
+            try w.writeAll("; line");
+            try writeRanges(w, found.edited);
+            try w.writeAll(" changed since mox wrote it and may hold one");
+        }
+    }
+    try w.writeAll(". Write its source with the secret's reference, or pass --cleartext-secrets to add it as it is\n");
+    return true;
+}
+
+/// ` 2, 5-7` for 2, 5, 6, 7, with `s` after "line" for more than one line.
+fn writeRanges(w: *Io.Writer, ns: []const usize) !void {
+    if (ns.len > 1) try w.writeAll("s");
+    var i: usize = 0;
+    while (i < ns.len) {
+        var j = i;
+        while (j + 1 < ns.len and ns[j + 1] == ns[j] + 1) j += 1;
+        try w.writeAll(if (i == 0) " " else ", ");
+        if (j == i) try w.print("{d}", .{ns[i]}) else try w.print("{d}-{d}", .{ ns[i], ns[j] });
+        i = j + 1;
+    }
+}
+
 pub const command = app.command(Spec, .{
     .name = "add",
     .summary = "Start managing a live file, or a whole directory with -r",
-    .usage = "mox add [-r] [--seed-once] [--force] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... [--gate <axis-expr>] <path>",
+    .usage = "mox add [-r] [--seed-once] [--force] [--cleartext-secrets] [--own <key-path>]... [--own-absent <key-path>]... [--disown <key-path>]... [--gate <axis-expr>] <path>",
     .group = .general,
     .needs_context = true,
     .conflicts = &.{

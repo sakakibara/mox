@@ -318,22 +318,27 @@ All notable changes to mox are documented here. The format follows
   release's history.
 
 ### Fixed
-- A snapshot keeps none of a whole file's prior content when it may hold
-  a secret: mox wrote a secret into the file, or the content holds a value
-  the run resolved, in any form mox writes it in that is at least 8 bytes
-  long. A shorter value, as common as a word, does not stop another file's
-  copy from being kept, so a short secret pasted into a file mox wrote no
-  secret into is kept in its copy. That holds whatever
-  displaces the file: an overwrite, a removal, `mox remove --purge`, a
-  rollback, or a directory apply removes or replaces with a link, each file
-  of which is judged on its own. The run prints a line naming each such
-  file ("its previous content held a secret and was not kept"), `mox
-  snapshot <id>` lists it as not kept, and rollback reports it as not
-  restored and restores the rest. The edits in such a file are not
-  recoverable from mox. A snapshot used to mask only the lines at the places
-  the last apply wrote secrets to, so a secret line the user had moved, or a
-  copy of the value elsewhere in the file, was kept in clear; `mox remove
-  --purge` and a directory's files kept the secrets in clear.
+- A snapshot keeps no secret mox wrote through a secret reference, and names
+  what it leaves out. A file mox wrote no secret into is kept byte for byte.
+  A copy of a file mox wrote a secret into keeps each line mox wrote with no
+  secret as it is, each secret line it can still find, moved or not, with
+  the secret replaced by `<mox:redacted-secret>`, and every line the user
+  added or edited as `<mox:redacted-line>`, since such a line may hold a
+  value mox wrote that it cannot find; the first partial apply of a file mox
+  managed whole with a secret keeps that whole file's masked copy, and a
+  partially owned file's copy is masked at its owned secret paths as before.
+  When a copy leaves something out, the run names the file and the counts
+  ("<path>: not kept in the snapshot, since each may hold a secret mox
+  wrote: N line(s) and the value in M secret slot(s); ..."), including
+  whether rollback can fill them from what the run leaves, and `apply
+  --dry-run` says so first ("would not keep") for a file apply overwrites.
+  Rollback fills a copy's secrets from the file it replaces when that file
+  is the one mox last wrote and holds the same secret lines, and refuses it
+  otherwise, naming the copy and why. A snapshot used to mask only the lines
+  at the places the last apply wrote secrets to, so a secret line the user
+  had moved, or a copy of the value elsewhere in the file, was kept in
+  clear; `mox remove --purge` and a directory's files kept the secrets in
+  clear.
 - `mox commit` routes no live line of a file mox wrote a secret into
   unless the line is one mox wrote that holds no secret: an edited or
   added line, which may hold a value no resolved secret finds, makes its
@@ -343,17 +348,21 @@ All notable changes to mox are documented here. The format follows
   the secret line (`old=<value>`) used to be printed and, once accepted,
   written into the source. This also leaves a loop row edited in such a
   file to be kept by hand.
-- `mox commit` routes no live line, in any file, that holds a value the
-  run resolved in a form of at least 8 bytes, nor a structured key whose
-  live value holds one: the hunk or key is manual ("may hold a secret: a
-  line holding a value this run resolved"), and the line is shown as
-  `<mox:redacted-line>`. Before routing, commit renders every managed file
-  once for the secrets it resolves. A secret pasted into a file mox wrote
-  no secret into used to be routed into its source, and printed when no
-  file commit composed had resolved it.
-- A partially owned file's snapshot masks every value the run resolved,
-  wherever it sits, beside the values under its secret-bearing owned keys;
-  a copy of a value in a section mox does not own was kept in clear.
+- `mox commit` routes no live line, in any file, in which it would mask a
+  value the run resolved, at any length, nor a structured key whose path
+  or live value holds one: the hunk or key is manual ("may hold a secret:
+  a line holding the value of <secret:URI>", naming the references, never
+  the value), and the line is shown as `<mox:redacted-line>`. Before
+  routing, commit renders every managed file once for the secrets it
+  resolves. A secret pasted into a file mox wrote no secret into used to be
+  routed into its source, and printed when no file commit composed had
+  resolved it.
+- `mox add` refuses a file mox wrote a secret into and stopped managing
+  while it may still hold that secret, naming its lines by number and
+  adding nothing; `--cleartext-secrets` adds it as it is. `mox remove`, a
+  tombstone and a source that left the tree keep the record of that secret
+  for this. A removed file holding a secret mox wrote used to be added
+  into the repo, value and all.
 - `mox remove --purge` removes a FIFO or device at the path without
   opening it; the run used to wait on it forever.
 - A value of several lines resolved into a TOML, YAML, INI or gitconfig
@@ -374,9 +383,9 @@ All notable changes to mox are documented here. The format follows
 - A secret in a generator's `into` path -- a `<secret:...>` capture, or a row
   field holding one -- is a compose error naming the capture's column, never
   a file name holding the secret.
-- Rollback no longer writes `<mox:redacted-secret>` into a live file: an
-  entry whose snapshot holds a redacted secret line is refused, with the
-  advice to run `mox apply` to resolve it again, and exits 1.
+- Rollback no longer writes `<mox:redacted-secret>` into a live file: a
+  copy's secrets are filled from the file it replaces or the entry is
+  refused, naming the copy, and the run exits 1.
 - apply's summary counts a generator's dropped files, an orphaned
   generator's files and an exact directory's removed entries in
   "removed"; it reported "0 removed" for a run that removed only those.

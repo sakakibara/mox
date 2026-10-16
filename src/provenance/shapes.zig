@@ -322,14 +322,14 @@ pub fn shapeOf(arena: std.mem.Allocator, line: []const u8, spans: []Span) !Shape
 }
 
 /// The outline of `content`, whose provenance is `segments`, with `values`
-/// the secret values its compose resolved: one entry per line. Empty when no
+/// the secret values the run resolved: one entry per line. Empty when no
 /// segment is a secret. A line no secret segment covers that holds a form
-/// of one of `values` is a shape too, with a slot at each form, so no value
-/// is kept in a line entry.
+/// of a value this render wrote into its secret lines is a shape too, with a
+/// slot at each form, so no such value is kept in a line entry.
 pub fn outlineOf(arena: std.mem.Allocator, content: []const u8, segments: []const map.Segment, values: []const []const u8) ![]const Entry {
     if (!map.hasSecret(segments)) return &.{};
     const lines = try splitLines(arena, content);
-    const forms = try writtenForms(arena, values);
+    const forms = try writtenForms(arena, try renderValues(arena, lines, segments, values));
     const spans = try secretSpans(arena, lines, segments, forms);
     const out = try arena.alloc(Entry, lines.len);
     for (lines, spans, out) |l, sp, *o| {
@@ -346,6 +346,31 @@ pub fn outlineOf(arena: std.mem.Allocator, content: []const u8, segments: []cons
             .{ .line = l };
     }
     return out;
+}
+
+/// The values of `values` with a whole form in a line of `lines` a `.secret`
+/// segment of `segments` covers: the ones this render wrote.
+fn renderValues(arena: std.mem.Allocator, lines: []const []const u8, segments: []const map.Segment, values: []const []const u8) ![]const []const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    for (segments) |sg| {
+        if (sg.origin != .secret) continue;
+        var i: usize = sg.out_start;
+        while (i < @as(usize, sg.out_start) + sg.out_len and i < lines.len) : (i += 1) {
+            try text.appendSlice(arena, lines[i]);
+            try text.append(arena, '\n');
+        }
+    }
+    var out: std.ArrayList([]const u8) = .empty;
+    for (values) |v| {
+        if (v.len == 0) continue;
+        for (try formsOf(arena, v)) |f| {
+            if (f.len > 0 and std.mem.indexOf(u8, text.items, f) != null) {
+                try out.append(arena, v);
+                break;
+            }
+        }
+    }
+    return out.items;
 }
 
 /// How the lines of a live file pair with the entries of its outline.
@@ -618,57 +643,199 @@ pub fn shown(arena: std.mem.Allocator, outline: []const Entry, p: Pairing, j: us
     return mask(arena, line, spans.items, map.secret_redaction);
 }
 
-/// The shortest line of a value of several lines that counts, on its own,
-/// as a written form of the value outside the slots of its own file, and the
-/// shortest form that counts in a file mox wrote no secret into.
-pub const min_fragment: usize = 8;
+/// A copy of a file mox wrote a secret into, holding only text mox wrote
+/// that holds no secret: `slots` is the byte offset of each
+/// `map.secret_redaction` it wrote for a slot, in order, and
+/// `lines_not_kept` the number of lines it wrote as `map.line_redaction`.
+pub const Masked = struct {
+    bytes: []const u8,
+    slots: []const u64,
+    lines_not_kept: usize,
+};
 
-/// Whether `content` holds a written form of one of `values` of at least
-/// `min_fragment` bytes: a whole form anywhere, or a line of a form of
-/// several lines.
-pub fn holdsAny(arena: std.mem.Allocator, content: []const u8, values: []const []const u8) !bool {
-    for (values) |v| {
-        if (v.len == 0) continue;
-        for (try formsOf(arena, v)) |f| {
-            if (f.len >= min_fragment and std.mem.indexOf(u8, content, f) != null) return true;
-            if (std.mem.indexOfScalar(u8, f, '\n') == null) continue;
-            var it = std.mem.splitScalar(u8, f, '\n');
-            while (it.next()) |l| {
-                const t = std.mem.trimEnd(u8, l, "\r");
-                if (t.len >= min_fragment and std.mem.indexOf(u8, content, t) != null) return true;
-            }
+/// `content`, a file mox last wrote with `outline`, as a copy keeps it: a
+/// line paired with an outline line as it is, one paired with a shape with
+/// each non-empty slot masked, and any other line, which may hold a value
+/// mox wrote that no shape finds, replaced whole.
+pub fn maskedCopy(arena: std.mem.Allocator, outline: []const Entry, content: []const u8) !Masked {
+    const lines = try splitLines(arena, content);
+    const p = try pair(arena, outline, lines);
+    var out: std.ArrayList(u8) = .empty;
+    var slots: std.ArrayList(u64) = .empty;
+    var not_kept: usize = 0;
+    for (lines, p.entry_of, 0..) |l, e, j| {
+        if (j > 0) try out.append(arena, '\n');
+        const entry = if (e) |i| outline[i] else null;
+        if (entry == null) {
+            try out.appendSlice(arena, map.line_redaction);
+            not_kept += 1;
+            continue;
+        }
+        switch (entry.?) {
+            .line => try out.appendSlice(arena, l),
+            .shape => |sh| {
+                var spans: std.ArrayList(Span) = .empty;
+                _ = try match(arena, sh, l, &spans);
+                var pos: usize = 0;
+                for (spans.items) |sp| {
+                    try out.appendSlice(arena, l[pos..sp.start]);
+                    if (sp.end > sp.start) {
+                        try slots.append(arena, out.items.len);
+                        try out.appendSlice(arena, map.secret_redaction);
+                    }
+                    pos = sp.end;
+                }
+                try out.appendSlice(arena, l[pos..]);
+            },
         }
     }
-    return false;
-}
-
-/// Whether `line` holds one of `forms` of at least `min_fragment` bytes.
-pub fn holdsForm(line: []const u8, forms: Forms) bool {
-    if (forms.lines.contains(std.mem.trimEnd(u8, line, "\r"))) return true;
-    for (forms.text) |f| {
-        if (f.len < min_fragment) break;
-        if (std.mem.indexOf(u8, line, f) != null) return true;
-    }
-    return false;
-}
-
-/// `content` with every one of `forms` masked wherever it occurs.
-pub fn maskForms(arena: std.mem.Allocator, content: []const u8, forms: Forms) ![]const u8 {
-    const lines = try splitLines(arena, content);
-    var out: std.ArrayList(u8) = .empty;
-    var changed = false;
-    for (lines, 0..) |l, j| {
-        if (j > 0) try out.append(arena, '\n');
-        var spans: std.ArrayList(Span) = .empty;
-        try formSpans(arena, l, forms, &spans);
-        const kept = try mask(arena, l, spans.items, map.secret_redaction);
-        if (kept.ptr != l.ptr) changed = true;
-        try out.appendSlice(arena, kept);
-    }
-    if (!changed) return content;
     if (content.len > 0 and content[content.len - 1] == '\n') try out.append(arena, '\n');
+    return .{ .bytes = out.items, .slots = slots.items, .lines_not_kept = not_kept };
+}
+
+/// `copy`, a masked copy whose markers at `slots` stand for secret slots,
+/// with each slot filled from `live`, the file mox last wrote with
+/// `outline`. Each run of consecutive copy lines holding a slot is filled
+/// as one: from every run of exactly as many consecutive live lines paired
+/// with a shape, each fitting its copy line (`fit`), which must all hold the
+/// same bytes in the slots the copy marks; so two secret lines of one shape
+/// are never told apart by position, and a value whose line count changed
+/// is never cut. Null when no live run fits, the fits disagree, the work
+/// passes its bound, a secret line of `live` is lost, or `slots` names no
+/// marker.
+pub fn fillCopy(arena: std.mem.Allocator, copy: []const u8, slots: []const u64, outline: []const Entry, live: []const u8) !?[]const u8 {
+    return fillWithin(arena, copy, slots, outline, live, max_comparisons);
+}
+
+fn fillWithin(arena: std.mem.Allocator, copy: []const u8, slots: []const u64, outline: []const Entry, live: []const u8, bound: usize) !?[]const u8 {
+    const m = map.secret_redaction;
+    for (slots, 0..) |s, k| {
+        if (s > copy.len or copy.len - s < m.len or !std.mem.eql(u8, copy[s..][0..m.len], m)) return null;
+        if (k > 0 and s < slots[k - 1] + m.len) return null;
+    }
+    const live_lines = try splitLines(arena, live);
+    const lp = try pair(arena, outline, live_lines);
+    if (lp.fail_closed) return null;
+    var budget: usize = bound;
+    const live_shape = try arena.alloc(?Shape, live_lines.len);
+    for (lp.entry_of, live_shape) |e, *o| o.* = if (e) |i| switch (outline[i]) {
+        .shape => |sh| sh,
+        .line => null,
+    } else null;
+
+    // Each copy line's literal text between the markers `slots` names in it;
+    // null for a line with none.
+    const Line = struct { start: usize, end: usize, literals: ?[]const []const u8 };
+    var lines: std.ArrayList(Line) = .empty;
+    var k: usize = 0;
+    var start: usize = 0;
+    while (start <= copy.len) {
+        const end = std.mem.indexOfScalarPos(u8, copy, start, '\n') orelse copy.len;
+        var lits: std.ArrayList([]const u8) = .empty;
+        var at = start;
+        while (k < slots.len and slots[k] < end) : (k += 1) {
+            try lits.append(arena, copy[at..slots[k]]);
+            at = slots[k] + m.len;
+        }
+        try lits.append(arena, copy[at..end]);
+        try lines.append(arena, .{ .start = start, .end = end, .literals = if (lits.items.len > 1) lits.items else null });
+        if (end == copy.len) break;
+        start = end + 1;
+    }
+    if (k != slots.len) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < lines.items.len) {
+        if (lines.items[i].literals == null) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < lines.items.len and lines.items[j].literals != null) j += 1;
+        const run = lines.items[i..j];
+        const Ctx = struct {
+            run: []const Line,
+            fn literals(c: @This(), t: usize) []const []const u8 {
+                return c.run[t].literals.?;
+            }
+        };
+        const values = (try runValues(arena, run.len, Ctx{ .run = run }, live_lines, live_shape, &budget)) orelse return null;
+        var v: usize = 0;
+        for (run) |l| {
+            try out.appendSlice(arena, copy[pos..l.start]);
+            const lits = l.literals.?;
+            for (lits[0 .. lits.len - 1]) |lit| {
+                try out.appendSlice(arena, lit);
+                try out.appendSlice(arena, values[v]);
+                v += 1;
+            }
+            try out.appendSlice(arena, lits[lits.len - 1]);
+            pos = l.end;
+        }
+        i = j;
+    }
+    try out.appendSlice(arena, copy[pos..]);
     return out.items;
 }
+
+/// The bytes each marker of a run of `n` copy lines (`ctx.literals(t)`)
+/// takes: those of every run of exactly `n` consecutive live lines paired
+/// with a shape, each fitting its copy line, when there is one and all
+/// agree. Null too once `budget` line comparisons are spent.
+fn runValues(arena: std.mem.Allocator, n: usize, ctx: anytype, lines: []const []const u8, shapes_of: []const ?Shape, budget: *usize) !?[]const []const u8 {
+    var found: ?[]const []const u8 = null;
+    if (lines.len < n) return null;
+    var j: usize = 0;
+    while (j + n <= lines.len) : (j += 1) {
+        if (j > 0 and shapes_of[j - 1] != null) continue;
+        if (j + n < lines.len and shapes_of[j + n] != null) continue;
+        if (budget.* < n) return null;
+        budget.* -= n;
+        var vals: std.ArrayList([]const u8) = .empty;
+        const fits = for (0..n) |t| {
+            const sh = shapes_of[j + t] orelse break false;
+            const lits = ctx.literals(t);
+            const marked = (try fit(arena, sh.pieces, lits)) orelse break false;
+            var spans: std.ArrayList(Span) = .empty;
+            if (!try match(arena, sh, lines[j + t], &spans)) break false;
+            for (spans.items, marked) |sp, mk| if (mk) try vals.append(arena, lines[j + t][sp.start..sp.end]);
+        } else true;
+        if (!fits) continue;
+        if (found) |f| {
+            if (f.len != vals.items.len) return null;
+            for (f, vals.items) |x, y| if (!std.mem.eql(u8, x, y)) return null;
+        } else found = vals.items;
+    }
+    return found;
+}
+
+/// Whether `pieces`, a shape, fits `literals`, a copy line's text around its
+/// markers, each slot either a marker or empty: per slot, true for a marker.
+fn fit(arena: std.mem.Allocator, pieces: []const []const u8, literals: []const []const u8) !?[]const bool {
+    if (pieces.len < 2) return null;
+    const marked = try arena.alloc(bool, pieces.len - 1);
+    return if (fitFrom(pieces, literals, marked, 0, 0, 0)) marked else null;
+}
+
+fn fitFrom(pieces: []const []const u8, literals: []const []const u8, marked: []bool, pi: usize, li: usize, pos: usize) bool {
+    const lit = literals[li];
+    const piece = pieces[pi];
+    if (lit.len - pos < piece.len or !std.mem.eql(u8, lit[pos..][0..piece.len], piece)) return false;
+    const next = pos + piece.len;
+    if (pi == pieces.len - 1) return li == literals.len - 1 and next == lit.len;
+    if (next == lit.len and li + 1 < literals.len) {
+        marked[pi] = true;
+        if (fitFrom(pieces, literals, marked, pi + 1, li + 1, 0)) return true;
+    }
+    marked[pi] = false;
+    return fitFrom(pieces, literals, marked, pi + 1, li, next);
+}
+
+/// The shortest line of a value of several lines that counts, on its own,
+/// as a written form of the value outside the slots of its own file.
+pub const min_fragment: usize = 8;
 
 const testing = std.testing;
 
@@ -901,6 +1068,19 @@ test "writtenForms: the raw, JSON, TOML and YAML forms, the outer lines of a for
     try testing.expectEqual(@as(usize, 0), spans.items.len);
 }
 
+test "outlineOf: a value only another file wrote makes no slot" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 1, .origin = .secret },
+    };
+    const outline = try outlineOf(a, "role=admin-77\ntoken=v4lue\n", &segs, &.{ "v4lue", "admin-77" });
+    try testing.expectEqualStrings("role=admin-77", outline[0].line);
+    try testing.expectEqualStrings("token=", outline[1].shape.pieces[0]);
+}
+
 test "outlineOf: a line no secret segment covers that holds a resolved value is a shape with a slot at the value" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -918,35 +1098,135 @@ test "outlineOf: a line no secret segment covers that holds a resolved value is 
     try testing.expectEqualStrings("z", outline[2].line);
 }
 
-test "holdsAny: a whole form anywhere and a line of a value of several lines, each only when it is long enough" {
+test "maskedCopy: keeps the lines mox wrote, masks the slots of paired secret lines, and keeps no line the user added or edited" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expect(try holdsAny(a, "x = \"pa\\\"ssword\"\n", &.{"pa\"ssword"}));
-    try testing.expect(!try holdsAny(a, "role = admin\n", &.{"admin"}));
-    try testing.expect(!try holdsAny(a, "f() {\n}\n", &.{"{\n  \"k\": \"v\"\n}"}));
-    try testing.expect(try holdsAny(a, "pasted MIIBlongline\n", &.{"-----BEGIN-----\nMIIBlongline\n-----END-----"}));
-    try testing.expect(!try holdsAny(a, "nothing\n", &.{ "", "absent" }));
+    const outline = try testOutline(a, "a\ntoken=V\nz\n", &.{1}, &.{"V"});
+    const got = try maskedCopy(a, outline, "a\n#token=OLD-1\nz\ntoken=EDITED-9\n");
+    try testing.expectEqualStrings("a\n" ++ map.line_redaction ++ "\nz\ntoken=" ++ map.secret_redaction ++ "\n", got.bytes);
+    try testing.expectEqual(@as(usize, 1), got.slots.len);
+    try testing.expectEqual(@as(usize, 1), got.lines_not_kept);
+    try testing.expectEqualStrings(map.secret_redaction, got.bytes[got.slots[0]..][0..map.secret_redaction.len]);
+    const lost = try maskedCopy(a, outline, "a\ntoken = EDITED\nz\n");
+    try testing.expectEqualStrings("a\n" ++ map.line_redaction ++ "\nz\n", lost.bytes);
+    try testing.expectEqual(@as(usize, 0), lost.slots.len);
+    const cleared = try maskedCopy(a, outline, "a\ntoken=\nz\n");
+    try testing.expectEqualStrings("a\ntoken=\nz\n", cleared.bytes);
+    try testing.expectEqual(@as(usize, 0), cleared.slots.len);
+    const whole = try testOutline(a, "TOKEN\n", &.{0}, &.{"TOKEN"});
+    const commented = try maskedCopy(a, whole, "# my token\nTOKEN\n");
+    try testing.expect(std.mem.indexOf(u8, commented.bytes, "TOKEN") == null);
 }
 
-test "holdsForm: a form of at least 8 bytes within the line, or a middle line of a value of several lines as the whole line" {
+test "fillCopy: fills each slot from the live lines of its shape when they agree, and refuses otherwise" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const forms = try writtenForms(a, &.{ "admin", "PASTED-9f3e1a", "-----BEGIN-----\nMIIBlongline\n-----END-----" });
-    try testing.expect(holdsForm("copy=PASTED-9f3e1a # x", forms));
-    try testing.expect(!holdsForm("role = admin", forms));
-    try testing.expect(holdsForm("MIIBlongline\r", forms));
-    try testing.expect(!holdsForm("x MIIBlongline", forms));
-    try testing.expect(holdsForm("key: -----BEGIN-----", forms));
+    const old = try testOutline(a, "a\nu=A p=B;\nz\n", &.{1}, &.{ "A", "B" });
+    const copy = try maskedCopy(a, old, "a\nu=A p=B;\nz\n");
+    try testing.expectEqualStrings("a\nu=A2 p=B2;\nz\n", (try fillCopy(a, copy.bytes, copy.slots, old, "b\nu=A2 p=B2;\nadded\n")).?);
+    try testing.expect(try fillCopy(a, copy.bytes, copy.slots, old, "a\nu: A2\nz\n") == null);
+    try testing.expect(try fillCopy(a, copy.bytes, &.{0}, old, "a\nu=A2 p=B2;\nz\n") == null);
+
+    const accounts = try testOutline(a, "[a]\npassword \"PA\"\n[b]\npassword \"PB\"\n", &.{ 1, 3 }, &.{ "PA", "PB" });
+    const two = try maskedCopy(a, accounts, "[b]\npassword \"PB\"\n[a]\npassword \"PA\"\n");
+    try testing.expect(try fillCopy(a, two.bytes, two.slots, accounts, "[a]\npassword \"PA\"\n[b]\npassword \"PB\"\n") == null);
+    try testing.expectEqualStrings("[b]\npassword \"P\"\n[a]\npassword \"P\"\n", (try fillCopy(a, two.bytes, two.slots, accounts, "[a]\npassword \"P\"\n[b]\npassword \"P\"\n")).?);
+
+    const url = try testOutline(a, "url=https://U:P@host\n", &.{0}, &.{ "U", "P" });
+    const u = try maskedCopy(a, url, "url=https://U:P@host\n");
+    try testing.expectEqualStrings("url=https://U2:P2@host\n", (try fillCopy(a, u.bytes, u.slots, url, "url=https://U2:P2@host\n")).?);
 }
 
-test "maskForms: every form masked on every line, the rest kept byte for byte" {
+test "fillCopy: a value of several lines is filled as one run, and a line with an empty slot beside a marked one fits" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const forms = try writtenForms(a, &.{"s3cr3t"});
-    try testing.expectEqualStrings("a = " ++ map.secret_redaction ++ "\nb\n", try maskForms(a, "a = s3cr3t\nb\n", forms));
-    const same = "plain\n";
-    try testing.expect((try maskForms(a, same, forms)).ptr == same.ptr);
+    const pem = "-----BEGIN-----\nAAAA1111\nBBBB2222\n-----END-----";
+    const segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 4, .origin = .secret },
+        .{ .out_start = 5, .out_len = 1, .origin = .{ .base = .{ .line = 3 } } },
+    };
+    const content = "a\nkey: " ++ pem ++ "\nz\n";
+    const outline = try outlineOf(a, content, &segs, &.{pem});
+    const copy = try maskedCopy(a, outline, content);
+    try testing.expect(std.mem.indexOf(u8, copy.bytes, "AAAA") == null);
+    const now_pem = "-----BEGIN-----\nCCCC3333\nDDDD4444\n-----END-----";
+    const now_content = "b\nkey: " ++ now_pem ++ "\nz\n";
+    const now = try outlineOf(a, now_content, &segs, &.{now_pem});
+    try testing.expectEqualStrings("a\nkey: " ++ now_pem ++ "\nz\n", (try fillCopy(a, copy.bytes, copy.slots, now, now_content)).?);
+
+    const two = try testOutline(a, "u=A p=B;\n", &.{0}, &.{ "A", "B" });
+    const cleared = try maskedCopy(a, two, "u= p=B;\n");
+    try testing.expectEqual(@as(usize, 1), cleared.slots.len);
+    try testing.expectEqualStrings("u= p=B2;\n", (try fillCopy(a, cleared.bytes, cleared.slots, two, "u=A2 p=B2;\n")).?);
+}
+
+test "maskedCopy: an edited secret line beside a new one, a duplicated secret line and a line inserted inside a value of several lines keep no value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outline = try testOutline(a, "a\ntoken=OLD-1\nz\n", &.{1}, &.{"OLD-1"});
+    for ([_][]const u8{ "a\n#token=OLD-1\ntoken=mine\nz\n", "a\ntoken=OLD-1\ntoken=OLD-1\nz\n" }) |live| {
+        const c = try maskedCopy(a, outline, live);
+        try testing.expect(std.mem.indexOf(u8, c.bytes, "OLD-1") == null);
+    }
+    const pem = "-----BEGIN-----\nAAAA1111\nBBBB2222\n-----END-----";
+    const segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 4, .origin = .secret },
+    };
+    const po = try outlineOf(a, "a\nkey: " ++ pem ++ "\n", &segs, &.{pem});
+    const inserted = try maskedCopy(a, po, "a\nkey: -----BEGIN-----\nAAAA1111\nnote\nBBBB2222\n-----END-----\n");
+    try testing.expect(std.mem.indexOf(u8, inserted.bytes, "AAAA") == null);
+    try testing.expect(std.mem.indexOf(u8, inserted.bytes, "BBBB") == null);
+}
+
+test "fillCopy: a value of several lines next to a whole-line secret is filled whole or refused, never with the other secret, and never cut" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pem = "-----BEGIN-----\nAAAA1111\nBBBB2222\n-----END-----";
+    const segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 5, .origin = .secret },
+    };
+    const content = "a\nkey: " ++ pem ++ "\nTOKEN-ZZZZ\n";
+    const outline = try outlineOf(a, content, &segs, &.{ pem, "TOKEN-ZZZZ" });
+    const copy = try maskedCopy(a, outline, content);
+    const short_segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 2, .origin = .secret },
+    };
+    const now = "a\nkey: single-value\nTOKEN-ZZZZ\n";
+    const now_outline = try outlineOf(a, now, &short_segs, &.{ "single-value", "TOKEN-ZZZZ" });
+    try testing.expect(try fillCopy(a, copy.bytes, copy.slots, now_outline, now) == null);
+
+    const grown = "-----BEGIN-----\nCCCC3333\nDDDD4444\nEEEE5555\n-----END-----";
+    const grown_content = "a\nkey: " ++ grown ++ "\nTOKEN-ZZZZ\n";
+    const grown_segs = [_]map.Segment{
+        .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+        .{ .out_start = 1, .out_len = 6, .origin = .secret },
+    };
+    const grown_outline = try outlineOf(a, grown_content, &grown_segs, &.{ grown, "TOKEN-ZZZZ" });
+    try testing.expect(try fillCopy(a, copy.bytes, copy.slots, grown_outline, grown_content) == null);
+}
+
+test "fillCopy: the search refuses once its bound on line comparisons is spent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var content: std.ArrayList(u8) = .empty;
+    var secret_lines: std.ArrayList(u32) = .empty;
+    var values: std.ArrayList([]const u8) = .empty;
+    for (0..200) |i| {
+        try content.print(a, "ctx{d}\ntok=V{d}\n", .{ i, i });
+        try secret_lines.append(a, @intCast(2 * i + 1));
+        try values.append(a, try std.fmt.allocPrint(a, "V{d}", .{i}));
+    }
+    const outline = try testOutline(a, content.items, secret_lines.items, values.items);
+    const copy = try maskedCopy(a, outline, content.items);
+    try testing.expect(try fillWithin(a, copy.bytes, copy.slots, outline, content.items, 50) == null);
 }

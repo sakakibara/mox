@@ -68,18 +68,30 @@ pub const Planted = struct {
     part: Hex,
 };
 
+/// Which rule masked a copy that records no slots.
+pub const MaskedBy = enum {
+    /// A partially owned file's owned secret paths.
+    owned,
+};
+
 /// Why a displaced file's content was not kept.
 pub const NotKept = enum {
-    /// It may have held a secret.
+    /// No line of it could be kept without a secret mox wrote.
     secret,
 };
 
 /// One displaced entry, flat: `root` is the key of the directory tree it was
 /// captured in, null for an entry of its own. A file has a `blob`, or a
-/// `not_kept` reason and none.
+/// `not_kept` reason and none. A masked copy of a file mox wrote a secret
+/// into names the offset of each secret marker it wrote in `slots` and
+/// counts the lines it wrote as a line marker in `lines_not_kept`;
+/// `masked` names a copy masked by a rule that records no slots.
 pub const Displaced = struct {
     type: EntryType,
     blob: ?Hex = null,
+    slots: []const u64 = &.{},
+    lines_not_kept: u32 = 0,
+    masked: ?MaskedBy = null,
     not_kept: ?NotKept = null,
     target: ?[]const u8 = null,
     mode: ?u32 = null,
@@ -250,10 +262,35 @@ fn parseLink(arena: std.mem.Allocator, v: ?json.Value) ParseError!?LinkRec {
     return .{ .target = try pathStr(arena, o.get("target")), .rolled_back = boolOf(o.get("rolled_back")) orelse false };
 }
 
+fn offsetList(arena: std.mem.Allocator, v: ?json.Value) ParseError![]const u64 {
+    const arr = switch (v orelse return &.{}) {
+        .array => |a| a,
+        else => return error.Malformed,
+    };
+    const out = try arena.alloc(u64, arr.len);
+    for (arr, out, 0..) |x, *o, k| {
+        o.* = switch (x) {
+            .integer => |i| std.math.cast(u64, i) orelse return error.Malformed,
+            else => return error.Malformed,
+        };
+        if (k > 0 and o.* <= out[k - 1]) return error.Malformed;
+    }
+    return out;
+}
+
 fn parseDisplaced(arena: std.mem.Allocator, o: json.ObjectMap, root: ?[]const u8) ParseError!Displaced {
     var d: Displaced = .{
         .type = enumOf(EntryType, o.get("type")) orelse return error.Malformed,
         .blob = try optHex(o.get("blob")),
+        .slots = try offsetList(arena, o.get("slots")),
+        .lines_not_kept = if (o.get("lines_not_kept")) |n| switch (n) {
+            .integer => |i| std.math.cast(u32, i) orelse return error.Malformed,
+            else => return error.Malformed,
+        } else 0,
+        .masked = if (o.get("masked")) |m| switch (m) {
+            .string => |t| std.meta.stringToEnum(MaskedBy, t) orelse return error.Malformed,
+            else => return error.Malformed,
+        } else null,
         .not_kept = if (o.get("not_kept")) |v| enumOf(NotKept, v) orelse return error.Malformed else null,
         .target = try optPath(arena, o.get("target")),
         .mode = if (o.get("mode")) |m| switch (m) {
@@ -413,6 +450,13 @@ fn displacedFields(arena: std.mem.Allocator, d: Displaced) !json.ObjectMap {
     var o: json.ObjectMap = .empty;
     try o.put(arena, "type", .{ .string = @tagName(d.type) });
     if (d.blob) |b| try o.put(arena, "blob", .{ .string = try arena.dupe(u8, &b) });
+    if (d.slots.len > 0) {
+        const arr = try arena.alloc(json.Value, d.slots.len);
+        for (d.slots, arr) |x, *v| v.* = .{ .integer = @intCast(x) };
+        try o.put(arena, "slots", .{ .array = arr });
+    }
+    if (d.lines_not_kept > 0) try o.put(arena, "lines_not_kept", .{ .integer = d.lines_not_kept });
+    if (d.masked) |m| try o.put(arena, "masked", .{ .string = @tagName(m) });
     if (d.not_kept) |n| try o.put(arena, "not_kept", .{ .string = @tagName(n) });
     if (d.target) |t| try o.put(arena, "target", .{ .string = try applied.pctEncode(arena, t) });
     if (d.mode) |m| try o.put(arena, "mode", .{ .integer = m });
@@ -580,6 +624,8 @@ test "generation: serialize then parse round-trips every map, members grouped un
     try g.displaced.put(a, "d", .{ .type = .dir, .mode = 0o700 });
     try g.displaced.put(a, "d/f", .{ .type = .file, .blob = h, .mode = 0o644, .root = "d" });
     try g.displaced.put(a, "d/s", .{ .type = .file, .not_kept = .secret, .mode = 0o600, .root = "d" });
+    try g.displaced.put(a, "d/m", .{ .type = .file, .blob = h, .slots = &.{ 4, 40 }, .lines_not_kept = 2, .root = "d" });
+    try g.displaced.put(a, "own", .{ .type = .file, .blob = h, .masked = .owned });
     try g.displaced.put(a, "l", .{ .type = .link, .target = "/x", .planted = .{ .live = "/h/l", .target = "/x", .part = h } });
 
     const bytes = try serialize(a, g);
@@ -589,6 +635,10 @@ test "generation: serialize then parse round-trips every map, members grouped un
     try std.testing.expectEqual(@as(u32, 0o700), back.displaced.get("d").?.mode.?);
     try std.testing.expect(back.displaced.get("d/s").?.not_kept.? == .secret);
     try std.testing.expect(back.displaced.get("d/s").?.blob == null);
+    try std.testing.expectEqualSlices(u64, &.{ 4, 40 }, back.displaced.get("d/m").?.slots);
+    try std.testing.expectEqual(@as(u32, 2), back.displaced.get("d/m").?.lines_not_kept);
+    try std.testing.expect(back.displaced.get("own").?.masked.? == .owned);
+    try std.testing.expect(back.displaced.get("d/f").?.masked == null);
     try std.testing.expectEqualStrings("/r e", back.parts.get(&h).?.repo);
     try std.testing.expect(back.paths.get("/h/link").?.kind == .link);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"tree\"") != null);

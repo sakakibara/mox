@@ -33,8 +33,9 @@ pub const Snap = union(enum) {
     /// A file: these bytes are what it holds, kept as `Draft.keepPrior`
     /// keeps them.
     file: []const u8,
-    /// A file whose content may hold a secret: none of it is kept.
-    secret_file,
+    /// A file whose copy the caller judged before it forgot the records
+    /// that say how to keep it.
+    copy: state.Copy,
     /// A symlink to this target.
     link: []const u8,
     /// A directory, snapshotted whole.
@@ -63,8 +64,8 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
     if (parent_link.through(io, c.home, live_path, c.links)) return .{ .left = parent_link.reason };
     if (c.dry_run) return .removed;
     const saved: anyerror!void = switch (snap) {
-        .file => |bytes| c.st.keepPrior(c.home, live_path, bytes),
-        .secret_file => c.st.saveNotKept(c.home, live_path),
+        .file => |bytes| c.st.keepPrior(c.home, live_path, bytes, .gone),
+        .copy => |cp| c.st.keepCopy(c.home, live_path, cp, .gone),
         .link => |target| c.st.saveSymlink(c.home, live_path, target),
         .tree => snapshot.saveTree(arena, io, c.st, c.home, live_path),
         .taken_tree, .taken_file, .special => {},
@@ -78,7 +79,7 @@ pub fn remove(arena: std.mem.Allocator, io: Io, c: Ctx, live_path: []const u8, s
     // A file, link or directory must still be what was snapshotted, read
     // without following a link.
     switch (snap) {
-        .file, .secret_file, .taken_file => switch (applied.inspectSymSite(io, arena, live_path)) {
+        .file, .copy, .taken_file => switch (applied.inspectSymSite(io, arena, live_path)) {
             .symlink, .directory => return .changed,
             .absent, .other => {},
         },

@@ -335,8 +335,10 @@ It is a plain lookup - no arithmetic, no transforms, no regex:
   content mox keeps of what it applied and of what it displaced, and `mox
   diff` masks it on both sides. For a file it writes a secret into, apply
   records the file's outline: each line as written, a line holding a secret
-  by the text around the secret. A snapshot keeps none of a whole file that may
-  hold a resolved secret. diff masks a live line that pairs with a secret
+  by the text around the secret. A snapshot of such a file keeps the lines
+  mox wrote with each secret replaced by `<mox:redacted-secret>`, and no
+  line you added or edited (see `mox snapshot` in commands.md).
+  diff masks a live line that pairs with a secret
   line's shape at the secret's place, and prints
   a live line of the file that pairs with no line of the outline, one you
   added or edited, as `<mox:redacted-line>` (see `mox diff` in

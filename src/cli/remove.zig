@@ -177,9 +177,10 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
     // cache, symlink target, owned record) and its provenance: mox stopped
     // tracking it, and a stale record would make a later re-add at the same
     // path compare against state from the previous management era instead of
-    // going through first contact. A file --purge removes is read, and
-    // whether it may hold a secret judged, first, while the records that
-    // say so still exist.
+    // going through first contact. A provenance that names a secret stays
+    // as residue, since the live file left in place may still hold what mox
+    // wrote. A file --purge removes is read, and how its copy is kept
+    // judged, first, while the records that say so still exist.
     // A FIFO or device is never opened: it would block, and holds nothing
     // to keep.
     const readable = purge and mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path) == .other and
@@ -188,9 +189,9 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
         try ctx.err.print("mox remove: cannot read {f} to back it up, not deleting: {s}\n", .{ display.of(live_path, context.paths.home), @errorName(e) });
         return 1;
     } else null;
-    const purged_secret = if (purged) |b| try st.priorHoldsSecret(live_path, b) else false;
-    try st.forget(live_path);
-    try st.forgetProvenance(live_path);
+    const purged_copy: ?mox.state.Copy = if (purged) |b| try st.copyOf(live_path, b) else null;
+    const keep_residue = try st.provenanceNamesSecret(live_path);
+    try st.release(live_path);
 
     try ctx.out.print("Removed {s} (trashed to {s})\n", .{ src_name, trash });
 
@@ -210,8 +211,7 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
             }
             for (prior) |leaf| {
                 if (claimed.contains(leaf)) continue;
-                try st.forget(leaf);
-                try st.forgetProvenance(leaf);
+                try st.release(leaf);
             }
             try st.forgetGenerator(live_path);
             try ctx.out.print("  {d} generated file(s) left in place, no longer managed\n", .{prior.len});
@@ -258,6 +258,7 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
         var expect: ?[]const u8 = null;
         const snap: mox.apply.live_remove.Snap = switch (mox.apply.applied.inspectSymSite(ctx.io, ctx.alloc, live_path)) {
             .absent => {
+                if (keep_residue) try st.forgetProvenance(live_path);
                 try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
                 return 0;
             },
@@ -269,11 +270,12 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
             .other => blk: {
                 if (purged) |b| {
                     expect = b;
-                    break :blk if (purged_secret) .secret_file else .{ .file = b };
+                    break :blk .{ .copy = purged_copy.? };
                 }
                 if (mox.apply.write.guardLiveRead(ctx.io, live_path) == .special) break :blk .special;
                 const live = Io.Dir.cwd().readFileAlloc(ctx.io, live_path, ctx.alloc, .limited(max_file_bytes)) catch |e| switch (e) {
                     error.FileNotFound => {
+                        if (keep_residue) try st.forgetProvenance(live_path);
                         try ctx.out.print("  live file already absent: {f}\n", .{display.of(live_path, context.paths.home)});
                         return 0;
                     },
@@ -301,6 +303,7 @@ fn removeOpened(ctx: *app.Ctx, st: *mox.state.Draft, name: []const u8, purge: bo
                 return 1;
             },
         }
+        if (keep_residue) try st.forgetProvenance(live_path);
         try ctx.out.print("  purged live file: {f}\n", .{display.of(live_path, context.paths.home)});
     } else {
         try ctx.out.print("  live file left in place: {f}\n", .{display.of(live_path, context.paths.home)});

@@ -102,10 +102,26 @@ pub fn commit(ctx: *app.Ctx, st: *state.Draft, opts: state.recovery.CommitOption
     if (committed != null) {
         if (st.cleanup_warning) |w| try ctx.err.print("mox: warning: {s}\n", .{w});
         const home = if (ctx.context) |c| c.paths.home else "";
-        for (st.not_kept.items) |live| try ctx.out.print("  {f}: its previous content held a secret and was not kept\n", .{display.of(live, home)});
-        st.not_kept.clearRetainingCapacity();
+        for (st.dropped.items) |x| try printDropped(ctx.out, display.of(x.live, home), x, false);
+        st.dropped.clearRetainingCapacity();
     }
     return true;
+}
+
+/// The line naming what a snapshot left out of a file mox wrote a secret
+/// into.
+pub fn printDropped(out: *std.Io.Writer, shown: anytype, x: state.draft.Dropped, would: bool) !void {
+    try out.print("  {f}: {s} in the snapshot, since each may hold a secret mox wrote:", .{ shown, if (would) "would not keep" else "not kept" });
+    if (x.lines > 0) try out.print(" {d} line(s)", .{x.lines});
+    if (x.lines > 0 and x.slots > 0) try out.writeAll(" and");
+    if (x.slots > 0) try out.print(" the value in {d} secret slot(s)", .{x.slots});
+    try out.writeAll(if (x.lines > 0) "; rollback cannot restore this file\n" else switch (x.fill) {
+        .yes => "; rollback fills them from the file it replaces\n",
+        .no => "; rollback cannot fill them, since the file left here does not hold the same secret lines\n",
+        .gone => "; rollback cannot fill them, since no file is left here to fill them from\n",
+        .unrecorded => "; rollback cannot fill them, since mox keeps no outline of the file left here\n",
+        .unknown => "; rollback fills them only from a file mox last wrote that holds the same secret lines\n",
+    });
 }
 
 /// Commit what `st` holds once the command's body has given `rc`, its exit

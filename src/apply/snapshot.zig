@@ -16,6 +16,7 @@ const write_mod = @import("write.zig");
 const source_path = @import("../source/path.zig");
 const dirent = @import("../source/dirent.zig");
 const prov_map = @import("../provenance/root.zig").map;
+const prov_shapes = @import("../provenance/root.zig").shapes;
 const state = @import("../state/root.zig");
 
 /// Bound on directory-tree snapshot recursion depth, matching the bound
@@ -98,6 +99,9 @@ pub fn saveTree(arena: std.mem.Allocator, io: Io, st: *state.Draft, home: []cons
 
 pub const Restored = struct {
     count: usize = 0,
+    /// Files restored with their secret slots filled from the file each
+    /// replaced.
+    filled: []const []const u8 = &.{},
     /// Entries not restored: each names its live path and where the
     /// generation keeps it.
     refused: []const Refused = &.{},
@@ -129,6 +133,8 @@ pub const Refused = struct {
     why: Why,
     /// For `failed`: what went wrong.
     reason: []const u8 = "",
+    /// For `lines_not_kept`: how many.
+    count: usize = 0,
 
     pub const Why = enum {
         /// A directory above the live path is a symlink.
@@ -139,9 +145,21 @@ pub const Refused = struct {
         dir_over_link,
         /// Restoring it failed; `reason` says how.
         failed,
-        /// The snapshot holds a secret line redacted: writing it would put
-        /// the placeholder in the live file.
-        redacted,
+        /// A partially owned file's copy, masked at its owned secret paths,
+        /// that is no longer re-patched: writing it whole would put the
+        /// placeholder in the live file.
+        owned_masked,
+        /// The copy leaves lines out that may have held a secret.
+        lines_not_kept,
+        /// The copy's secret slots cannot be filled: no file is at the live
+        /// path.
+        fill_gone,
+        /// ... the live path is a symlink.
+        fill_link,
+        /// ... the live file is not what mox last wrote there.
+        fill_stale,
+        /// ... the live file does not hold the same secret lines.
+        fill_changed,
         /// The kept content is missing or no longer matches its name.
         missing,
         /// Its content may have held a secret, and was not kept.
@@ -171,9 +189,9 @@ fn entryRefusal(io: Io, st: *const state.Draft, home: []const u8, live: []const 
 
 /// Keep `bytes`, what a partial re-patch is about to replace at `live`, in
 /// the rollback's own displaced history; the caller has masked its secret
-/// values.
-pub fn keepBytes(st: *state.Draft, home: []const u8, live: []const u8, bytes: []const u8) !void {
-    try st.save(home, live, bytes);
+/// values, `masked` when that changed a byte.
+pub fn keepBytes(st: *state.Draft, home: []const u8, live: []const u8, bytes: []const u8, masked: bool) !void {
+    try st.saveOwned(home, live, bytes, masked);
 }
 
 /// Keep what is at `live` in the rollback's own displaced history before
@@ -193,7 +211,7 @@ fn keepReplaced(arena: std.mem.Allocator, io: Io, st: *state.Draft, home: []cons
             if (write_mod.guardLiveRead(io, live) == .special) return;
             const bytes = try Io.Dir.cwd().readFileAlloc(io, live, arena, .limited(64 * 1024 * 1024));
             if (incoming) |in| if (std.mem.eql(u8, in, bytes)) return;
-            try st.keepPrior(home, live, bytes);
+            try st.keepPrior(home, live, bytes, if (incoming == null) .gone else .unknown);
         },
     }
 }
@@ -222,6 +240,7 @@ pub fn restoreExcept(
 ) !Restored {
     var result: Restored = .{};
     var refused: std.ArrayList(Refused) = .empty;
+    var filled: std.ArrayList([]const u8) = .empty;
     var planted = std.StringHashMap(state.generation.Planted).init(arena);
     for (src.displaced.values()) |d| if (d.planted) |p| try planted.put(p.live, p);
 
@@ -246,7 +265,7 @@ pub fn restoreExcept(
                     continue;
                 }
                 const copy: Copy = .{ .blob = try st.blobPath(d.blob orelse continue) };
-                restoreFile(arena, io, st, d, live, home, skip, skipped, &result, &refused) catch |e| switch (e) {
+                restoreFile(arena, io, st, d, live, home, skip, skipped, &result, &refused, &filled) catch |e| switch (e) {
                     error.OutOfMemory => return e,
                     else => try refused.append(arena, .{ .live_path = live, .copy = copy, .why = .failed, .reason = @errorName(e) }),
                 };
@@ -266,6 +285,7 @@ pub fn restoreExcept(
         try write_mod.setMode(dirs.items[i].live, dirs.items[i].mode);
     }
     result.refused = try refused.toOwnedSlice(arena);
+    result.filled = try filled.toOwnedSlice(arena);
     return result;
 }
 
@@ -300,6 +320,7 @@ fn restoreFile(
     skipped: ?*std.ArrayList(Withheld),
     result: *Restored,
     refused: *std.ArrayList(Refused),
+    filled: *std.ArrayList([]const u8),
 ) !void {
     const copy: Copy = .{ .blob = try st.blobPath(d.blob.?) };
     // A withheld partial target is re-patched by the caller, through a link
@@ -313,13 +334,34 @@ fn restoreFile(
         try refused.append(arena, .{ .live_path = live, .copy = copy, .why = why });
         return;
     }
-    const content = (try st.readBlob(d.blob.?)) orelse {
+    const stored = (try st.readBlob(d.blob.?)) orelse {
         try refused.append(arena, .{ .live_path = live, .copy = copy, .why = .missing });
         return;
     };
-    if (!withheld and std.mem.indexOf(u8, content, prov_map.secret_redaction) != null) {
-        try refused.append(arena, .{ .live_path = live, .copy = copy, .why = .redacted });
+    var content = stored;
+    // A re-patch masks and refuses owned secret values itself; a copy whose
+    // lines were left out, or whose slots cannot be filled, is refused
+    // either way.
+    const why: ?Refused.Why = if (d.masked) |m| switch (m) {
+        .owned => if (withheld) null else .owned_masked,
+    } else if (d.lines_not_kept > 0) .lines_not_kept else null;
+    if (why) |w| {
+        try refused.append(arena, .{ .live_path = live, .copy = copy, .why = w, .count = d.lines_not_kept });
         return;
+    }
+    if (d.slots.len > 0) {
+        content = switch (try fill(arena, io, st, live, stored, d.slots)) {
+            .bytes => |b| b,
+            .refused => |w| {
+                try refused.append(arena, .{ .live_path = live, .copy = copy, .why = w });
+                return;
+            },
+            .failed => |err_name| {
+                try refused.append(arena, .{ .live_path = live, .copy = copy, .why = .failed, .reason = try std.fmt.allocPrint(arena, "the file to fill its secret slots from cannot be read: {s}", .{err_name}) });
+                return;
+            },
+        };
+        try filled.append(arena, live);
     }
     if (withheld) {
         if (skipped) |out| try out.append(arena, .{ .live_path = live, .content = content });
@@ -329,6 +371,29 @@ fn restoreFile(
     try write_mod.writeAtomic(io, live, content, d.mode orelse 0o644);
     try st.forgetSymlink(live);
     result.count += 1;
+}
+
+const Fill = union(enum) { bytes: []const u8, refused: Refused.Why, failed: []const u8 };
+
+/// `copy`, a masked copy whose markers at `slots` stand for secret slots,
+/// filled from the regular file at `live` by the outline mox last wrote it
+/// with (`prov_shapes.fillCopy`).
+fn fill(arena: std.mem.Allocator, io: Io, st: *state.Draft, live: []const u8, copy: []const u8, slots: []const u64) !Fill {
+    switch (applied.inspectSymSite(io, arena, live)) {
+        .absent, .directory => return .{ .refused = .fill_gone },
+        .symlink => return .{ .refused = .fill_link },
+        .other => {},
+    }
+    if (write_mod.guardLiveRead(io, live) != .readable) return .{ .failed = "not a regular file" };
+    const outline = blk: {
+        const m = (try st.provenance(live)) orelse return .{ .refused = .fill_changed };
+        break :blk m.outline orelse return .{ .refused = .fill_changed };
+    };
+    const now = Io.Dir.cwd().readFileAlloc(io, live, arena, .limited(64 * 1024 * 1024)) catch |e| return .{ .failed = @errorName(e) };
+    const recorded = st.read(live) orelse return .{ .refused = .fill_stale };
+    if (!std.mem.eql(u8, &recorded, &applied.contentHashHex(now))) return .{ .refused = .fill_stale };
+    const bytes = (try prov_shapes.fillCopy(arena, copy, slots, outline, now)) orelse return .{ .refused = .fill_changed };
+    return .{ .bytes = bytes };
 }
 
 fn restoreLink(

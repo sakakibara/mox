@@ -1922,7 +1922,7 @@ test "apply: a secret of a megabyte, rotated and overwritten, leaves no byte of 
     }
 }
 
-test "apply --overwrite: the previous content of a file mox wrote a secret into is not kept, says so, and rollback restores the rest" {
+test "apply --overwrite: a copy of an edited file mox wrote a secret into masks its slot, keeps no line the user added, names both first, and rollback refuses it with the count" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1933,14 +1933,18 @@ test "apply --overwrite: the previous content of a file mox wrote a secret into 
     try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntoken=<secret:env:MOX_TEST_TOKEN>\nz\n");
     try writeRepo(io, &tmp, "repo/src/plain.txt", "p\n");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "token=tok-4c1d-SECRET\na\nz\nkept-4c1e\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\ntoken=tok-4c1d-SECRET\nz\nkept-4c1e\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("plain.txt"), .data = "edited\n" });
+    const note = ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: 1 line(s) and the value in 1 secret slot(s); rollback cannot restore this file\n";
+    const dry = try h.run(&.{ "mox", "apply", "--overwrite", "--dry-run" });
+    try std.testing.expect(contains(dry.out, ".cfg: would not keep in the snapshot, since each may hold a secret mox wrote: 1 line(s) and the value in 1 secret slot(s); rollback cannot restore this file\n"));
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(contains(r.out, ".cfg: its previous content held a secret and was not kept\n"));
-    try std.testing.expect(!contains(r.out, "plain.txt: its previous content"));
+    try std.testing.expect(contains(r.out, note));
+    try std.testing.expect(!contains(r.out, "plain.txt: not kept"));
     try std.testing.expect(!try stateHolds(h, "4c1d"));
     try std.testing.expect(!try stateHolds(h, "kept-4c1e"));
+    try std.testing.expect(try stateHolds(h, "a\ntoken=" ++ redacted_secret ++ "\nz\n" ++ redacted_line ++ "\n"));
     try std.testing.expect(try stateHolds(h, "edited\n"));
 
     const ids = try h.run(&.{ "mox", "snapshot" });
@@ -1948,18 +1952,18 @@ test "apply --overwrite: the previous content of a file mox wrote a secret into 
     try std.testing.expect(std.mem.indexOfScalar(u8, id, '\n') == null);
     const listed = try h.run(&.{ "mox", "snapshot", id });
     try std.testing.expectEqual(@as(u8, 0), listed.rc);
-    try std.testing.expect(contains(listed.out, ".cfg file not kept: its content held a secret\n"));
+    try std.testing.expect(contains(listed.out, " (masked: 1 secret slot(s), 1 line(s) not kept)\n"));
     try std.testing.expect(contains(listed.out, "plain.txt file "));
 
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(contains(rb.err, ".cfg (not restored: its content held a secret and was not kept)"));
+    try std.testing.expect(contains(rb.err, ".cfg (not restored: the copy leaves out 1 line(s) that may have held a secret; the snapshot copy is at "));
     try std.testing.expect(contains(rb.out, "Restored 1 file(s)"));
     try std.testing.expectEqualStrings("edited\n", try read(io, a, try h.liveOf("plain.txt")));
     try std.testing.expectEqualStrings("a\ntoken=tok-4c1d-SECRET\nz\n", try read(io, a, try h.liveOf(".cfg")));
 }
 
-test "apply --overwrite: a file holding a value this run resolved is not kept, though mox wrote no secret into it" {
+test "apply --overwrite: a file mox wrote no secret into is kept byte for byte, a value another file resolves included" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1969,16 +1973,19 @@ test "apply --overwrite: a file holding a value this run resolved is not kept, t
     const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "RESOLVED-77aa" }});
     try writeRepo(io, &tmp, "repo/src/.cfg", "tok=<secret:env:MOX_TEST_TOKEN>\n");
     try writeRepo(io, &tmp, "repo/src/notes.txt", "hello\n");
+    try writeRepo(io, &tmp, "repo/src/.exact/k.yaml", "apiVersion: v1\n");
+    try writeRepo(io, &tmp, "repo/src/.exact/.mox-exact", "");
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("notes.txt"), .data = "hello\npasted RESOLVED-77aa\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".exact/mine.yaml"), .data = "apiVersion: v1\nkind: Mine\n" });
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(contains(r.out, "notes.txt: its previous content held a secret and was not kept\n"));
-    try std.testing.expect(!try stateHolds(h, "77aa"));
-    try std.testing.expect(!try stateHolds(h, "pasted"));
+    try std.testing.expect(!contains(r.out, "not kept in the snapshot"));
+    try std.testing.expect(try stateHolds(h, "hello\npasted RESOLVED-77aa\n"));
+    try std.testing.expect(try stateHolds(h, "apiVersion: v1\nkind: Mine\n"));
 }
 
-test "apply --overwrite: in a file mox wrote no secret into, a resolved value counts only from 8 bytes" {
+test "apply --overwrite: a file mox wrote no secret into is kept byte for byte whatever value of another file it holds, short or long" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1997,13 +2004,12 @@ test "apply --overwrite: in a file mox wrote no secret into, a resolved value co
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("notes.txt"), .data = "hello\npasted TEN-b7c2e1\n" });
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expect(!contains(r.out, "roles.txt: its previous content"));
+    try std.testing.expect(!contains(r.out, "not kept in the snapshot"));
     try std.testing.expect(try stateHolds(h, "admin edited-5e3f\n"));
-    try std.testing.expect(contains(r.out, "notes.txt: its previous content held a secret and was not kept\n"));
-    try std.testing.expect(!try stateHolds(h, "b7c2e1"));
+    try std.testing.expect(try stateHolds(h, "hello\npasted TEN-b7c2e1\n"));
 }
 
-test "apply --overwrite: a partially owned file's snapshot masks a resolved value outside what mox owns" {
+test "apply --overwrite: a partially owned file's snapshot masks its owned secret paths and nothing else" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2015,13 +2021,13 @@ test "apply --overwrite: a partially owned file's snapshot masks a resolved valu
     try Io.Dir.cwd().createDirPath(io, try h.liveOf(".config"));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/p.toml"), .data = "[other]\nx = 1\n" });
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/p.toml"), .data = "[other]\nx = 1\nbackup = \"OWNEDSEKRIT1\"\n\n[auth]\ntoken = \"mine\"\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/p.toml"), .data = "[other]\nx = 1\nnote = \"kept-61ab\"\n\n[auth]\ntoken = \"mine-5c0d\"\n" });
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
-    try std.testing.expect(!try stateHolds(h, "OWNEDSEKRIT1"));
-    try std.testing.expect(try stateHolds(h, "backup = \"" ++ redacted_secret ++ "\""));
+    try std.testing.expect(!try stateHolds(h, "mine-5c0d"));
+    try std.testing.expect(try stateHolds(h, "note = \"kept-61ab\""));
 }
 
-test "rollback: what it replaces that holds a secret is not kept, and rolling that back says it cannot be restored" {
+test "rollback: what it replaces of a file mox wrote a secret into is kept masked, and rolling that back refuses to fill it from a file mox did not last write" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2035,16 +2041,17 @@ test "rollback: what it replaces that holds a secret is not kept, and rolling th
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
     const rb = try h.run(&.{ "mox", "rollback" });
     try std.testing.expectEqual(@as(u8, 0), rb.rc);
-    try std.testing.expect(contains(rb.out, ".conf: its previous content held a secret and was not kept\n"));
+    try std.testing.expect(contains(rb.out, ".conf: not kept in the snapshot, since each may hold a secret mox wrote: the value in 1 secret slot(s); rollback fills them only from a file mox last wrote that holds the same secret lines\n"));
     try std.testing.expectEqualStrings("a=1\ntoken=plain\nz=2\n", try read(io, a, try h.liveOf(".conf")));
     try std.testing.expect(!try stateHolds(h, "RB-SECRET-9"));
+    try std.testing.expect(try stateHolds(h, "a=1\ntoken=" ++ redacted_secret ++ "\nz=2\n"));
     const ids = try h.run(&.{ "mox", "snapshot" });
     var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, ids.out, "\n"), '\n');
     var last: []const u8 = "";
     while (it.next()) |l| last = l[0 .. std.mem.indexOfScalar(u8, l, ' ') orelse l.len];
     const again = try h.run(&.{ "mox", "rollback", last });
     try std.testing.expectEqual(@as(u8, 1), again.rc);
-    try std.testing.expect(contains(again.err, ".conf (not restored: its content held a secret and was not kept)"));
+    try std.testing.expect(contains(again.err, ".conf (not restored: the copy leaves out a secret, and the file it would replace is not the one mox last wrote, so it cannot fill it from;"));
     try std.testing.expectEqualStrings("a=1\ntoken=plain\nz=2\n", try read(io, a, try h.liveOf(".conf")));
 }
 
@@ -2192,7 +2199,7 @@ test "diff and apply: a rotated value that holds the text after its slot is mask
     try std.testing.expect(!try stateHolds(h, "LEAKME"));
 }
 
-test "apply: a snapshot of a file whose provenance has no shapes, or none at all, keeps no rotated value" {
+test "apply: a copy of a file whose provenance has no outline, or none at all, keeps no line, and says so" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2218,7 +2225,9 @@ test "apply: a snapshot of a file whose provenance has no shapes, or none at all
         }
     }.unrecorded, try h.liveOf(".cfg"));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = pw, .data = "NEWPASSWORD" });
-    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const r = try h.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(contains(r.out, ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: 3 line(s); rollback cannot restore this file\n"));
     try std.testing.expect(!try stateHolds(h, "OLDPASSWORD"));
 
     const live = try h.liveOf(".cfg");
@@ -2230,7 +2239,7 @@ test "apply: a snapshot of a file whose provenance has no shapes, or none at all
     try std.testing.expect(!try stateHolds(h, "NEWPASSWORD"));
 }
 
-test "remove --purge: a file mox wrote a secret into is not kept, and it says so" {
+test "remove --purge: an unedited file mox wrote a secret into is kept masked, the run says rollback cannot fill it, and rollback refuses it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2244,10 +2253,15 @@ test "remove --purge: a file mox wrote a secret into is not kept, and it says so
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!exists(io, try h.liveOf(".cfg")));
     try std.testing.expect(!try stateHolds(h, "PURGEDSECRET"));
-    try std.testing.expect(contains(r.out, ".cfg: its previous content held a secret and was not kept\n"));
+    try std.testing.expect(contains(r.out, ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: the value in 1 secret slot(s); rollback cannot fill them, since no file is left here to fill them from\n"));
+    try std.testing.expect(try stateHolds(h, "a\ntok=" ++ redacted_secret ++ "\nz\n"));
     const ids = try h.run(&.{ "mox", "snapshot" });
     const listed = try h.run(&.{ "mox", "snapshot", std.mem.trimEnd(u8, ids.out, "\n") });
-    try std.testing.expect(contains(listed.out, ".cfg file not kept: its content held a secret\n"));
+    try std.testing.expect(contains(listed.out, " (masked: 1 secret slot(s), 0 line(s) not kept)\n"));
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(contains(rb.err, ".cfg (not restored: the copy leaves out a secret, and no file is there to fill it from; the snapshot copy is at "));
+    try std.testing.expect(!exists(io, try h.liveOf(".cfg")));
 }
 
 test "diff: a value of several lines whose first line is `{` masks no `{` in another file" {
@@ -2413,7 +2427,7 @@ test "diff: a secret line edited beyond its shape fails closed although another 
     }
 }
 
-test "apply --overwrite and remove --purge: a secret line edited beyond its shape, its value rotated, is not kept in the snapshot" {
+test "apply --overwrite and remove --purge: a secret line edited beyond its shape, its value rotated, is not kept in the snapshot, and the run says so" {
     const io = std.testing.io;
     for ([_]bool{ false, true }) |purge| {
         var tmp = std.testing.tmpDir(.{});
@@ -2434,7 +2448,8 @@ test "apply --overwrite and remove --purge: a secret line edited beyond its shap
         try std.testing.expectEqual(@as(u8, 0), r.rc);
         try std.testing.expect(!try stateHolds(h, "OLDSECRET1"));
         try std.testing.expect(!try stateHolds(h, "NEWSECRET2"));
-        try std.testing.expect(contains(r.out, ".app.conf: its previous content held a secret and was not kept\n"));
+        try std.testing.expect(try stateHolds(h, "other=public\n" ++ redacted_line ++ "\n"));
+        try std.testing.expect(contains(r.out, ".app.conf: not kept in the snapshot, since each may hold a secret mox wrote: 1 line(s); rollback cannot restore this file\n"));
     }
 }
 
@@ -2562,7 +2577,7 @@ test "diff: a YAML list of secrets with one item gone and its value moved elsewh
     try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
 }
 
-test "diff and apply --overwrite: a secret line moved below the lines around it is still recognized, a line added is not shown, and the file is not kept" {
+test "diff and apply --overwrite: a secret line moved below the lines around it is still recognized, a line added is neither shown nor kept, and the run says so" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2585,10 +2600,11 @@ test "diff and apply --overwrite: a secret line moved below the lines around it 
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!try stateHolds(h, "MOVED"));
     try std.testing.expect(!try stateHolds(h, "added"));
-    try std.testing.expect(contains(r.out, ".cfg: its previous content held a secret and was not kept\n"));
+    try std.testing.expect(try stateHolds(h, "a\nz\n" ++ redacted_line ++ "\ntoken=" ++ redacted_secret ++ "\n"));
+    try std.testing.expect(contains(r.out, ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: 1 line(s) and the value in 1 secret slot(s); rollback cannot restore this file\n"));
 }
 
-test "apply --overwrite: a file whose provenance holds no outline is not kept" {
+test "apply --overwrite: a file whose provenance holds no outline keeps no line, and the run says so" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2618,7 +2634,7 @@ test "apply --overwrite: a file whose provenance holds no outline is not kept" {
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!try stateHolds(h, "UNOUTLINED"));
     try std.testing.expect(!try stateHolds(h, "a\ntoken"));
-    try std.testing.expect(contains(r.out, ".cfg: its previous content held a secret and was not kept\n"));
+    try std.testing.expect(contains(r.out, ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: 3 line(s); rollback cannot restore this file\n"));
 }
 
 /// Fails the test run, rather than letting it hang, when the test does not
@@ -2652,7 +2668,7 @@ const Watchdog = struct {
     }
 };
 
-test "apply: a file mox wrote a secret into, replaced by a symlink, is not kept" {
+test "apply: a file mox wrote a secret into, replaced by a symlink, is kept masked, and the run says rollback cannot fill it" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2668,11 +2684,11 @@ test "apply: a file mox wrote a secret into, replaced by a symlink, is not kept"
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!try stateHolds(h, "LINKEDSECRET"));
-    try std.testing.expect(!try stateHolds(h, "a\ntok="));
-    try std.testing.expect(contains(r.out, ".cfg: its previous content held a secret and was not kept\n"));
+    try std.testing.expect(try stateHolds(h, "a\ntok=" ++ redacted_secret ++ "\n"));
+    try std.testing.expect(contains(r.out, ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: the value in 1 secret slot(s); rollback cannot fill them, since no file is left here to fill them from\n"));
 }
 
-test "apply: a directory holding a file mox wrote a secret into, replaced by a symlink, keeps every member but that file, and rollback restores them" {
+test "apply: a directory holding a file mox wrote a secret into, replaced by a symlink, keeps that file masked, and rollback restores the rest and refuses it with nothing to fill from" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2691,9 +2707,8 @@ test "apply: a directory holding a file mox wrote a secret into, replaced by a s
     const r = try h.run(&.{ "mox", "apply", "--overwrite" });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(!try stateHolds(h, "TREESECRET"));
-    try std.testing.expect(!try stateHolds(h, "a\ntok="));
+    try std.testing.expect(try stateHolds(h, "a\ntok=" ++ redacted_secret ++ "\n"));
     try std.testing.expect(try stateHolds(h, "plain\n"));
-    try std.testing.expect(contains(r.out, "app.cfg: its previous content held a secret and was not kept\n"));
     try tmp.dir.deleteFile(io, "repo/src/.conf.d");
     try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "");
     try Io.Dir.cwd().deleteFile(io, try h.liveOf(".conf.d"));
@@ -2703,7 +2718,7 @@ test "apply: a directory holding a file mox wrote a secret into, replaced by a s
     while (it.next()) |l| last = l;
     const rb = try h.run(&.{ "mox", "rollback", last });
     try std.testing.expectEqual(@as(u8, 1), rb.rc);
-    try std.testing.expect(contains(rb.err, "app.cfg (not restored: its content held a secret and was not kept)"));
+    try std.testing.expect(contains(rb.err, "app.cfg (not restored: the copy leaves out a secret, and no file is there to fill it from;"));
     try std.testing.expectEqualStrings("plain\n", try read(io, a, try h.liveOf(".conf.d/plain.cfg")));
     try std.testing.expect(!exists(io, try h.liveOf(".conf.d/app.cfg")));
 }
@@ -3404,4 +3419,310 @@ test "readers: doctor shows nothing left for a reader when no reader kept a comm
         const d = try hh.run(&.{ "mox", "doctor" });
         try std.testing.expect(!contains(d.out, "left for a reader"));
     }
+}
+
+test "commit: a live line holding a resolved value shorter than 8 bytes is never routed, and the reason names the reference, never the value" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_PIN", .value = "4821" }});
+    try writeRepo(io, &tmp, "repo/src/.conf", "pin=<secret:env:MOX_TEST_PIN>\n");
+    try writeRepo(io, &tmp, "repo/src/notes.txt", "a=1\nz=2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("notes.txt"), .data = "a=1\ncode 4821\nz=2\n" });
+    const dry = try h.run(&.{ "mox", "commit", "--dry-run" });
+    try std.testing.expect(!contains(dry.out, "4821"));
+    try std.testing.expect(!contains(dry.err, "4821"));
+    try std.testing.expect(contains(dry.out, "may hold a secret: a line holding the value of <secret:env:MOX_TEST_PIN>"));
+    const plain = try h.run(&.{ "mox", "commit", try h.liveOf("notes.txt") });
+    try std.testing.expect(!contains(plain.out, "4821"));
+    try std.testing.expectEqualStrings("a=1\nz=2\n", try read(io, a, try h.srcOf("notes.txt")));
+}
+
+test "add: a file mox wrote a secret into and stopped managing is refused, by line number, after the next apply too, and added once its value is gone or under --cleartext-secrets" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "ADDSECRET-3e" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntok=<secret:env:MOX_TEST_TOKEN>\nz\n");
+    try writeRepo(io, &tmp, "repo/src/.two", "a\ntok=<secret:env:MOX_TEST_TOKEN>\nz\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", ".cfg" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", ".two" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\ntok=ADDSECRET-3e\nz\nadded\n" });
+
+    const r = try h.runIn(h.home, &.{ "mox", "add", ".cfg" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(contains(r.err, ".cfg: mox wrote a secret into this file, so adding it would put the value in the repo; line 2 holds a secret mox wrote; line 4 changed since mox wrote it and may hold one. Write its source with the secret's reference, or pass --cleartext-secrets to add it as it is\n"));
+    try std.testing.expect(contains(r.err, "mox add: nothing was added\n"));
+    try std.testing.expect(!contains(r.err, "ADDSECRET"));
+    try std.testing.expect(!exists(io, try h.srcOf(".cfg")));
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".two"), .data = "a\ntok=\nz\n" });
+    const emptied = try h.runIn(h.home, &.{ "mox", "add", ".two" });
+    try std.testing.expectEqual(@as(u8, 0), emptied.rc);
+    try std.testing.expectEqualStrings("a\ntok=\nz\n", try read(io, a, try h.srcOf(".two")));
+
+    const forced = try h.runIn(h.home, &.{ "mox", "add", "--cleartext-secrets", ".cfg" });
+    try std.testing.expectEqual(@as(u8, 0), forced.rc);
+    try std.testing.expect(contains(try read(io, a, try h.srcOf(".cfg")), "ADDSECRET-3e"));
+}
+
+test "add -r: one file mox wrote a secret into keeps every file of the directory from being added" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "TREEADD-7c" }});
+    try writeRepo(io, &tmp, "repo/src/.conf.d/app.cfg", "tok=<secret:env:MOX_TEST_TOKEN>\n");
+    try writeRepo(io, &tmp, "repo/src/.conf.d/plain.cfg", "plain\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", ".conf.d/app.cfg" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", ".conf.d/plain.cfg" })).rc);
+    const r = try h.runIn(h.home, &.{ "mox", "add", "-r", ".conf.d" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(contains(r.err, "app.cfg: mox wrote a secret into this file"));
+    try std.testing.expect(contains(r.err, "mox add: nothing was added\n"));
+    try std.testing.expect(!exists(io, try h.srcOf(".conf.d/plain.cfg")));
+}
+
+test "rollback: two secret lines of one shape holding different values are refused, never swapped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{ .{ .name = "MOX_TEST_A", .value = "PASS-AAAA" }, .{ .name = "MOX_TEST_B", .value = "PASS-BBBB" } });
+    try writeRepo(io, &tmp, "repo/src/.accounts", "[a]\npassword=<secret:env:MOX_TEST_A>\n[b]\npassword=<secret:env:MOX_TEST_B>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.accounts", "[b]\npassword=<secret:env:MOX_TEST_B>\n[a]\npassword=<secret:env:MOX_TEST_A>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const now = try read(io, a, try h.liveOf(".accounts"));
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(contains(rb.err, ".accounts (not restored: the copy leaves out a secret, and the file it would replace does not hold the same secret lines to fill it from;"));
+    try std.testing.expectEqualStrings(now, try read(io, a, try h.liveOf(".accounts")));
+}
+
+test "apply --overwrite: a value typed by hand into a secret slot is masked, and the run counts it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "FROMSOURCE" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntoken=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\ntoken=TYPEDBYHAND\n" });
+    const r = try h.run(&.{ "mox", "apply", "--overwrite" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!try stateHolds(h, "TYPEDBYHAND"));
+    try std.testing.expect(contains(r.out, ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: the value in 1 secret slot(s); rollback fills them from the file it replaces\n"));
+}
+
+test "rollback: a partially owned file's copy masked at its owned secret paths is refused once the file is no longer managed in part, never written with the marker" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "OWNEDROLL-1" }});
+    try writeRepo(io, &tmp, "repo/src/.config/p.toml", "# mox: own auth\n[auth]\ntoken = \"<secret:env:MOX_TEST_TOKEN>\"\n");
+    try Io.Dir.cwd().createDirPath(io, try h.liveOf(".config"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/p.toml"), .data = "[other]\nx = 1\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".config/p.toml"), .data = "[other]\nx = 1\n\n[auth]\ntoken = \"mine-77\"\n" });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const ids = try h.run(&.{ "mox", "snapshot" });
+    var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, ids.out, "\n"), '\n');
+    var last: []const u8 = "";
+    while (it.next()) |l| last = l;
+    const listed = try h.run(&.{ "mox", "snapshot", last });
+    try std.testing.expect(contains(listed.out, " (masked at its owned secret paths)\n"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", ".config/p.toml" })).rc);
+    const before = try read(io, a, try h.liveOf(".config/p.toml"));
+    const rb = try h.run(&.{ "mox", "rollback", last });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(contains(rb.err, "p.toml (not restored: its copy is masked at the owned secret paths of a file mox no longer manages in part;"));
+    try std.testing.expectEqualStrings(before, try read(io, a, try h.liveOf(".config/p.toml")));
+}
+
+test "apply: the first partial apply of a file mox managed whole with a secret keeps the whole file's masked copy" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "WHOLE-SECRET-5" }});
+    try writeRepo(io, &tmp, "repo/src/p.toml", "[rest]\nkey = \"<secret:env:MOX_TEST_TOKEN>\"\n\n[auth]\nuser = \"me\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/p.toml", "# mox: own auth\n[auth]\nuser = \"you\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    try std.testing.expect(!try stateHolds(h, "WHOLE-SECRET-5"));
+    try std.testing.expect(try stateHolds(h, "key = \"" ++ redacted_secret ++ "\""));
+}
+
+test "add --own: a file mox wrote a secret into and stopped managing is judged whole and refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "OWNADD-2b" }});
+    try writeRepo(io, &tmp, "repo/src/q.toml", "[auth]\ntoken = \"<secret:env:MOX_TEST_TOKEN>\"\n\n[ui]\ntheme = \"dark\"\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", "q.toml" })).rc);
+    const r = try h.runIn(h.home, &.{ "mox", "add", "--own", "ui", "q.toml" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(contains(r.err, "q.toml: mox wrote a secret into this file, so adding it would put the value in the repo; line 2 holds a secret mox wrote."));
+    try std.testing.expect(!contains(r.err, "OWNADD"));
+    try std.testing.expect(!exists(io, try h.srcOf("q.toml")));
+}
+
+test "apply: a copy whose secret line the new render drops says rollback cannot fill it, and rollback refuses it" {
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |edited| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "DROPPED-SECRET" }});
+        try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntoken=<secret:env:MOX_TEST_TOKEN>\nz\n");
+        try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+        if (edited) try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfg"), .data = "a\ntoken=MINE-11\nz\n" });
+        try writeRepo(io, &tmp, "repo/src/.cfg", "a\nz\n");
+        const note = ".cfg: not kept in the snapshot, since each may hold a secret mox wrote: the value in 1 secret slot(s); rollback cannot fill them, since the file left here does not hold the same secret lines\n";
+        const dry = try h.run(if (edited) &.{ "mox", "apply", "--overwrite", "--dry-run" } else &.{ "mox", "apply", "--dry-run" });
+        try std.testing.expect(contains(dry.out, ".cfg: would not keep in the snapshot"));
+        const r = try h.run(if (edited) &.{ "mox", "apply", "--overwrite" } else &.{ "mox", "apply" });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(contains(r.out, note));
+        try std.testing.expect(!try stateHolds(h, "MINE-11"));
+        const rb = try h.run(&.{ "mox", "rollback" });
+        try std.testing.expectEqual(@as(u8, 1), rb.rc);
+        try std.testing.expect(contains(rb.err, ".cfg (not restored: the copy leaves out a secret, and the file it would replace does not hold the same secret lines to fill it from;"));
+    }
+}
+
+test "add: a path mox manages is not judged for a secret, and add -r still adds the files beside it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "MANAGED-SECRET" }});
+    try writeRepo(io, &tmp, "repo/src/.cfgdir/a.conf", "tok=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf(".cfgdir/b.conf"), .data = "plain\n" });
+    const r = try h.runIn(h.home, &.{ "mox", "add", "-r", ".cfgdir" });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(!contains(r.err, "mox wrote a secret"));
+    try std.testing.expectEqualStrings("plain\n", try read(io, a, try h.srcOf(".cfgdir/b.conf")));
+}
+
+test "rollback: a typed secret marker in a file mox wrote no secret into is restored as text" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/notes.txt", "n\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const typed = "docs say " ++ redacted_secret ++ " here\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("notes.txt"), .data = typed });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 0), rb.rc);
+    try std.testing.expectEqualStrings(typed, try read(io, a, try h.liveOf("notes.txt")));
+}
+
+test "rollback: a masked copy whose live path is now a symlink is refused, naming the link" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "LINKFILL-9" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "a\ntok=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.cfg", "/nonexistent-target\n");
+    try writeRepo(io, &tmp, "repo/.mox/attributes.toml", "[\".cfg\"]\nsymlink = true\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply", "--overwrite" })).rc);
+    const rb = try h.run(&.{ "mox", "rollback" });
+    try std.testing.expectEqual(@as(u8, 1), rb.rc);
+    try std.testing.expect(contains(rb.err, ".cfg (not restored: the copy leaves out a secret, and a symlink is there to fill it from;"));
+}
+
+test "add: a file mox wrote a secret into whose residue holds no outline is refused whole, under --seed-once and --disown too" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "NOOUTLINE-4" }});
+    try writeRepo(io, &tmp, "repo/src/r.toml", "[a]\ntoken = \"<secret:env:MOX_TEST_TOKEN>\"\n\n[b]\nx = 1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    raced_state = h.state;
+    try editCurrent(h, struct {
+        fn unrecorded(arena_: std.mem.Allocator, g: *mox.state.generation.Generation, p: []const u8) !void {
+            const segments = [_]mox.provenance.map.Segment{
+                .{ .out_start = 0, .out_len = 1, .origin = .{ .base = .{ .line = 1 } } },
+                .{ .out_start = 1, .out_len = 1, .origin = .secret },
+                .{ .out_start = 2, .out_len = 3, .origin = .{ .base = .{ .line = 3 } } },
+            };
+            const bytes = try mox.provenance.map.serialize(arena_, p, &segments, null);
+            const store = try mox.state.Store.init(arena_, raced_state);
+            g.paths.getPtr(p).?.file.?.provenance_blob = try mox.state.blob.put(arena_, std.testing.io, store.blobs, bytes);
+        }
+    }.unrecorded, try h.liveOf("r.toml"));
+    try std.testing.expectEqual(@as(u8, 0), (try h.runIn(h.home, &.{ "mox", "remove", "r.toml" })).rc);
+    for ([_][]const []const u8{
+        &.{ "mox", "add", "r.toml" },
+        &.{ "mox", "add", "--seed-once", "r.toml" },
+        &.{ "mox", "add", "--disown", "b", "r.toml" },
+    }) |argv| {
+        const r = try h.runIn(h.home, argv);
+        try std.testing.expectEqual(@as(u8, 1), r.rc);
+        try std.testing.expect(contains(r.err, "r.toml: mox wrote a secret into this file, so adding it would put the value in the repo; mox kept no outline to tell which lines hold it."));
+        try std.testing.expect(!contains(r.err, "NOOUTLINE"));
+    }
+    try std.testing.expect(!exists(io, try h.srcOf("r.toml")));
+}
+
+test "add: a file mox wrote a secret into whose source was deleted, before an apply forgets it, is still refused" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setupEnv(a, io, &tmp, &.{.{ .name = "MOX_TEST_TOKEN", .value = "DELETED-SRC-77" }});
+    try writeRepo(io, &tmp, "repo/src/.cfg", "tok=<secret:env:MOX_TEST_TOKEN>\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try tmp.dir.deleteFile(io, "repo/src/.cfg");
+    const r = try h.runIn(h.home, &.{ "mox", "add", ".cfg" });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(contains(r.err, ".cfg: mox wrote a secret into this file, so adding it would put the value in the repo; line 1 holds a secret mox wrote."));
+    try std.testing.expect(!exists(io, try h.srcOf(".cfg")));
 }

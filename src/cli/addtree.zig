@@ -36,6 +36,7 @@ pub fn runRecursive(
     ctx: *app.Ctx,
     dir_abs: []const u8,
     seed_once: bool,
+    secrets_of: ?*mox.state.Draft,
 ) anyerror!u8 {
     const context = ctx.context.?;
 
@@ -80,6 +81,15 @@ pub fn runRecursive(
         return 1;
     }
 
+    if (secrets_of) |draft| {
+        var refused = false;
+        try refuseSecrets(ctx, draft, dir_abs, &ruleset, &refused);
+        if (refused) {
+            try ctx.err.writeAll("mox add: nothing was added\n");
+            return 1;
+        }
+    }
+
     var counts: Counts = .{};
     try walk(ctx, dir_abs, &ruleset, &counts, seed_once);
 
@@ -90,6 +100,24 @@ pub fn runRecursive(
 
     try ctx.out.print("Added {d} file(s); {d} skipped, {d} failed\n", .{ counts.added, counts.skipped, counts.failed });
     return if (counts.failed > 0) 1 else 0;
+}
+
+/// Every file `walk` would add that would carry a secret mox wrote into the
+/// repo, each refused by `add.refusedForSecret`, before any is added.
+fn refuseSecrets(ctx: *app.Ctx, st: *mox.state.Draft, dir_abs: []const u8, ruleset: *const mox.source.ignore.match.RuleSet, refused: *bool) !void {
+    const home = ctx.context.?.paths.home;
+    const entries = try mox.source.dirent.sortedPath(ctx.alloc, ctx.io, dir_abs, .{ .iterate = true, .follow_symlinks = false });
+    for (entries) |entry| {
+        const child = try std.fs.path.join(ctx.alloc, &.{ dir_abs, entry.name });
+        const rel = try mox.source.path.liveKeyRelToHome(ctx.alloc, home, child);
+        switch (entry.kind) {
+            .directory => if (!ruleset.isIgnored(rel, true)) try refuseSecrets(ctx, st, child, ruleset, refused),
+            .file => if (!mox.source.junk.isJunk(entry.name) and !ruleset.isIgnored(rel, false)) {
+                if (try add.refusedForSecret(ctx, st, child)) refused.* = true;
+            },
+            else => {},
+        }
+    }
 }
 
 fn walk(

@@ -131,12 +131,11 @@ pub const Draft = struct {
     changed: bool = false,
     committed: bool = false,
     /// The secret values this run resolved: a provenance with a secret
-    /// segment finds its slots by them, and prior content holding one is
-    /// not kept.
+    /// segment finds its slots by them.
     secrets: ?*const secret_cache.Cache = null,
-    /// The live paths whose prior content this run did not keep because it
-    /// may have held a secret, in the order it met them.
-    not_kept: std.ArrayList([]const u8) = .empty,
+    /// The live paths whose copy this run kept without some of what they
+    /// held, which may hold a secret mox wrote, in the order it met them.
+    dropped: std.ArrayList(Dropped) = .empty,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
     /// What a step that waits for the readers says first.
@@ -254,40 +253,39 @@ pub const Draft = struct {
         return prov_map.deserialize(d.arena, bytes) catch null;
     }
 
-    /// Whether `content`, what is at `live` before this run replaces or
-    /// removes it, may hold a secret: the provenance mox last wrote `live`
-    /// with names a secret line, its record was written for a secret, or
-    /// `content` holds a written form of at least `min_fragment` bytes of a
-    /// value this run resolved.
-    pub fn priorHoldsSecret(d: *Draft, live: []const u8, content: []const u8) !bool {
-        if (try d.wroteSecret(live)) return true;
-        return prov_shapes.holdsAny(d.arena, content, if (d.secrets) |c| try c.values(d.arena) else &.{});
+    /// Whether the provenance kept for `live`, its record's or residue,
+    /// names a secret line.
+    pub fn provenanceNamesSecret(d: *const Draft, live: []const u8) !bool {
+        const m = (try d.provenance(live)) orelse return false;
+        if (prov_map.hasSecret(m.segments)) return true;
+        if (m.secretOutline()) |o| for (o) |e| if (e == .shape) return true;
+        return false;
     }
 
     /// Whether mox last wrote `live` with a secret: the provenance it kept
     /// names a secret line (a `.secret` segment, an outline with a shape),
     /// or the record was written for a secret.
     pub fn wroteSecret(d: *const Draft, live: []const u8) !bool {
-        if (try d.provenance(live)) |m| {
-            if (prov_map.hasSecret(m.segments)) return true;
-            if (m.secretOutline()) |o| for (o) |e| if (e == .shape) return true;
-        }
+        if (try d.provenanceNamesSecret(live)) return true;
         if (d.fileRecord(live)) |f| if (f.cache_blob == null) return true;
         if (d.ownedRec(live)) |o| if (o.secret) return true;
         return false;
     }
 
-    /// Every written form of every value this run resolved.
-    pub fn resolvedForms(d: *const Draft) !prov_shapes.Forms {
-        const all = if (d.secrets) |c| try c.values(d.arena) else &.{};
-        return prov_shapes.writtenForms(d.arena, all);
-    }
-
-    /// `content` with every written form of every value this run resolved
-    /// masked: how a partially owned file's prior content is kept, beside
-    /// its owned secret paths.
-    pub fn maskResolved(d: *const Draft, content: []const u8) ![]const u8 {
-        return prov_shapes.maskForms(d.arena, content, try d.resolvedForms());
+    /// How a copy of `content`, what `live` holds before this run replaces
+    /// or removes it, is kept: as it is when mox wrote no secret into it,
+    /// else masked to the text mox wrote that holds no secret
+    /// (`prov_shapes.maskedCopy`); with no outline to tell its lines apart,
+    /// or no line left, not at all.
+    pub fn copyOf(d: *Draft, live: []const u8, content: []const u8) !Copy {
+        if (!try d.wroteSecret(live)) return .{ .plain = content };
+        const lines = (try @import("../diff/lines.zig").splitLines(d.arena, content)).len;
+        if (lines == 0) return .{ .plain = content };
+        const outline = if (try d.provenance(live)) |m| m.outline else null;
+        const masked = try prov_shapes.maskedCopy(d.arena, outline orelse return .{ .none = @intCast(lines) }, content);
+        if (masked.lines_not_kept == lines) return .{ .none = @intCast(lines) };
+        const unedited = if (d.read(live)) |h| std.mem.eql(u8, &h, &applied.contentHashHex(content)) else false;
+        return .{ .masked = .{ .masked = masked, .edited = !unedited } };
     }
 
     /// The generator at `gen_live`'s produced set.
@@ -551,6 +549,15 @@ pub const Draft = struct {
         if (e.kind == kind) try d.forget(live);
     }
 
+    /// Stop managing `live`, whose live file stays: every record goes, and
+    /// its provenance too unless it names a secret line, which stays as
+    /// residue, since the file may still hold what mox wrote.
+    pub fn release(d: *Draft, live: []const u8) !void {
+        const keep = try d.provenanceNamesSecret(live);
+        try d.forget(live);
+        if (!keep) try d.forgetProvenance(live);
+    }
+
     /// Forget the provenance of `live`, wherever it is kept.
     pub fn forgetProvenance(d: *Draft, live: []const u8) !void {
         try d.clearResidue(live);
@@ -658,25 +665,70 @@ pub const Draft = struct {
     }
 
     /// Keep `content`, what the whole file at `live` holds now, before the
-    /// run replaces or removes it; when it may hold a secret
-    /// (`priorHoldsSecret`), keep none of it (`saveNotKept`).
-    pub fn keepPrior(d: *Draft, home: []const u8, live: []const u8, content: []const u8) !void {
-        if (try d.priorHoldsSecret(live, content)) return d.saveNotKept(home, live);
-        return d.save(home, live, content);
+    /// run replaces or removes it with `next`, as `copyOf` keeps it.
+    pub fn keepPrior(d: *Draft, home: []const u8, live: []const u8, content: []const u8, next: Next) !void {
+        return d.keepCopy(home, live, try d.copyOf(live, content), next);
     }
 
-    /// Note that the file at `live` is displaced with none of its content
-    /// kept, since it may hold a secret.
-    pub fn saveNotKept(d: *Draft, home: []const u8, live: []const u8) !void {
+    /// Keep `copy` of the file at `live`, noting what it leaves out.
+    pub fn keepCopy(d: *Draft, home: []const u8, live: []const u8, copy: Copy, next: Next) !void {
         const key = try d.displacedKey(home, live);
         const st = try Io.Dir.cwd().statFile(d.io, live, .{});
-        try d.setDisplaced(key, .{ .type = .file, .not_kept = .secret, .mode = write_mod.modeOf(st.permissions) });
-        try d.noteNotKept(live);
+        try d.setDisplaced(key, try d.copyEntry(copy, write_mod.modeOf(st.permissions), null));
+        try d.noteDropped(live, copy, next);
     }
 
-    fn noteNotKept(d: *Draft, live: []const u8) !void {
-        for (d.not_kept.items) |l| if (std.mem.eql(u8, l, live)) return;
-        try d.not_kept.append(d.arena, try d.arena.dupe(u8, live));
+    /// Whether rollback can fill `m`'s slots from what `next` leaves at the
+    /// path.
+    fn fillOf(d: *Draft, live: []const u8, m: prov_shapes.Masked, next: Next) !Dropped.Fill {
+        return switch (next) {
+            .gone => .gone,
+            .unrecorded => .unrecorded,
+            .unknown => .unknown,
+            .file => |f| blk: {
+                // The outline the record will keep, size cap included.
+                const bytes = (try d.serializeProvenance(live, f.bytes, f.segments)) orelse break :blk .no;
+                const m2 = prov_map.deserialize(d.arena, bytes) catch break :blk .no;
+                const outline = m2.outline orelse break :blk .no;
+                break :blk if (try prov_shapes.fillCopy(d.arena, m.bytes, m.slots, outline, f.bytes) != null) .yes else .no;
+            },
+        };
+    }
+
+    fn copyEntry(d: *Draft, copy: Copy, mode: u32, root: ?[]const u8) !generation.Displaced {
+        return switch (copy) {
+            .plain => |bytes| .{ .type = .file, .blob = try blob.put(d.arena, d.io, d.store.blobs, bytes), .mode = mode, .root = root },
+            .masked => |k| .{ .type = .file, .blob = try blob.put(d.arena, d.io, d.store.blobs, k.masked.bytes), .slots = k.masked.slots, .lines_not_kept = @intCast(k.masked.lines_not_kept), .mode = mode, .root = root },
+            .none => .{ .type = .file, .not_kept = .secret, .mode = mode, .root = root },
+        };
+    }
+
+    /// What `copy` of `live` leaves out: its lines not kept, and its masked
+    /// slots for a file the user edited, whose slots may hold a value the
+    /// user typed, or one rollback may not fill from what `next` leaves; null
+    /// when nothing.
+    pub fn droppedOf(d: *Draft, live: []const u8, copy: Copy, next: Next) !?Dropped {
+        const x: Dropped = switch (copy) {
+            .plain => return null,
+            .masked => |k| blk: {
+                const fill: Dropped.Fill = if (k.masked.slots.len == 0) .yes else try d.fillOf(live, k.masked, next);
+                break :blk .{ .live = live, .lines = k.masked.lines_not_kept, .slots = if (k.edited or fill != .yes) k.masked.slots.len else 0, .fill = fill };
+            },
+            .none => |n| .{ .live = live, .lines = n, .slots = 0, .fill = .no },
+        };
+        return if (x.lines == 0 and x.slots == 0) null else x;
+    }
+
+    fn noteDropped(d: *Draft, live: []const u8, copy: Copy, next: Next) !void {
+        const x = (try d.droppedOf(live, copy, next)) orelse return;
+        for (d.dropped.items) |*y| if (std.mem.eql(u8, y.live, live)) {
+            y.* = x;
+            y.live = live;
+            return;
+        };
+        var kept = x;
+        kept.live = try d.arena.dupe(u8, live);
+        try d.dropped.append(d.arena, kept);
     }
 
     /// Keep `content`, what `live` holds now, before the run replaces it.
@@ -685,6 +737,15 @@ pub const Draft = struct {
         const st = try Io.Dir.cwd().statFile(d.io, live, .{});
         const h = try blob.put(d.arena, d.io, d.store.blobs, content);
         try d.setDisplaced(key, .{ .type = .file, .blob = h, .mode = write_mod.modeOf(st.permissions) });
+    }
+
+    /// `save` for `content`, a partially owned file's copy masked at its
+    /// owned secret paths when `masked`.
+    pub fn saveOwned(d: *Draft, home: []const u8, live: []const u8, content: []const u8, masked: bool) !void {
+        const key = try d.displacedKey(home, live);
+        const st = try Io.Dir.cwd().statFile(d.io, live, .{});
+        const h = try blob.put(d.arena, d.io, d.store.blobs, content);
+        try d.setDisplaced(key, .{ .type = .file, .blob = h, .masked = if (masked) .owned else null, .mode = write_mod.modeOf(st.permissions) });
     }
 
     /// `save` for `content` with the mode a re-patch keeps.
@@ -710,8 +771,7 @@ pub const Draft = struct {
     }
 
     /// Keep a captured directory tree: its root `dir_live`, and every member
-    /// by its full key, a file that may hold a secret with none of its
-    /// content, as `keepPrior` keeps it.
+    /// by its full key, each file as `keepPrior` keeps it.
     pub fn saveTree(d: *Draft, home: []const u8, dir_live: []const u8, captured: Captured) !void {
         const root = try d.displacedKey(home, dir_live);
         for (captured.dirs) |c| {
@@ -720,13 +780,9 @@ pub const Draft = struct {
         }
         for (captured.files) |c| {
             const key = try d.displacedKey(home, c.live);
-            if (try d.priorHoldsSecret(c.live, c.content)) {
-                try d.setDisplaced(key, .{ .type = .file, .not_kept = .secret, .mode = c.mode, .root = root });
-                try d.noteNotKept(c.live);
-                continue;
-            }
-            const h = try blob.put(d.arena, d.io, d.store.blobs, c.content);
-            try d.setDisplaced(key, .{ .type = .file, .blob = h, .mode = c.mode, .root = root });
+            const copy = try d.copyOf(c.live, c.content);
+            try d.setDisplaced(key, try d.copyEntry(copy, c.mode, root));
+            try d.noteDropped(c.live, copy, .gone);
         }
         for (captured.symlinks) |c| {
             const key = try d.displacedKey(home, c.live);
@@ -786,7 +842,7 @@ pub const Draft = struct {
                     const v = op.value orelse continue;
                     const x = generation.parseFlatDisplaced(d.arena, v) catch continue;
                     try entries.append(d.arena, .{ .key = op.key, .type = x.type, .where = switch (x.type) {
-                        .file => if (x.not_kept != null) "not kept: its content held a secret" else try blob.pathOf(d.arena, d.store.blobs, x.blob orelse continue),
+                        .file => if (x.not_kept != null) "not kept: every line may hold a secret mox wrote" else try blob.pathOf(d.arena, d.store.blobs, x.blob orelse continue),
                         .link => x.target orelse "",
                         .dir => "",
                     } });
@@ -837,6 +893,47 @@ pub const Draft = struct {
     pub fn hasDisplaced(d: *const Draft) bool {
         return d.gen.displaced.count() > 0;
     }
+};
+
+/// How a copy of a file's prior content is kept: byte for byte, masked, or
+/// not at all, `none` naming its line count.
+pub const Copy = union(enum) {
+    plain: []const u8,
+    /// `edited`: the content is not what mox last wrote.
+    masked: struct { masked: prov_shapes.Masked, edited: bool },
+    none: u32,
+};
+
+/// What a copy of `live` left out: `lines` lines, and the values in
+/// `slots` secret slots, and whether rollback can fill its slots.
+pub const Dropped = struct {
+    live: []const u8,
+    lines: usize,
+    slots: usize,
+    fill: Fill = .yes,
+
+    pub const Fill = enum {
+        /// From what the run leaves at the path.
+        yes,
+        /// Not from what the run leaves there.
+        no,
+        /// No file is left there.
+        gone,
+        /// mox keeps no outline of what is left there.
+        unrecorded,
+        /// Only from a file that holds the same secret lines.
+        unknown,
+    };
+};
+
+/// What a run leaves at a path whose prior content it keeps: nothing, a
+/// file it writes, one it keeps no outline of, or content it does not know
+/// the secrets of.
+pub const Next = union(enum) {
+    gone,
+    file: struct { bytes: []const u8, segments: []const prov_map.Segment },
+    unrecorded,
+    unknown,
 };
 
 pub const MissingCanonical = struct { key: []const u8, missing: applied.CanonicalMissing };

@@ -2136,7 +2136,7 @@ fn sweepStale(ctx: *app.Ctx, st: *State, in: StaleInput, units: *std.ArrayList(m
         if (in.only) |only| if (!only.contains(c.live_path)) continue;
         const shown = try display.alloc(ctx.alloc, c.live_path, home);
         if (in.released.contains(try mox.apply.stale.foldCase(ctx.alloc, c.live_path))) {
-            if (!in.dry_run) try forgetAll(st, c.live_path);
+            if (!in.dry_run) try st.release(c.live_path);
             continue;
         }
         switch (try mox.apply.removable.judge(ctx.alloc, ctx.io, jc, c.live_path, mox.apply.removable.wroteOf(c))) {
@@ -2148,7 +2148,7 @@ fn sweepStale(ctx: *app.Ctx, st: *State, in: StaleInput, units: *std.ArrayList(m
                 try ctx.out.print("  {s}: now a directory; its record is forgotten\n", .{shown});
             },
             .linked_parent => {
-                if (!in.dry_run) try forgetAll(st, c.live_path);
+                if (!in.dry_run) try st.release(c.live_path);
                 try ctx.out.print("  {s}: {s}\n", .{ shown, mox.apply.parent_link.reason });
             },
             .refused => |why| {
@@ -2159,7 +2159,7 @@ fn sweepStale(ctx: *app.Ctx, st: *State, in: StaleInput, units: *std.ArrayList(m
                 if (in.dry_run) {
                     try ctx.out.print("  would leave {s} in place (no longer managed)\n", .{shown});
                 } else {
-                    try forgetAll(st, c.live_path);
+                    try st.release(c.live_path);
                     try ctx.out.print("  left {s} in place (no longer managed)\n", .{shown});
                 }
             },
@@ -2306,13 +2306,18 @@ fn applyRegularFile(ctx: *app.Ctx, st: *State, in: RegularInput, counts: *Counts
     if (in.dry_run) {
         counts.ok += 1;
         try ctx.out.print("  would write {s}\n", .{shown});
+        if (disposition != .fresh_write) {
+            const next: mox.state.Next = .{ .file = .{ .bytes = in.bytes, .segments = in.prov_items } };
+            if (try st.droppedOf(in.live_path, try st.copyOf(in.live_path, live.?), next)) |x|
+                try state_cli.printDropped(ctx.out, display.of(in.live_path, context.paths.home), x, true);
+        }
         return;
     }
-    // About to replace existing content: snapshot it first (none of it when
-    // it may hold a secret), and refuse the overwrite if the snapshot cannot
-    // be taken.
+    // About to replace existing content: snapshot it first, masked when mox
+    // wrote a secret into it, and refuse the overwrite if the snapshot
+    // cannot be taken.
     if (disposition != .fresh_write) {
-        st.keepPrior(context.paths.home, in.live_path, live.?) catch |e| {
+        st.keepPrior(context.paths.home, in.live_path, live.?, .{ .file = .{ .bytes = in.bytes, .segments = in.prov_items } }) catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             try ctx.err.flush();
             counts.fail += 1;
@@ -2656,6 +2661,10 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
             try ctx.out.print("  would create {s}\n", .{shown});
         } else {
             try ctx.out.print("  would write {s}\n", .{shown});
+            if (try st.provenanceNamesSecret(live_path)) {
+                if (try st.droppedOf(live_path, try st.copyOf(live_path, live_text), .unrecorded)) |x|
+                    try state_cli.printDropped(ctx.out, display.of(live_path, context.paths.home), x, true);
+            }
         }
         return;
     }
@@ -2698,9 +2707,9 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
 
     if (live != null) {
         // Snapshot the whole pre-write live file, with values under
-        // secret-bearing owned paths (recorded or current) and every value
-        // this run resolved masked, so the snapshot never stores a resolved
-        // secret.
+        // secret-bearing owned paths (recorded or current) masked, so the
+        // snapshot never stores a secret mox wrote; a file mox last wrote
+        // whole with a secret is kept as any such whole file is.
         const recorded_secret: []const mox.source.tree.OwnPath = if (record) |r| try owned_mod.parseRawPaths(ctx.alloc, r.secret_paths) else &.{};
         var current_secret: std.ArrayList(mox.source.tree.OwnPath) = .empty;
         for (secret_scope, secret_flags) |p, flagged| {
@@ -2716,7 +2725,11 @@ fn applyPartialFile(ctx: *app.Ctx, st: *State, in: PartialInput, counts: *Counts
                 return;
             },
         };
-        st.save(context.paths.home, live_path, try st.maskResolved(snap_content)) catch |e| {
+        const kept: anyerror!void = if (try st.provenanceNamesSecret(live_path))
+            st.keepPrior(context.paths.home, live_path, live_text, .unrecorded)
+        else
+            st.saveOwned(context.paths.home, live_path, snap_content, !std.mem.eql(u8, snap_content, live_text));
+        kept catch |e| {
             try ctx.err.print("mox apply: {s}: snapshot failed, not overwriting: {s}\n", .{ shown, @errorName(e) });
             try ctx.err.flush();
             counts.fail += 1;

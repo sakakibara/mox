@@ -215,6 +215,21 @@ gate (`when`) are written into `.mox/attributes.toml`, and its source is
 the owned content as valid JSON. A target's dialect is resolved from its
 path and attributes before any source exists.
 
+A file mox wrote a secret into and stopped managing (with `remove`, a
+tombstone, or a source that left the tree while the file stayed) is
+refused, in every mode, when it may still hold that secret: `mox add:
+<path>: mox wrote a secret into this file, so adding it would put the value
+in the repo; line 2 holds a secret mox wrote; line 9 changed since mox
+wrote it and may hold one. Write its source with the secret's reference,
+or pass --cleartext-secrets to add it as it is`, by line number only, and
+then `mox add: nothing was added`; under `-r` every file is judged first,
+and nothing is added when one is refused. A line whose secret value you
+emptied is clean. A file mox kept no outline for is refused whole (`mox
+kept no outline to tell which lines hold it`), and one it cannot read is
+refused too. `--cleartext-secrets` adds the file as it is. This guards only
+the path mox wrote: a copy of the file under another name is added as it
+is.
+
 A plain `add` of a target whose source declares ownership is refused.
 Adding a path a tombstone released removes the tombstone. A command that
 would rewrite an `.mox/attributes.toml` holding a comment is refused
@@ -230,6 +245,7 @@ before it changes anything.
 | `--own-absent <key-path>` | declare a key-path mox enforces as absent (repeatable; single file only) |
 | `--disown <key-path>` | manage the whole file except this key-path (repeatable; single file only) |
 | `--gate <axis-expr>` | gate the created partial source on this axis expression (single file only) |
+| `--cleartext-secrets` | add a file mox wrote a secret into as it is, value and all |
 <!-- /generated -->
 
 ## mv
@@ -261,7 +277,9 @@ a tombstone, `released = true`, in `.mox/attributes.toml` in place of its
 entry. Every machine's apply then forgets the path's records and leaves its
 file alone; a released generator's leaves stay too, forgotten. mox forgets
 the path's applied state here as well, so a later re-add starts from first
-contact; `mox add` or `mox mv` onto the path removes the tombstone, and
+contact, except that a record of a secret mox wrote into the file stays,
+so that `mox add` can refuse to put the value into the repo;
+`mox add` or `mox mv` onto the path removes the tombstone, and
 tombstones are never pruned otherwise.
 
 `--purge` deletes the live file here, snapshotting it first (a
@@ -475,12 +493,15 @@ live line, edited or added, may hold a value no resolved secret finds, so
 its hunk is reported `manual: <path>:<line> may hold a secret: a line mox
 did not write, in a file it wrote a secret into`, by `--dry-run`, `--yes`
 and the prompt alike, and the prompt shows such a line as
-`<mox:redacted-line>`. In any file, a live line holding a value the run
-resolved, in any form mox writes it in that is at least 8 bytes long, is
-never routed: its hunk is reported `manual: <path>:<line> may hold a
-secret: a line holding a value this run resolved`, and the line is shown as
-`<mox:redacted-line>`; a structured key whose live value holds one is
-reported the same way. Before routing anything, commit renders every
+`<mox:redacted-line>`. In any file, a live line in which commit would mask
+a value the run resolved, at any length, is never routed: what commit
+masks it never writes into a source. Its hunk is reported `manual:
+<path>:<line> may hold a secret: a line holding the value of
+<secret:URI>`, naming every reference whose value the line holds and never
+the value, and the line is shown as `<mox:redacted-line>`; a structured key
+whose path or live value holds one is reported the same way. A short value
+that is common text keeps every line holding it from being routed.
+Before routing anything, commit renders every
 managed file once for the secrets it resolves, so a value pasted into a
 file whose own source names none is found. Every line a hunk prints has
 every value the run resolved masked as `<mox:redacted-secret>`. A source reached through two
@@ -838,37 +859,24 @@ no outline is masked by this render's outline when the render reproduces
 what the last apply wrote, and is otherwise not shown: stderr says so, and
 that `mox apply` records what diff needs, or, for a file with edits, `mox
 apply --overwrite <path>`, which writes it again and keeps the edits in a
-snapshot. A snapshot keeps none of a whole file's prior content when it may
-hold a secret: its provenance names a secret line, its record was written
-for one, or it holds a value the run resolved, in any form mox writes it in
-that is at least 8 bytes long (a whole form, or a line of a value of several
-lines). A shorter value, as common as a word, does not stop another file's
-copy from being kept, so a short secret pasted into a file mox wrote no
-secret into is kept in its copy. Whatever displaces the file (an overwrite,
-a removal, `mox remove --purge`, a rollback's own history, or a directory
-apply removes or replaces with a link, each file of which is judged on its
-own), the command prints `<path>: its previous content held a secret and was
-not kept`, `mox snapshot <id>` lists it as not kept, and rollback reports it
-as not restored and restores the rest: the edits in such a file are not
-recoverable from mox. A partially owned file's snapshot keeps the file with
-the values under its secret-bearing owned keys masked, and every value the
-run resolved masked wherever it occurs. A file whose source left the tree,
-which apply would remove, shows its live content on the removed side, and
-such a symlink the line `symlink -> <target>`, as does an unedited file of a
-generator that left the tree; a file that does not parse in its format is an
-`ERROR` line on stderr, as apply reports it. Read-only: it takes no writer
-lock, only the readers lock. A difference is not an error, so a run that
-completes exits 0 whether or not anything differs. An `attributes.toml`, the
-repo's or the private layer's, that is not valid TOML or cannot be read
-stops the run with exit 2, as it does in every command that reads attributes
-(add, apply, commit, doctor, edit, export, facts, mv, remove and status);
-rollback warns instead. A refusal exits 1: a path that is not managed, a
-head ownership declaration that does not parse, and an attributes entry that
-breaks the schema, with or without a source. A file's own `ERROR` that does
-not come from an attributes file -- a head directive on an unstructured
-target, one spelled with another file's comment marker, a mox directive in
-strict JSON, or a layer or output that does not parse -- is reported and the
-run still exits 0.
+snapshot; see [snapshot / rollback](#snapshot--rollback) for what a snapshot
+of such a file keeps. A file whose source left the tree, which apply would
+remove, shows its live content on the removed side, and such a symlink the
+line `symlink -> <target>`, as does an unedited file of a generator that
+left the tree; a file that does not parse in its format is an `ERROR` line
+on stderr, as apply reports it. Read-only: it takes no writer lock, only the
+readers lock. A difference is not an error, so a run that completes exits 0
+whether or not anything differs. An `attributes.toml`, the repo's or the
+private layer's, that is not valid TOML or cannot be read stops the run with
+exit 2, as it does in every command that reads attributes (add, apply,
+commit, doctor, edit, export, facts, mv, remove and status); rollback warns
+instead. A refusal exits 1: a path that is not managed, a head ownership
+declaration that does not parse, and an attributes entry that breaks the
+schema, with or without a source. A file's own `ERROR` that does not come
+from an attributes file -- a head directive on an unstructured target, one
+spelled with another file's comment marker, a mox directive in strict JSON,
+or a layer or output that does not parse -- is reported and the run still
+exits 0.
 
 <!-- generated: flags diff -->
 | Flag | Description |
@@ -1228,8 +1236,45 @@ overwrite, a removal or a rollback replaced -- oldest first, one id per
 line; a rollback's own is annotated `(what rolling back <id> replaced)`.
 `snapshot <id>` lists that run's entries, one per line: the home-relative
 key and `file <path of its kept copy>`, `link -> <target>`, or `dir` with
-the directory's entries indented beneath it. A refused restore can be
-finished by hand from it.
+the directory's entries indented beneath it. A masked copy (below) adds
+`(masked: S secret slot(s), N line(s) not kept)`, one masked at a partially
+owned file's secret keys `(masked at its owned secret paths)`, and an entry
+of which no line was kept reads `file not kept: every line may hold a secret
+mox wrote`. A refused restore can be finished by hand from it.
+
+A snapshot this version takes holds no secret slot mox wrote through a
+secret reference, and mox tells which files to mask from what it recorded,
+never by searching their text; a value written through any other capture
+(`<env.X>`) is no secret there. A file mox wrote no secret into is kept byte
+for byte, a value you pasted into it included. A copy of a file mox wrote a
+secret into keeps only text mox wrote: each line it wrote with no secret as
+it is, each secret line it can still find (moved lines included) with each
+non-empty secret slot replaced by `<mox:redacted-secret>`, and every other
+line, one you added or edited, as `<mox:redacted-line>`, since it may hold a
+value mox wrote that it cannot find (`#token=OLD` beside a new
+`token=mine`). A file whose provenance is missing or records no outline
+keeps no line, and neither does an owned-secret file inside a directory a
+removal takes. When a copy leaves something out, the command names the file
+once the run commits: `<path>: not kept in the snapshot, since each may hold
+a secret mox wrote: N line(s) and the value in M secret slot(s); rollback
+cannot restore this file`, each count only when above zero. The slots are
+counted when the file was edited (a value typed into a slot by hand) or when
+rollback could not fill them from what the run leaves at the path, and with
+no line left out the last clause says which: `rollback fills them from the
+file it replaces`, `rollback cannot fill them, since the file left here does
+not hold the same secret lines`, `rollback cannot fill them, since no file
+is left here to fill them from`, `rollback cannot fill them, since mox keeps
+no outline of the file left here` (the first partial apply of a file mox
+managed whole), or, for what a rollback replaces, `rollback fills them only
+from a file mox last wrote that holds the same secret lines`. `apply
+--dry-run` prints the same line, with `would not keep`, for a file apply
+overwrites; for a removal or a link replacement the line follows the run. A
+copy loses content only in a command that discards it on purpose: `apply
+--overwrite`, `remove --purge`, rollback, and a removal or link replacement
+of a file mox wrote. A partially owned file's snapshot keeps the file with
+the values under its secret-bearing owned keys masked; while the path still
+holds a provenance from being managed whole with a secret, the snapshot is
+that whole file's masked copy instead.
 
 `rollback [<id>]` restores live files from one, defaulting to the newest
 and announcing which it took. A partially owned file is never whole-file
@@ -1257,13 +1302,31 @@ chain of snapshots it undoes (it may undo another such snapshot) ends at one
 that is pruned; a chain with a missing link keeps it. An entry that cannot
 be restored is that entry's `ERROR`, naming where its content is, and the
 rest are still restored; one whose kept copy is missing or damaged is
-refused, naming it; a file whose content was not kept because it held a
-secret is refused ("its content held a secret and was not kept"); one whose
-snapshot holds a redacted secret line is never written ("holds a secret mox
-does not store; run mox apply to resolve it again"); a link already as the
-snapshot has it is left alone and not counted. An `attributes.toml` that is
-not valid TOML or cannot be read is a warning here, not exit 2: whole files
-are still restored, and partial targets cannot be re-patched.
+refused, naming it. A masked copy's secret slots are filled from the regular
+file at its live path, as it holds them now: each run of copy lines holding
+a slot takes the bytes of every live run of as many lines whose secret lines
+have the same shapes, which must all agree, so two secret lines of one shape
+holding different values are refused, never swapped; a run is matched only
+to a live run of exactly as many secret lines, so a value whose line count
+changed, or secret lines the source has since separated, are refused; the
+live file must be the one mox last wrote there; a filled file prints
+`<path>: secret slots filled from the file it replaced`. A copy that cannot
+be filled is refused, `(not restored: the copy leaves out a secret, and
+<why>; the snapshot copy is at <path>, fill its <mox:redacted-secret>
+markers by hand)`, where <why> is `no file is there to fill it from`, `a
+symlink is there to fill it from`, `the file it would replace is not the one
+mox last wrote, so it cannot fill it from`, or `the file it would replace
+does not hold the same secret lines to fill it from`; one with lines not
+kept, `(not restored: the copy leaves out N line(s) that may have held a
+secret; ..., restore it by hand)`; one of which no line was kept, `(not
+restored: no line of it was kept, since each may have held a secret mox
+wrote)`; and one masked at the owned secret paths of a file no longer
+re-patched, `(not restored: its copy is masked at the owned secret paths of
+a file mox no longer manages in part; ...)`. A marker in a file's own text
+is restored as text. A link already as the snapshot has it is left alone and
+not counted. An `attributes.toml` that is not valid TOML or cannot be read
+is a warning here, not exit 2: whole files are still restored, and partial
+targets cannot be re-patched.
 
 `MOX_SNAPSHOT_RETENTION` is how many to keep (default 10, at least 1); an
 apply that displaced or removed something prunes the oldest of the rest,
