@@ -136,6 +136,9 @@ pub const Draft = struct {
     /// The live paths whose copy this run kept without some of what they
     /// held, which may hold a secret mox wrote, in the order it met them.
     dropped: std.ArrayList(Dropped) = .empty,
+    /// The key the last displaced save stored, null when that save kept an
+    /// earlier entry of this run.
+    fresh_key: ?[]const u8 = null,
     /// Why the commit deleted nothing old, when that is not a reader's doing.
     cleanup_warning: ?[]const u8 = null,
     /// What a step that waits for the readers says first.
@@ -634,22 +637,25 @@ pub const Draft = struct {
 
     // Displaced content.
 
+    /// Keep `entry_in` for `key` unless this run already kept one: the first
+    /// entry of a key holds what was there before the run. A later save only
+    /// moves an earlier entry of the same type into a tree saved later that
+    /// encloses it, its members with it; any other later save is a no-op.
     fn setDisplaced(d: *Draft, key: []const u8, entry_in: generation.Displaced) !void {
-        var e = entry_in;
+        d.fresh_key = null;
         if (d.gen.displaced.get(key)) |old| {
-            if (e.planted == null) e.planted = old.planted;
-            // A tree's members follow its directory: on their own when it is
-            // replaced by something else, into the enclosing tree when a
-            // later save captures it as a member.
-            if (old.type == .dir and old.root == null) {
-                if (e.type != .dir) {
-                    try d.rerootMembers(key, null);
-                } else if (e.root) |r| try d.rerootMembers(key, r);
-            }
+            const r = entry_in.root orelse return;
+            if (old.type != entry_in.type) return;
+            var e = old;
+            e.root = r;
+            if (old.type == .dir and old.root == null) try d.rerootMembers(key, r);
+            try d.log(.displaced, key, try generation.flatDisplacedValue(d.arena, e), true);
+            try d.gen.displaced.put(d.arena, key, e);
+            return;
         }
-        const v = try generation.flatDisplacedValue(d.arena, e);
-        try d.log(.displaced, key, v, true);
-        try d.gen.displaced.put(d.arena, key, e);
+        try d.log(.displaced, key, try generation.flatDisplacedValue(d.arena, entry_in), true);
+        try d.gen.displaced.put(d.arena, key, entry_in);
+        d.fresh_key = key;
     }
 
     fn rerootMembers(d: *Draft, from: []const u8, to: ?[]const u8) !void {
@@ -676,7 +682,7 @@ pub const Draft = struct {
         const key = try d.displacedKey(home, live);
         const st = try Io.Dir.cwd().statFile(d.io, live, .{});
         try d.setDisplaced(key, try d.copyEntry(copy, write_mod.modeOf(st.permissions), null));
-        try d.noteDropped(live, copy, next);
+        if (d.fresh_key != null) try d.noteDropped(live, copy, next);
     }
 
     /// Whether rollback can fill `m`'s slots from what `next` leaves at the
@@ -762,9 +768,12 @@ pub const Draft = struct {
         try d.setDisplaced(key, .{ .type = .link, .target = target });
     }
 
-    /// Note that the link kept for `live` is one mox planted, at `target`.
+    /// Note that the link the save just before kept for `live` is one mox
+    /// planted, at `target`; nothing when that save kept an earlier entry.
     pub fn notePlanted(d: *Draft, home: []const u8, live: []const u8, target: []const u8, part: Hex) !void {
         const key = try d.displacedKey(home, live);
+        const fresh = d.fresh_key orelse return;
+        if (!std.mem.eql(u8, fresh, key)) return;
         var e = d.gen.displaced.get(key) orelse return;
         e.planted = .{ .live = live, .target = target, .part = part };
         try d.log(.displaced, key, try generation.flatDisplacedValue(d.arena, e), true);
@@ -774,16 +783,19 @@ pub const Draft = struct {
     /// Keep a captured directory tree: its root `dir_live`, and every member
     /// by its full key, each file as `keepPrior` keeps it.
     pub fn saveTree(d: *Draft, home: []const u8, dir_live: []const u8, captured: Captured) !void {
-        const root = try d.displacedKey(home, dir_live);
+        const root_key = try d.displacedKey(home, dir_live);
+        // A tree whose root this run already kept as something other than a
+        // directory keeps its members on their own.
+        const root: ?[]const u8 = if (d.gen.displaced.get(root_key)) |e| (if (e.type == .dir) root_key else null) else root_key;
         for (captured.dirs) |c| {
             const key = try d.displacedKey(home, c.live);
-            try d.setDisplaced(key, .{ .type = .dir, .mode = c.mode, .root = if (std.mem.eql(u8, key, root)) null else root });
+            try d.setDisplaced(key, .{ .type = .dir, .mode = c.mode, .root = if (std.mem.eql(u8, key, root_key)) null else root });
         }
         for (captured.files) |c| {
             const key = try d.displacedKey(home, c.live);
             const copy = try d.copyOf(c.live, c.content);
             try d.setDisplaced(key, try d.copyEntry(copy, c.mode, root));
-            try d.noteDropped(c.live, copy, .gone);
+            if (d.fresh_key != null) try d.noteDropped(c.live, copy, .gone);
         }
         for (captured.symlinks) |c| {
             const key = try d.displacedKey(home, c.live);
@@ -1135,7 +1147,7 @@ test "draft: a tree saved inside a later tree save keeps every member it holds, 
     const back = try generation.parse(a, try generation.serialize(a, g), null);
     for (want) |k| try testing.expect(back.displaced.contains(k));
     try testing.expectEqual(want.len, back.displaced.count());
-    try testing.expectEqual(@as(u32, 0o750), back.displaced.get("A/B").?.mode.?);
+    try testing.expectEqual(@as(u32, 0o755), back.displaced.get("A/B").?.mode.?);
 
     const j = try Io.Dir.cwd().readFileAlloc(io, d.jnl.?.path, a, .unlimited);
     const parsed = (try journal.parse(a, j)).?;
@@ -1144,6 +1156,88 @@ test "draft: a tree saved inside a later tree save keeps every member it holds, 
     const refolded = try generation.parse(a, try generation.serialize(a, folded), null);
     for (want) |k| try testing.expect(refolded.displaced.contains(k));
     try testing.expectEqual(want.len, refolded.displaced.count());
+}
+
+test "draft: the first save of a path in a run is the one kept; a later save keeps it, mode and type alike" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const d = try testStore(a, io, &tmp);
+    const home = "/h";
+    try d.saveWithMode(home, "/h/f", "before\n", 0o644);
+    const first = d.gen.displaced.get("f").?.blob.?;
+    try d.saveWithMode(home, "/h/f", "written by this run\n", 0o600);
+    try testing.expectEqualSlices(u8, &first, &d.gen.displaced.get("f").?.blob.?);
+    try testing.expectEqual(@as(u32, 0o644), d.gen.displaced.get("f").?.mode.?);
+    try d.saveSymlink(home, "/h/f", "/elsewhere");
+    try testing.expect(d.gen.displaced.get("f").?.type == .file);
+    try d.notePlanted(home, "/h/f", "/elsewhere", applied.contentHashHex("part"));
+    try testing.expect(d.gen.displaced.get("f").?.planted == null);
+}
+
+test "draft: a link member of a saved tree stays a member when a later save replaces it with a file" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const d = try testStore(a, io, &tmp);
+    const home = "/h";
+    try d.saveTree(home, "/h/T", .{
+        .dirs = &.{.{ .live = "/h/T", .mode = 0o755 }},
+        .files = &.{},
+        .symlinks = &.{.{ .live = "/h/T/l", .target = "/t" }},
+    });
+    try d.saveWithMode(home, "/h/T/l", "a file now\n", 0o644);
+    const l = d.gen.displaced.get("T/l").?;
+    try testing.expect(l.type == .link);
+    try testing.expectEqualStrings("/t", l.target.?);
+    try testing.expectEqualStrings("T", l.root.?);
+}
+
+test "draft: a file kept first, then a tree saved at its path, keeps the file and the tree's members on their own" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const d = try testStore(a, io, &tmp);
+    const home = "/h";
+    try d.saveWithMode(home, "/h/P", "was a file\n", 0o644);
+    try d.saveTree(home, "/h/P", .{
+        .dirs = &.{.{ .live = "/h/P", .mode = 0o755 }},
+        .files = &.{.{ .live = "/h/P/x", .content = "x\n", .mode = 0o644 }},
+        .symlinks = &.{},
+    });
+    try testing.expect(d.gen.displaced.get("P").?.type == .file);
+    try testing.expect(d.gen.displaced.get("P/x").?.root == null);
+}
+
+test "draft: a file kept first, then a tree that encloses it, moves the file into the tree with its first content" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const d = try testStore(a, io, &tmp);
+    const home = "/h";
+    try d.saveWithMode(home, "/h/D/f", "first\n", 0o600);
+    const first = d.gen.displaced.get("D/f").?.blob.?;
+    try d.saveTree(home, "/h/D", .{
+        .dirs = &.{.{ .live = "/h/D", .mode = 0o755 }},
+        .files = &.{.{ .live = "/h/D/f", .content = "second\n", .mode = 0o644 }},
+        .symlinks = &.{},
+    });
+    const f = d.gen.displaced.get("D/f").?;
+    try testing.expectEqualSlices(u8, &first, &f.blob.?);
+    try testing.expectEqual(@as(u32, 0o600), f.mode.?);
+    try testing.expectEqualStrings("D", f.root.?);
 }
 
 test "draft: a change equal to what is held is not a change, and the journal is claimed at the first one" {
