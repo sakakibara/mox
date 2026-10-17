@@ -1686,7 +1686,7 @@ fn stateHolds(h: Harness, needle: []const u8) !bool {
     defer walker.deinit();
     while (try walker.next(h.io)) |entry| {
         if (contains(entry.path, needle)) return true;
-        if (entry.kind != .file) continue;
+        if (entry.kind != .file or testutil.isMoxBinCopy(entry)) continue;
         const content = try dir.readFileAlloc(h.io, entry.path, h.a, .limited(256 << 20));
         if (contains(content, needle)) return true;
     }

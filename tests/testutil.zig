@@ -219,6 +219,16 @@ pub fn editCurrent(h: Harness, edit: *const fn (std.mem.Allocator, *mox.state.ge
     try mox.state.recovery.writeGeneration(h.a, h.io, store, g);
 }
 
+/// True when `e`, walked from a state directory, is the copy of the running
+/// mox that `moxBinDir` keeps there on Windows. Under test that copy is the
+/// test binary, which holds every literal the tests spell.
+pub fn isMoxBinCopy(e: Io.Dir.Walker.Entry) bool {
+    const rs = mox.apply.run_scripts;
+    if (rs.bin_entry_kind != .file or e.kind != .file) return false;
+    return std.mem.eql(u8, e.basename, rs.bin_entry_name) and
+        std.mem.eql(u8, std.fs.path.dirname(e.path) orelse "", rs.bin_dir_name);
+}
+
 /// True when any file under `root` contains `needle`, or any symlink under it
 /// has `needle` in its target. Used to assert that nothing of a machine reaches
 /// the shared repo -- git stores a symlink as a blob whose content is the raw

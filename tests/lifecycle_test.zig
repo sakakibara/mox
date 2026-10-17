@@ -6756,7 +6756,10 @@ fn fsImage(a: std.mem.Allocator, io: Io, root: []const u8) ![]const u8 {
     var lines: std.ArrayList([]const u8) = .empty;
     while (try walker.next(io)) |e| {
         const line = switch (e.kind) {
-            .file => try std.fmt.allocPrint(a, "{s} {s}", .{ e.path, try e.dir.readFileAlloc(io, e.basename, a, .limited(1 << 20)) }),
+            .file => if (testutil.isMoxBinCopy(e))
+                try std.fmt.allocPrint(a, "{s} (mox)", .{e.path})
+            else
+                try std.fmt.allocPrint(a, "{s} {s}", .{ e.path, try e.dir.readFileAlloc(io, e.basename, a, .limited(1 << 20)) }),
             .sym_link => blk: {
                 var buf: [std.fs.max_path_bytes]u8 = undefined;
                 const n = try e.dir.readLink(io, e.basename, &buf);
