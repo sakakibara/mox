@@ -6350,10 +6350,10 @@ test "orphans: status, diff and apply --dry-run judge an orphaned generator's fi
     try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/id-b.inc (its generator left the tree)")));
     try std.testing.expect(lineWith(s.out, "DRIFT", try tilde(a, "~/.config/id-c.inc (its generator left the tree)")));
     try std.testing.expect(std.mem.indexOf(u8, s.out, "id-d.inc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, s.out, "kp-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try testutil.withoutTmpName(h, s.out), "kp-") == null);
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expect(std.mem.indexOf(u8, d.out, "-k=a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, d.out, "kp-") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try testutil.withoutTmpName(h, d.out), "kp-") == null);
     const dry = try h.run(&.{ "mox", "apply", "--dry-run" });
     try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/id-a.inc (generated, no longer produced)")) != null);
     try std.testing.expect(std.mem.indexOf(u8, dry.out, try tilde(a, "would remove ~/.config/id-b.inc")) == null);

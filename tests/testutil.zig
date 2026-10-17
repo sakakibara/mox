@@ -219,6 +219,12 @@ pub fn editCurrent(h: Harness, edit: *const fn (std.mem.Allocator, *mox.state.ge
     try mox.state.recovery.writeGeneration(h.a, h.io, store, g);
 }
 
+/// `out` with the random name of the harness's temporary directory written
+/// as `<tmp>`, so a short needle cannot match a path in it by chance.
+pub fn withoutTmpName(h: Harness, out: []const u8) ![]const u8 {
+    return std.mem.replaceOwned(u8, h.a, out, std.fs.path.basename(h.root), "<tmp>");
+}
+
 /// True when `e`, walked from a state directory, is the copy of the running
 /// mox that `moxBinDir` keeps there on Windows. Under test that copy is the
 /// test binary, which holds every literal the tests spell.

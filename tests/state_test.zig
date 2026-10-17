@@ -1525,7 +1525,7 @@ test "diff: a secret line the last apply wrote is masked wherever it moved, and 
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 0), d.rc);
     try std.testing.expect(!contains(d.out, "tok-4c1d"));
-    try std.testing.expect(!contains(d.out, "n1"));
+    try std.testing.expect(!contains(try testutil.withoutTmpName(h, d.out), "n1"));
     try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n-" ++ redacted_line ++ "\n-" ++ redacted_line ++ "\n"));
     try std.testing.expect(contains(d.out, "-token=" ++ mox.provenance.map.secret_redaction ++ "\n"));
 }
@@ -1709,7 +1709,7 @@ test "diff: a three-byte secret the source no longer resolves is masked by the s
     try writeRepo(io, &tmp, "repo/src/rc.txt", "a=1\npin=none\n");
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 0), d.rc);
-    try std.testing.expect(!contains(d.out, "k9z"));
+    try std.testing.expect(!contains(try testutil.withoutTmpName(h, d.out), "k9z"));
     try std.testing.expect(contains(d.out, "-pin=" ++ redacted_secret ++ "\n"));
     try std.testing.expect(contains(d.out, "+pin=none\n"));
 }
@@ -2072,7 +2072,7 @@ test "diff: an edited secret line, a trailing comment added, is masked from its 
     try std.testing.expect(contains(d.out, "-token=" ++ redacted_secret ++ "\n"));
     try std.testing.expect(contains(d.out, "+token=" ++ redacted_secret ++ "\n"));
     try std.testing.expect(!contains(d.out, "export"));
-    try std.testing.expect(!contains(d.out, "q1"));
+    try std.testing.expect(!contains(try testutil.withoutTmpName(h, d.out), "q1"));
     try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
 }
 
@@ -2303,7 +2303,7 @@ test "diff: a file whose source gains its first secret shows the lines the user 
     try std.testing.expect(contains(d.out, "-token=plain\n"));
     try std.testing.expect(contains(d.out, "-z=3\n"));
     try std.testing.expect(contains(d.out, "+token=" ++ redacted_secret ++ "\n"));
-    try std.testing.expect(!contains(d.out, "3b"));
+    try std.testing.expect(!contains(try testutil.withoutTmpName(h, d.out), "3b"));
 }
 
 test "apply --overwrite: a value one file resolves masks nothing in the snapshot of another" {
@@ -2550,8 +2550,8 @@ test "diff: two secret lines of one shape under two INI sections, one edited bey
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try h.liveOf("app.ini"), .data = "[a]\ntoken: AAAOLDVALUE\n[b]\ntoken = BBBVALUE\n" });
     const d = try h.run(&.{ "mox", "diff" });
     try std.testing.expectEqual(@as(u8, 0), d.rc);
-    try std.testing.expect(!contains(d.out, "AAA"));
-    try std.testing.expect(!contains(d.out, "BBB"));
+    try std.testing.expect(!contains(try testutil.withoutTmpName(h, d.out), "AAA"));
+    try std.testing.expect(!contains(try testutil.withoutTmpName(h, d.out), "BBB"));
     try std.testing.expect(contains(d.out, "-" ++ redacted_line ++ "\n"));
 }
 
