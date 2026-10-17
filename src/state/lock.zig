@@ -68,13 +68,29 @@ pub fn parseHolder(content: []const u8) ?Holder {
     return .{ .pid = pid, .start = start, .boot = boot, .command = it.rest() };
 }
 
-/// A UUID, or `boot-<seconds>`.
+/// A UUID, `boot-count-<n>`, or the `boot-<seconds>` an earlier build wrote
+/// on Windows.
 pub fn isBootId(s: []const u8) bool {
-    if (std.mem.startsWith(u8, s, "boot-")) {
-        if (s.len == "boot-".len) return false;
-        for (s["boot-".len..]) |c| if (!std.ascii.isDigit(c)) return false;
-        return true;
-    }
+    if (bootForm(s)) |f| return f != .uuid or uuidShaped(s);
+    return false;
+}
+
+const BootForm = enum { uuid, count, seconds };
+
+fn bootForm(s: []const u8) ?BootForm {
+    if (digitsAfter(s, "boot-count-")) return .count;
+    if (digitsAfter(s, "boot-")) return .seconds;
+    if (s.len == 36) return .uuid;
+    return null;
+}
+
+fn digitsAfter(s: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, s, prefix) or s.len == prefix.len) return false;
+    for (s[prefix.len..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+fn uuidShaped(s: []const u8) bool {
     if (s.len != 36) return false;
     for (s, 0..) |c, i| switch (i) {
         8, 13, 18, 23 => if (c != '-') return false,
@@ -524,8 +540,8 @@ pub fn readersHeld(io: Io, path: []const u8) bool {
 }
 
 /// The id of this boot: `/proc/sys/kernel/random/boot_id` on Linux,
-/// `kern.bootsessionuuid` on macOS, `boot-<seconds>` from the tick count on
-/// Windows.
+/// `kern.bootsessionuuid` on macOS, `boot-count-<n>` from the boot counter
+/// Windows increments at every boot.
 pub fn bootId(arena: std.mem.Allocator, io: Io) ![]const u8 {
     switch (builtin.os.tag) {
         .linux => {
@@ -540,8 +556,8 @@ pub fn bootId(arena: std.mem.Allocator, io: Io) ![]const u8 {
             return arena.dupe(u8, s);
         },
         .windows => {
-            const now = Io.Clock.real.now(io).toSeconds();
-            return std.fmt.allocPrint(arena, "boot-{d}", .{windowsBootSeconds(now, GetTickCount64())});
+            const n = windowsBootCount() orelse return error.NoBootId;
+            return std.fmt.allocPrint(arena, "boot-count-{d}", .{n});
         },
         else => return error.NoBootId,
     }
@@ -559,24 +575,37 @@ fn readProcFile(arena: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     };
 }
 
-extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "advapi32" fn RegGetValueW(
+    hkey: windows.HKEY,
+    sub_key: ?[*:0]const u16,
+    value: ?[*:0]const u16,
+    flags: windows.DWORD,
+    value_type: ?*windows.DWORD,
+    data: ?*anyopaque,
+    data_len: ?*windows.DWORD,
+) callconv(.winapi) windows.LSTATUS;
 
-pub fn windowsBootSeconds(now_secs: i64, ticks_ms: u64) i64 {
-    return now_secs - @as(i64, @intCast(@divTrunc(ticks_ms + 500, 1000)));
+/// The `BootId` value Windows increments at every boot, readable by every
+/// user; null when it cannot be read.
+fn windowsBootCount() ?u32 {
+    const rrf_rt_reg_dword: windows.DWORD = 0x10;
+    const sub_key = std.unicode.utf8ToUtf16LeStringLiteral("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters");
+    var value: windows.DWORD = 0;
+    var len: windows.DWORD = @sizeOf(windows.DWORD);
+    if (RegGetValueW(windows.HKEY_LOCAL_MACHINE, sub_key, std.unicode.utf8ToUtf16LeStringLiteral("BootId"), rrf_rt_reg_dword, null, &value, &len) != 0) return null;
+    return value;
 }
 
-/// Two boot ids name one boot: equal, or two `boot-<seconds>` stamps at
-/// most 2 seconds apart.
+/// Two boot ids name one boot when they are equal. Ids of different forms
+/// (an earlier build's `boot-<seconds>` against `boot-count-<n>`) cannot be
+/// compared, so they read as one boot: a live holder is never taken for dead.
 pub fn sameBoot(a: []const u8, b: []const u8) bool {
-    if (std.mem.eql(u8, a, b)) return true;
-    if (!std.mem.startsWith(u8, a, "boot-") or !std.mem.startsWith(u8, b, "boot-")) return false;
-    const x = std.fmt.parseInt(i64, a["boot-".len..], 10) catch return false;
-    const y = std.fmt.parseInt(i64, b["boot-".len..], 10) catch return false;
-    return @abs(x - y) <= 2;
+    if (bootForm(a) != bootForm(b)) return true;
+    return std.mem.eql(u8, a, b);
 }
 
 /// True only when signal 0 to `pid` succeeds; on Windows when the process
-/// can be opened and has not exited.
+/// has not exited, or cannot be opened for want of access (it exists).
 pub fn processAlive(pid: Pid) bool {
     if (is_windows) return windowsProcessAlive(pid);
     std.posix.kill(@intCast(pid), @enumFromInt(0)) catch return false;
@@ -584,12 +613,20 @@ pub fn processAlive(pid: Pid) bool {
 }
 
 extern "kernel32" fn OpenProcess(dwDesiredAccess: windows.DWORD, bInheritHandle: windows.BOOL, dwProcessId: windows.DWORD) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn GetProcessTimes(
+    process: windows.HANDLE,
+    creation: *windows.FILETIME,
+    exit: *windows.FILETIME,
+    kernel: *windows.FILETIME,
+    user: *windows.FILETIME,
+) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn GetExitCodeProcess(hProcess: windows.HANDLE, lpExitCode: *windows.DWORD) callconv(.winapi) windows.BOOL;
 
 fn windowsProcessAlive(pid: Pid) bool {
     const process_query_limited_information: windows.DWORD = 0x1000;
     const still_active: windows.DWORD = 259;
-    const handle = OpenProcess(process_query_limited_information, .FALSE, pid) orelse return false;
+    const handle = OpenProcess(process_query_limited_information, .FALSE, pid) orelse
+        return windows.GetLastError() == .ACCESS_DENIED;
     defer windows.CloseHandle(handle);
     var code: windows.DWORD = 0;
     if (!GetExitCodeProcess(handle, &code).toBool()) return false;
@@ -626,6 +663,20 @@ pub fn processStart(arena: std.mem.Allocator, io: Io, pid: Pid) []const u8 {
             @memcpy(std.mem.asBytes(&usec), buf[8..12]);
             return std.fmt.allocPrint(arena, "{d}.{d}", .{ sec, usec }) catch "";
         },
+        .windows => {
+            // The kernel fixes the creation time when the process starts, so
+            // a clock step later leaves it unchanged.
+            const process_query_limited_information: windows.DWORD = 0x1000;
+            const handle = OpenProcess(process_query_limited_information, .FALSE, pid) orelse return "";
+            defer windows.CloseHandle(handle);
+            var created: windows.FILETIME = undefined;
+            var exited: windows.FILETIME = undefined;
+            var kernel_time: windows.FILETIME = undefined;
+            var user_time: windows.FILETIME = undefined;
+            if (!GetProcessTimes(handle, &created, &exited, &kernel_time, &user_time).toBool()) return "";
+            const ticks = (@as(u64, created.dwHighDateTime) << 32) | created.dwLowDateTime;
+            return std.fmt.allocPrint(arena, "{d}", .{ticks}) catch "";
+        },
         else => return "",
     }
 }
@@ -641,10 +692,12 @@ test "bootId and processStart: this boot and this process are named" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     switch (builtin.os.tag) {
-        .linux, .macos => {},
+        .linux, .macos, .windows => {},
         else => return error.SkipZigTest,
     }
-    try testing.expect(isBootId(try bootId(a, testing.io)));
+    const boot = try bootId(a, testing.io);
+    try testing.expect(isBootId(boot));
+    if (builtin.os.tag == .windows) try testing.expect(std.mem.startsWith(u8, boot, "boot-count-"));
     try testing.expect(processStart(a, testing.io, selfPid()).len > 0);
 }
 
@@ -692,12 +745,33 @@ test "lock: a filesystem that cannot lock fails closed, naming the errno" {
     }
 }
 
-test "sameBoot: a Windows boot stamp matches within 2 seconds and not beyond" {
-    try testing.expect(sameBoot("boot-1000", "boot-1002"));
-    try testing.expect(sameBoot("boot-1002", "boot-1000"));
-    try testing.expect(!sameBoot("boot-1000", "boot-1003"));
-    try testing.expectEqual(@as(i64, 1000), windowsBootSeconds(1100, 100_000));
-    try testing.expectEqual(@as(i64, 1000), windowsBootSeconds(1100, 99_600));
+test "sameBoot: ids of one form match only when equal; ids of different forms read as one boot" {
+    try testing.expect(sameBoot("boot-count-41", "boot-count-41"));
+    try testing.expect(!sameBoot("boot-count-41", "boot-count-42"));
+    try testing.expect(!sameBoot("6F9619FF-8B86-D011-B42D-00C04FC964FF", "7F9619FF-8B86-D011-B42D-00C04FC964FF"));
+    try testing.expect(sameBoot("boot-1700000000", "boot-count-41"));
+    try testing.expect(!sameBoot("boot-1700000000", "boot-1700000002"));
+}
+
+test "stampLive: this process under a boot id of another form is live; under another boot of the same form it is dead" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const boot = bootId(a, testing.io) catch return error.SkipZigTest;
+    const other_form = if (std.mem.startsWith(u8, boot, "boot-count-")) "6F9619FF-8B86-D011-B42D-00C04FC964FF" else "boot-count-1";
+    try testing.expect(stampLive(a, testing.io, try std.fmt.allocPrint(a, "{d} - {s}", .{ selfPid(), other_form })));
+    const other_boot = if (std.mem.startsWith(u8, boot, "boot-count-")) "boot-count-0" else "00000000-0000-0000-0000-000000000000";
+    try testing.expect(!stampLive(a, testing.io, try std.fmt.allocPrint(a, "{d} - {s}", .{ selfPid(), other_boot })));
+}
+
+test "isBootId: a UUID, a boot count and an earlier build's boot seconds; nothing else" {
+    try testing.expect(isBootId("6F9619FF-8B86-D011-B42D-00C04FC964FF"));
+    try testing.expect(isBootId("boot-count-7"));
+    try testing.expect(isBootId("boot-1700000000"));
+    try testing.expect(!isBootId("boot-count-"));
+    try testing.expect(!isBootId("boot-"));
+    try testing.expect(!isBootId("windows"));
+    try testing.expect(!isBootId("6F9619FF-8B86-D011-B42D-00C04FC964FX"));
 }
 
 test "parseHolder: a holder line with a command after the boot id; a line with no boot id is none" {
