@@ -765,7 +765,7 @@ fn leafFailure(arena: std.mem.Allocator, file: ManagedFile, format: source.forma
     validate.checkOutputFor(arena, format, content, &layers, has_secret, key, &d) catch |e| switch (e) {
         error.FormatViolation => {
             const why = d.capture() orelse "does not parse";
-            // A typed default reads as its type in 0.12.4; here it is a string.
+            // A bare capture's default is a string, whatever it spells.
             if (bare_default and format.isJson()) return try std.fmt.allocPrint(arena, "{s}; a bare capture's default is written as a JSON string", .{why});
             return try arena.dupe(u8, why);
         },
