@@ -478,7 +478,7 @@ test "state: an exhausted chain reads as empty with a warning, refuses writes, a
     try writeRepo(io, &tmp, "state/v2/current", "not an id\n");
 
     const s = try h.run(&.{ "mox", "status" });
-    try std.testing.expect(contains(s.err, "mox doctor --fix"));
+    try std.testing.expect(contains(s.err, "`current` cannot be parsed; the state reads as empty, and every command that writes refuses until `mox doctor --fix`"));
     const w = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), w.rc);
     try std.testing.expect(contains(w.err, "mox doctor --fix"));
@@ -556,7 +556,50 @@ test "state: v2/ with generations but no current refuses as an exhausted chain" 
     try Io.Dir.cwd().deleteFile(io, try statePath(h, &.{ "v2", "current" }));
     const w = try h.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), w.rc);
-    try std.testing.expect(contains(w.err, "mox doctor --fix"));
+    try std.testing.expect(contains(w.err, "holds generations but no current one; the state reads as empty, and every command that writes refuses until `mox doctor --fix`"));
+}
+
+test "state: an unreadable current generation names it, and with its parent unreadable too names both" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v2\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const cur = mox.state.recovery.parseCurrent(try read(io, a, try statePath(h, &.{ "v2", "current" }))).?;
+    const parent = cur.parent.?;
+    const tear = struct {
+        fn at(hh: Harness, aa: std.mem.Allocator, id: []const u8) !void {
+            try Io.Dir.cwd().writeFile(hh.io, .{ .sub_path = try statePath(hh, &.{ "v2", "gen", try std.fmt.allocPrint(aa, "{s}.json", .{id}) }), .data = "{ torn" });
+        }
+    };
+    try tear.at(h, a, cur.id);
+    try tear.at(h, a, parent);
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(contains(s.err, try std.fmt.allocPrint(a, "generations {s} and {s} cannot be read; the state reads as empty, and every command that writes refuses until `mox doctor --fix`", .{ cur.id, parent })));
+    try std.testing.expect(!contains(s.err, "every one before it"));
+}
+
+test "state: an unreadable current generation with no parent names it alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const h = try setup(a, io, &tmp);
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "v1\n");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const cur = mox.state.recovery.parseCurrent(try read(io, a, try statePath(h, &.{ "v2", "current" }))).?;
+    try std.testing.expect(cur.parent == null);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try statePath(h, &.{ "v2", "gen", try std.fmt.allocPrint(a, "{s}.json", .{cur.id}) }), .data = "{ torn" });
+    const s = try h.run(&.{ "mox", "status" });
+    try std.testing.expect(contains(s.err, try std.fmt.allocPrint(a, "generation {s} cannot be read; the state reads as empty, and every command that writes refuses until `mox doctor --fix`", .{cur.id})));
 }
 
 test "snapshot: mox snapshot <id> lists every entry, and a refused restore names where its content is" {

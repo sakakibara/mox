@@ -92,7 +92,7 @@ pub fn open(arena: std.mem.Allocator, io: Io, opts: Options) !Opened {
             const adopted = try recovery.recover(arena, io, store, loaded, .{ .writes = false, .unlocked = !opts.locked }, &probe);
             if (adopted.gen == null) {
                 report.exhausted = true;
-                try report.warnings.append(arena, try std.fmt.allocPrint(arena, "{s} holds generations but no current one; the state reads as empty, and every command that writes refuses until `mox doctor --fix`", .{store.v2}));
+                try report.warnings.append(arena, try std.fmt.allocPrint(arena, "{s} holds generations but no current one; " ++ recovery.exhausted_tail, .{store.gen}));
             }
         }
     }

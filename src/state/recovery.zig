@@ -95,7 +95,7 @@ pub fn loadCurrent(arena: std.mem.Allocator, io: Io, store: Store, report: *Repo
     if (base.len == 0) return .{ .gen = null, .base = base };
     const cur = parseCurrent(base) orelse {
         report.exhausted = true;
-        try report.warnings.append(arena, "the state's current generation cannot be read; run `mox doctor --fix`");
+        try report.warnings.append(arena, "`current` cannot be parsed; " ++ exhausted_tail);
         return .{ .gen = null, .base = base };
     };
     var why: generation.Unread = .malformed;
@@ -119,9 +119,16 @@ pub fn loadCurrent(arena: std.mem.Allocator, io: Io, store: Store, report: *Repo
         }
     }
     report.exhausted = true;
-    try report.warnings.append(arena, try std.fmt.allocPrint(arena, "generation {s} and every one before it cannot be read; the state reads as empty, and every command that writes refuses until `mox doctor --fix`", .{cur.id}));
+    const what = if (cur.parent) |p|
+        try std.fmt.allocPrint(arena, "generations {s} and {s} cannot be read", .{ cur.id, p })
+    else
+        try std.fmt.allocPrint(arena, "generation {s} cannot be read", .{cur.id});
+    try report.warnings.append(arena, try std.fmt.allocPrint(arena, "{s}; " ++ exhausted_tail, .{what}));
     return .{ .gen = null, .base = base };
 }
+
+/// What every warning of an exhausted chain ends with.
+pub const exhausted_tail = "the state reads as empty, and every command that writes refuses until `mox doctor --fix`";
 
 pub const RecoverOptions = struct {
     writes: bool,
