@@ -1590,3 +1590,23 @@ test "expand: an outside value is encoded for its context; a default written in 
         try std.testing.expect(enc.refused == null);
     }
 }
+
+test "expand: with secrets withheld, a placeholder is encoded where its context holds a string and written as it is where it cannot be" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { kind: context.Kind, template: []const u8, want: []const u8 }{
+        .{ .kind = .sh, .template = "x=\"<secret:env:A\\\"B>\"\n", .want = "x=\"<SECRET:env:A\\\\\\\"B>\"\n" },
+        .{ .kind = .sh, .template = "x=<secret:env:A>\n", .want = "x=<SECRET:env:A>\n" },
+        .{ .kind = .toml, .template = "x = <secret:env:A>\n", .want = "x = <SECRET:env:A>\n" },
+        .{ .kind = .toml, .template = "x = '<secret:env:A>'\n", .want = "x = '<SECRET:env:A>'\n" },
+    };
+    for (cases) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        var enc = context.Encoder.init(c.kind, &buf, true);
+        const out = try expand(a, c.template, null, .{ .encoder = &enc });
+        try std.testing.expectEqualStrings(c.want, out);
+        try std.testing.expect(enc.refused == null);
+        try std.testing.expect(enc.finish() == null);
+    }
+}
