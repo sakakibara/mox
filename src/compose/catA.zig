@@ -19,6 +19,7 @@ fn keyPath(arena: std.mem.Allocator, path: []const u8) []const u8 {
 }
 const ini_merge = @import("ini_merge.zig");
 const interp = @import("interp.zig");
+const context = @import("context/root.zig");
 const json_interp = @import("json_interp.zig");
 const validate = @import("validate.zig");
 const catB = @import("catB.zig");
@@ -603,6 +604,9 @@ fn interpolate(
     };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
+    var enc = context.Encoder.init(context.kindFor(file.format, file.live_path, bytes), &out, secrets == null);
+    var ectx = ctx;
+    ectx.encoder = &enc;
     var secret_seen = false;
     var line_secret: std.ArrayList(bool) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -610,12 +614,13 @@ fn interpolate(
     while (lines.next()) |line| {
         if (!first) try out.append(arena, '\n');
         first = false;
-        const exp = try interp.expandTracked(arena, line, null, ctx);
+        const exp = try interp.expandTracked(arena, line, null, ectx);
         if (exp.secret) secret_seen = true;
         // A value of several lines fills an output line for each of them.
         try line_secret.appendNTimes(arena, exp.secret, std.mem.count(u8, exp.bytes, "\n") + 1);
         try out.appendSlice(arena, exp.bytes);
     }
+    try interp.finishEncoder(arena, &enc, out.items, file.live_path, diag);
     const result = try out.toOwnedSlice(arena);
     if (secret_seen) {
         try recordPerLineSecret(arena, prov, result, file, merged, line_secret.items, base_removed);

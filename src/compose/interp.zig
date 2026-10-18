@@ -6,6 +6,7 @@ const dsl = @import("../dsl/root.zig");
 const machine = @import("../machine/root.zig");
 const secret = @import("../secret/root.zig");
 const Env = @import("env").Env;
+const context = @import("context/root.zig");
 
 const Io = std.Io;
 
@@ -23,8 +24,29 @@ pub const InterpError = error{
     SecretRefWithoutContext,
     /// A TOML inf or nan float captured as a JSON value, which has no form.
     NotRepresentableInJson,
+    /// A capture's value cannot be written in the lexical context it sits
+    /// in, or the file around captures cannot be followed; `Diag` says why.
+    CaptureContextRefused,
     OutOfMemory,
 } || secret.uri.ParseError || secret.resolver.ResolveError;
+
+/// Close `enc` over the emitted `out` of the file at `path`: the error, with
+/// `diag` naming the capture, its line, its context and the remedy, when a
+/// value was refused or the file could not be followed.
+pub fn finishEncoder(arena: std.mem.Allocator, enc: *context.Encoder, out: []const u8, path: []const u8, diag: ?*Diag) InterpError!void {
+    const unfollowed = enc.finish();
+    if (enc.refused) |r| {
+        const line = std.mem.count(u8, out[0..@min(r.offset, out.len)], "\n") + 1;
+        if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: the value of {s} cannot be written in {s}{s}{s}; {s}", .{
+            path, line, r.capture, r.refusal.where, if (r.refusal.reason.len > 0) ": " else "", r.refusal.reason, r.refusal.remedy,
+        }));
+        return error.CaptureContextRefused;
+    }
+    if (unfollowed) |why| {
+        if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}: {s}, so mox cannot tell where its captures sit; fix the file", .{ path, why }));
+        return error.CaptureContextRefused;
+    }
+}
 
 pub const LintError = error{
     AdjacentCaptures,
@@ -133,7 +155,40 @@ pub const Ctx = struct {
     /// Set while composing a JSON-family file: a template is then a chunk
     /// of a JSON document, and only its string tokens are expanded.
     json: ?*json_interp.ScanState = null,
+    /// Set while composing a file whose captures are encoded for their
+    /// lexical context: it follows the emitted bytes and encodes each value.
+    encoder: ?*context.Encoder = null,
 };
+
+/// Encode the value of `cap` that its branch has just appended to `out`
+/// after `start`, for the context at `start`; nothing without an encoder.
+/// A data or loop value that is a YAML plain scalar's whole text keeps its
+/// own type, and a secret in a bare TOML value is refused.
+fn encodeCapture(arena: std.mem.Allocator, out: *std.ArrayList(u8), start: usize, ctx: Ctx, cap: []const u8, rest: []const u8, typed: bool) InterpError!void {
+    const enc = ctx.encoder orelse return;
+    const value = try arena.dupe(u8, out.items[start..]);
+    var c = enc.contextAt(out.items[0..start]);
+    if (c.refuse == null) {
+        if (c.enc == .yaml_plain and typed and wholeScalar(out.items[0..start], rest)) c.enc = .yaml_typed;
+        if (c.enc == .toml_bare and std.mem.startsWith(u8, cap, "<secret:")) c.refuse = "quote it in the source: a secret cannot be a bare TOML value";
+    }
+    const bytes = try enc.encodeAt(arena, out.items[0..start], cap, value, c);
+    out.shrinkRetainingCapacity(start);
+    try out.appendSlice(arena, bytes);
+}
+
+/// True when a capture after `before` and before `rest` is a YAML plain
+/// value's whole text: only `key:` or `- ` and spaces precede it on its line,
+/// and only spaces or a comment follow it.
+fn wholeScalar(before: []const u8, rest: []const u8) bool {
+    const line_start = if (std.mem.lastIndexOfScalar(u8, before, '\n')) |n| n + 1 else 0;
+    const head = std.mem.trimEnd(u8, before[line_start..], " \t");
+    if (head.len == 0) return false;
+    if (head[head.len - 1] != ':' and head[head.len - 1] != '-') return false;
+    const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const tail = std.mem.trimStart(u8, rest[0..line_end], " \t");
+    return tail.len == 0 or tail[0] == '#';
+}
 
 const ScopeResult = union(enum) {
     /// The capture resolved to these bytes.
@@ -405,6 +460,9 @@ fn expandTrackedImpl(
                 continue;
             };
             const inner_raw = template[i + 1 .. close];
+            const cap_start = out.items.len;
+            const cap = template[i .. close + 1];
+            const rest = template[close + 1 ..];
 
             // `<secret:URI>`: resolve the URI through the shared resolver+cache
             // and splice the plaintext mid-line, or emit the `<SECRET:uri>`
@@ -412,6 +470,7 @@ fn expandTrackedImpl(
             // so it is never default- or chain-split.
             if (std.mem.startsWith(u8, inner_raw, "secret:")) {
                 try appendSecret(arena, &out, ctx, inner_raw["secret:".len..], &secret_seen, &placeholder_seen);
+                try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                 i = close + 1;
                 continue;
             }
@@ -430,6 +489,7 @@ fn expandTrackedImpl(
             if (capture.isChain(inner)) {
                 switch (try resolveChain(arena, &out, inner, default_opt, record_opt, ctx)) {
                     .resolved => {
+                        try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                         i = close + 1;
                         continue;
                     },
@@ -454,10 +514,15 @@ fn expandTrackedImpl(
                         // Expand it through the same machinery, one level
                         // only -- see this function's doc comment for the
                         // bound.
-                        const nested = try expandTrackedImpl(arena, v, record_opt, ctx, false);
+                        var plain = ctx;
+                        plain.encoder = null;
+                        const nested = try expandTrackedImpl(arena, v, record_opt, plain, false);
                         try out.appendSlice(arena, nested.bytes);
                         if (nested.secret) secret_seen = true;
                         if (nested.placeholder) placeholder_seen = true;
+                        // An authored value is spliced as written, unless a
+                        // secret resolved inside it.
+                        if (nested.secret or nested.placeholder) try encodeCapture(arena, &out, cap_start, ctx, cap, rest, true);
                     } else {
                         try out.appendSlice(arena, v);
                     }
@@ -487,6 +552,7 @@ fn expandTrackedImpl(
                     else => return e,
                 };
                 try out.appendSlice(arena, formatted);
+                try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                 i = close + 1;
                 continue;
             }
@@ -502,10 +568,13 @@ fn expandTrackedImpl(
                         // `<machine.brew_prefix>/bin`). Expand it through the
                         // same machinery, one level only -- see
                         // `expandTrackedImpl`'s doc comment for the bound.
-                        const nested = try expandTrackedImpl(arena, formatted, record_opt, ctx, false);
+                        var plain = ctx;
+                        plain.encoder = null;
+                        const nested = try expandTrackedImpl(arena, formatted, record_opt, plain, false);
                         try out.appendSlice(arena, nested.bytes);
                         if (nested.secret) secret_seen = true;
                         if (nested.placeholder) placeholder_seen = true;
+                        if (nested.secret or nested.placeholder) try encodeCapture(arena, &out, cap_start, ctx, cap, rest, true);
                     } else {
                         try out.appendSlice(arena, formatted);
                     }
@@ -564,6 +633,7 @@ fn expandTrackedImpl(
                 }
                 if (!found and default_opt != null) resolved = default_opt.?;
                 try out.appendSlice(arena, resolved);
+                try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                 i = close + 1;
                 continue;
             }

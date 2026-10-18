@@ -13,6 +13,7 @@ pub const toml_merge = @import("toml_merge.zig");
 pub const json_merge = @import("json_merge.zig");
 pub const yaml_merge = @import("yaml_merge.zig");
 pub const ini_merge = @import("ini_merge.zig");
+pub const context = @import("context/root.zig");
 pub const categoryOf = @import("compose.zig").categoryOf;
 pub const composeFile = @import("compose.zig").composeFile;
 pub const composeFileTracked = @import("compose.zig").composeFileTracked;
@@ -29,4 +30,5 @@ test {
     _ = ini_merge;
     _ = json_interp;
     _ = validate;
+    _ = context;
 }

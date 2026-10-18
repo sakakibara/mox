@@ -6,6 +6,7 @@ const match_mod = @import("match.zig");
 const pacifier = @import("pacifier.zig");
 const data_mod = @import("../data/root.zig");
 const interp = @import("interp.zig");
+const context = @import("context/root.zig");
 const json_interp = @import("json_interp.zig");
 const machine = @import("../machine/root.zig");
 const secret = @import("../secret/root.zig");
@@ -116,8 +117,10 @@ fn emitSecretAwareBody(
     policy: BodyOrigin,
 ) !void {
     var whole_secret = false;
-    // A secret re-expands the body line by line from the same scanner state.
+    // A secret re-expands the body line by line from the same scanner and
+    // encoder state.
     const json_start: ?json_interp.ScanState = if (ctx.json) |js| js.* else null;
+    const enc_start: ?context.Encoder = if (ctx.encoder) |e| e.* else null;
     const expanded = if (interp_on) blk: {
         const exp = try interp.expandTracked(arena, body, record, ctx);
         whole_secret = exp.secret or exp.placeholder;
@@ -139,6 +142,7 @@ fn emitSecretAwareBody(
     // empty final segment; `always_add` emits that segment too, doubling the
     // newline exactly as the pre-helper append did (trimmed by the post-loop pop).
     if (ctx.json) |js| js.* = json_start.?;
+    if (ctx.encoder) |e| e.* = enc_start.?;
     const drop_final = trailing == .single and body.len > 0 and body[body.len - 1] == '\n';
     var lines = std.mem.splitScalar(u8, body, '\n');
     var i: u32 = 0;
@@ -392,6 +396,11 @@ pub fn composeTrackedContent(
         json_state.dialect = f.jsonDialect();
         ctx.json = &json_state;
     };
+    // Every other file encodes each value for the context it lands in.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+    var enc = context.Encoder.init(context.kindFor(file.format, file.live_path, base_content), &out, secrets == null);
+    if (ctx.json == null) ctx.encoder = &enc;
 
     const marker = file.marker(base_content) orelse {
         // No signal at all. Pass through verbatim -- directiveless config
@@ -403,8 +412,6 @@ pub fn composeTrackedContent(
             // `.secret`, not the whole file: a false whole-file mark would
             // redact every non-secret line out of diffs and snapshots (and a
             // rollback would then restore the redaction placeholder over them).
-            var out: std.ArrayList(u8) = .empty;
-            errdefer out.deinit(arena);
             var em: Emitter = .{ .arena = arena, .buf = &out, .prov = prov };
             var lines = std.mem.splitScalar(u8, base_content, '\n');
             var ln: u32 = 0;
@@ -412,6 +419,7 @@ pub fn composeTrackedContent(
                 ln += 1;
                 try emitBaseLine(&em, arena, line, source.head.sourceLine(base_removed, ln), true, ctx);
             }
+            try interp.finishEncoder(arena, &enc, out.items, file.live_path, ctx.diag);
             if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') _ = out.pop();
             if (prov) |p| prov_mod.map.truncateTo(p, prov_mod.map.lineCount(out.items));
             return @as(?[]u8, try out.toOwnedSlice(arena));
@@ -448,8 +456,6 @@ pub fn composeTrackedContent(
     var empty_record = std.StringHashMap(data_mod.value.Value).init(arena);
     const top_nest: Nest = .{ .marker = marker, .record = &empty_record, .in_for = false, .depth = 0 };
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(arena);
     var em: Emitter = .{ .arena = arena, .buf = &out, .prov = prov };
 
     var lines = std.mem.splitScalar(u8, base_content, '\n');
@@ -487,6 +493,7 @@ pub fn composeTrackedContent(
     // to EOF already carries its own trailing newline). Drop it so the
     // output's final-newline shape matches the input's, then trim provenance
     // to the surviving line count so segments stay aligned 1:1 with the diff.
+    try interp.finishEncoder(arena, &enc, out.items, file.live_path, ctx.diag);
     if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') {
         _ = out.pop();
     }
@@ -720,8 +727,14 @@ pub fn composeGenerator(
         errdefer out.deinit(arena);
         var prov: std.ArrayList(Segment) = .empty;
         var em: Emitter = .{ .arena = arena, .buf = &out, .prov = &prov };
+        var enc = context.Encoder.init(context.kindFor(leaf_format, live_path, loop.body_template), &out, secrets == null);
+        if (row_ctx.json == null) row_ctx.encoder = &enc;
 
         composeGeneratorBody(arena, io, &em, file, bindings, row_ctx, secrets, marker, loop.body_template, parsed_body, nested, stripped, record_ptr) catch |e| {
+            if (diag) |d| if (row_diag.capture()) |c| d.set(c);
+            return e;
+        };
+        interp.finishEncoder(arena, &enc, out.items, live_path, &row_diag) catch |e| {
             if (diag) |d| if (row_diag.capture()) |c| d.set(c);
             return e;
         };

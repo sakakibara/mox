@@ -7097,7 +7097,8 @@ test "validation: capture-bearing and region-bearing TOML layers are checked on 
     try put(io, &tmp, "repo/src/regions.toml", "# mox: when os=zzz\nk = 1\n# mox: end\n# mox: when not os=zzz\nk = 2\n# mox: end\n");
     // A bare capture whose value is no TOML value: the output is refused.
     try put(io, &tmp, "repo/src/bad.toml", "a = 1\n");
-    // A quoted capture whose value holds a quote: text expansion breaks it.
+    // A quoted capture of an authored data value holding a quote: the data
+    // is template text, spliced as written, so the output does not parse.
     try put(io, &tmp, "repo/src/bad.toml.d/os=" ++ host_os ++ ".toml", "b = \"<data.u.name>\"\n");
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
@@ -7127,7 +7128,7 @@ test "validation: an include fragment is never parsed alone" {
     try std.testing.expectEqualStrings("[user]\n\tname = me\n\tsigningkey = ABC\n", try read(io, a, try c.homePath(".gitconfig")));
 }
 
-test "validation: a line carrying a resolved secret is never quoted in a parse error" {
+test "validation: a secret in a bare TOML value is refused before it is written, and never quoted" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7139,7 +7140,7 @@ test "validation: a line carrying a resolved secret is never quoted in a parse e
     const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t value" }} });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
-    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "composed output line 2 from src/app.toml: "));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: the value of <secret:env:MOX_TEST_TOKEN> cannot be written in a bare TOML value") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "s3cr3t") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, "s3cr3t") == null);
     try std.testing.expect(!exists(io, try c.homePath("app.toml")));
@@ -7578,7 +7579,7 @@ test "captures in JSON: a key capture stays a string, and a duplicate it makes i
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/s.jsonc"), "duplicate key \"same\""));
 }
 
-test "validation: a secret-bearing error keeps its reason, and a duplicate key from a secret capture is never printed" {
+test "validation: a secret in a bare TOML value is refused naming its reason, and a duplicate key from a secret capture is never printed" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7593,13 +7594,7 @@ test "validation: a secret-bearing error keeps its reason, and a duplicate key f
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "hunter2") == null);
-    var it = std.mem.splitScalar(u8, r.err, '\n');
-    var toml_line: []const u8 = "";
-    while (it.next()) |l| if (std.mem.indexOf(u8, l, try tilde(a, "~/app.toml")) != null) {
-        toml_line = l;
-    };
-    try std.testing.expect(std.mem.indexOf(u8, toml_line, "composed output line 2 from src/app.toml: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, toml_line, ": <redacted>)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: the value of <secret:env:MOX_TEST_TOKEN> cannot be written in a bare TOML value") != null);
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/d.json"), "duplicate key <redacted>"));
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/e.json"), "duplicate key \"a\\n\\\"b\""));
 }
