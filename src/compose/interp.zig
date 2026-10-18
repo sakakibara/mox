@@ -488,8 +488,8 @@ fn expandTrackedImpl(
             // name outside template mode is not a capture: pass through.
             if (capture.isChain(inner)) {
                 switch (try resolveChain(arena, &out, inner, default_opt, record_opt, ctx)) {
-                    .resolved => {
-                        try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
+                    .resolved => |r| {
+                        if (r.outside) try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                         i = close + 1;
                         continue;
                     },
@@ -544,15 +544,20 @@ fn expandTrackedImpl(
             if (std.mem.startsWith(u8, inner, "machine.")) {
                 const m = ctx.machine orelse return error.MachineRefWithoutState;
                 const field = inner[8..];
+                var outside = true;
                 const formatted = formatMachineField(arena, m, field) catch |e| switch (e) {
-                    error.UnknownMachineField => if (default_opt) |d| try arena.dupe(u8, d) else {
+                    error.UnknownMachineField => if (default_opt) |d| blk: {
+                        outside = false;
+                        break :blk try arena.dupe(u8, d);
+                    } else {
                         noteDiag(ctx, inner);
                         return e;
                     },
                     else => return e,
                 };
                 try out.appendSlice(arena, formatted);
-                try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
+                // A default is authored text, spliced as written.
+                if (outside) try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                 i = close + 1;
                 continue;
             }
@@ -633,7 +638,7 @@ fn expandTrackedImpl(
                 }
                 if (!found and default_opt != null) resolved = default_opt.?;
                 try out.appendSlice(arena, resolved);
-                try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
+                if (found or default_opt == null) try encodeCapture(arena, &out, cap_start, ctx, cap, rest, false);
                 i = close + 1;
                 continue;
             }
@@ -701,10 +706,15 @@ fn appendSecret(
     }
 }
 
-const ChainResult = enum { resolved, not_a_capture };
+const ChainResult = union(enum) {
+    /// The winner came from outside the repo (a machine fact or the
+    /// environment), not from authored data or the default.
+    resolved: struct { outside: bool },
+    not_a_capture,
+};
 
 /// Resolve a multi-member fallback chain, appending the winning value to
-/// `out`. Members resolve to empty (and fall through) when their field is
+/// `out` and saying whether it came from outside the repo. Members resolve to empty (and fall through) when their field is
 /// unknown or unset; `entry.` members still error without a record, since a
 /// chain touching row data outside a loop is a template bug, not a fallback.
 fn resolveChain(
@@ -716,9 +726,11 @@ fn resolveChain(
     ctx: Ctx,
 ) InterpError!ChainResult {
     var chosen: ?[]const u8 = null;
+    var outside = false;
     var members = capture.members(inner);
     while (members.next()) |member| {
         var value: []const u8 = "";
+        const from_outside = std.mem.startsWith(u8, member, "machine.") or std.mem.startsWith(u8, member, "env.");
         if (try scopeChainMember(arena, ctx.scope, member)) |v| {
             value = v;
         } else if (std.mem.startsWith(u8, member, "machine.")) {
@@ -755,11 +767,14 @@ fn resolveChain(
             const r = record_opt orelse return .not_a_capture;
             if (r.get(member)) |v| value = try v.format(arena) else return .not_a_capture;
         }
-        if (chosen == null and value.len > 0) chosen = value;
+        if (chosen == null and value.len > 0) {
+            chosen = value;
+            outside = from_outside;
+        }
     }
     const winner = chosen orelse default_opt orelse return error.UnresolvedFallbackChain;
     try out.appendSlice(arena, winner);
-    return .resolved;
+    return .{ .resolved = .{ .outside = outside } };
 }
 
 const DataSpec = struct { file: []const u8, table: ?[]const u8, key: []const u8 };
@@ -1542,4 +1557,29 @@ test "containsCapture: finds every capture compose could expand, whatever quotin
     try std.testing.expect(containsCapture("<machine.os | default x>"));
     try std.testing.expect(containsCapture("<secret:cmd:printf hi\\>"));
     try std.testing.expect(containsCapture("< machine.os | env.X>"));
+}
+
+test "expand: an outside value is encoded for its context; a default written in the template is spliced as written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = std.process.Environ.Map.init(a);
+    try map.put("MOX_ENC_SET", "a\"b");
+    var probe = machine.state.EnvProbe.init(a, .{ .map = &map });
+    var m = chainTestState();
+    m.env_probe = &probe;
+    const cases = [_]struct { template: []const u8, want: []const u8 }{
+        .{ .template = "x=\"<env.MOX_ENC_SET>\"\n", .want = "x=\"a\\\"b\"\n" },
+        .{ .template = "x=\"<env.MOX_ENC_UNSET | default \"$HOME\">\"\n", .want = "x=\"$HOME\"\n" },
+        .{ .template = "x=\"<machine.no_such_fact | default \"$HOME\">\"\n", .want = "x=\"$HOME\"\n" },
+        .{ .template = "x=\"<env.MOX_ENC_UNSET | machine.cargo_home | default \"$HOME\">\"\n", .want = "x=\"$HOME\"\n" },
+        .{ .template = "x=\"<env.MOX_ENC_UNSET | env.MOX_ENC_SET | default \"\">\"\n", .want = "x=\"a\\\"b\"\n" },
+    };
+    for (cases) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        var enc = context.Encoder.init(.sh, &buf, false);
+        const out = try expand(a, c.template, null, .{ .machine = &m, .encoder = &enc });
+        try std.testing.expectEqualStrings(c.want, out);
+        try std.testing.expect(enc.refused == null);
+    }
 }
