@@ -7926,6 +7926,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/cli/apply.zig", "applyRegularFile", 1 },
         .{ "src/cli/apply.zig", "bootstrapBackends", 1 },
         .{ "src/cli/apply.zig", "partialCheckAccepts", 3 },
+        .{ "src/cli/apply.zig", "updateRecords", 1 },
         .{ "src/cli/commit.zig", "acceptedHolder", 2 },
         .{ "src/cli/commit.zig", "commitOpened", 3 },
         .{ "src/cli/commit.zig", "couplingCandidates", 12 },

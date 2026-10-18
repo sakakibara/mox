@@ -70,6 +70,11 @@ pub const Harness = struct {
         const saved_refresh = mox.cli.app.admin_refresh_override;
         if (saved_refresh == null) mox.cli.app.admin_refresh_override = .{ .run = noRefresh };
         defer mox.cli.app.admin_refresh_override = saved_refresh;
+        // Nor the identity of the machine running the suite: every run is
+        // the same machine unless a test names another.
+        const saved_identity = mox.cli.app.identity_override;
+        if (saved_identity == null) mox.cli.app.identity_override = .{ .known = test_identity };
+        defer mox.cli.app.identity_override = saved_identity;
 
         var reader: Io.Reader = if (stdin) |s| .fixed(s) else undefined;
         const saved_stdin = mox.cli.app.stdin_override;
@@ -129,6 +134,9 @@ pub const Harness = struct {
 };
 
 fn noRefresh(_: ?*anyopaque, _: Io) void {}
+
+/// The identity every run has unless a test names another.
+pub const test_identity = "mox-test-machine";
 
 /// `text` with each `~/...` path spelled with the platform separator, as
 /// mox displays a path under home.

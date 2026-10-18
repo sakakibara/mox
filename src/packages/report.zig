@@ -58,6 +58,10 @@ pub const BackendDrift = struct {
     /// fails for a while must not forget an uninstall. Empty for a backend
     /// assumed rather than asked.
     declared_ids: []const []const u8 = &.{},
+    /// Treated as usable with nothing installed rather than asked: named to
+    /// assume, or absent with a bootstrap row apply would run. Its record is
+    /// never updated, since nothing about it was seen.
+    assumed: bool = false,
 };
 
 /// The records in effect for a report: per backend, the ids this machine was
@@ -309,6 +313,7 @@ pub fn fromManifest(
             },
             .limitation = if (contains(assume_available, b.name)) null else "absent; apply will bootstrap it",
             .gated = try gatedFor(arena, gated.items, b.name),
+            .assumed = true,
         });
     }
     for (usable.items) |b| {
@@ -670,6 +675,7 @@ test "fromManifest: an absent backend apply would bootstrap is assumed, its rows
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
     try testing.expectEqualStrings("absent; apply will bootstrap it", rep.backends[0].limitation.?);
+    try testing.expect(rep.backends[0].assumed);
     try testing.expectEqual(@as(usize, 1), rep.missingCount());
     try testing.expectEqual(@as(usize, 0), rep.untrackedCount());
     try testing.expect(!rep.clean());
@@ -1012,6 +1018,8 @@ test "fromManifest: a backend with no record in effect has every row it lacks mi
     try testing.expectEqual(@as(usize, 1), rep3.missingCount());
     try testing.expectEqual(@as(usize, 0), rep3.removedCount());
     try testing.expectEqual(@as(usize, 0), assumed.present_calls);
+    try testing.expect(rep3.backends[0].assumed);
+    try testing.expect(!rep2.backends[0].assumed);
 }
 
 test "fromManifest: a seen row the manager holds in some form is missing, and one it holds in none is removed" {

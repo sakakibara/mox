@@ -336,6 +336,18 @@ reported by `mox status` and reconciled by `mox commit`, never uninstalled.
 An `ASTRAY` package (see [status](#status)) is left as it is for the same
 reason: apply names it on stderr with what repairs it, counts it in the
 summary (`, N astray`), and exits 1, as for file drift it leaves untouched.
+A declared package this machine was seen holding and has lost -- one its
+manager no longer holds in any form, a dependency included -- is `REMOVED`
+and withheld: apply does not install it again, names it on stderr (`<name>
+is not installed here any more, so it was not reinstalled`), counts it in
+the summary (`, N removed`), and exits 1, leaving `mox commit` to remove
+its row, keep it off this machine, or have the next apply install it. What
+each machine held is recorded per backend under the state directory
+(`seen/`) after each real apply that ran its package step: the desired
+packages verified installed, plus what it held before and some row still
+declares under any gate. A manager bootstrapped in the run starts that
+record afresh, and a machine whose identity cannot be read neither uses
+nor writes one, which a note says.
 An `UNCHECKED` one is named on stderr and counted (`, N unchecked`) but
 changes nothing about the exit code: what apply installs is known all the
 same. Each backend that installed anything is asked again afterwards, and a
@@ -1424,8 +1436,8 @@ That is mox's guarded fetch without the write -- a dirty tree refused,
 a missing upstream reported in mox's terms, the arriving commit count
 printed -- which `mox git -- pull --rebase` does not give you.
 
-Exit 0 clean, 1 drift or an astray package left for a decision, 2 a
-refusal or failure, the same contract `apply` uses. Sending work the other
+Exit 0 clean, 1 drift, or an astray or removed package left for a
+decision, 2 a refusal or failure, the same contract `apply` uses. Sending work the other
 way is `publish`.
 
 <!-- generated: flags update -->

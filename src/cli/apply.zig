@@ -156,9 +156,9 @@ pub fn walkTreeOrReport(ctx: *app.Ctx, cmd: []const u8, src_dir: []const u8, hom
 /// every drifted one (no write, no snapshot, no record), and reports the
 /// drift set at the end. `force` (`--overwrite`) writes through drift instead
 /// of skipping it, scoped to `paths` when given. Returns 0 (clean), 1 (drift
-/// was skipped, or a package is astray, and needs a decision), or 2 (a
-/// genuine failure -- see the exit-code split in `applyPass`). `held` is a
-/// keepalive the caller already holds a sudo credential with (`init`'s
+/// was skipped, or a package is astray or removed, and needs a decision), or
+/// 2 (a genuine failure -- see the exit-code split in `applyPass`). `held` is
+/// a keepalive the caller already holds a sudo credential with (`init`'s
 /// Command Line Tools install); a bootstrap that elevates runs on it instead
 /// of asking again, and the caller stops it.
 pub fn applyImpl(ctx: *app.Ctx, force: bool, dry_run: bool, skip_scripts_arg: bool, defaults: bool, color: style.ColorFlag, paths: []const []const u8, held: ?*mox.packages.admin.Keepalive) anyerror!u8 {
@@ -878,6 +878,7 @@ fn applyPass(
                 );
             }
             if (pkg_counts.astray > 0) try ctx.out.print(", {d} astray", .{pkg_counts.astray});
+            if (pkg_counts.removed > 0) try ctx.out.print(", {d} removed", .{pkg_counts.removed});
             if (pkg_counts.unchecked > 0) try ctx.out.print(", {d} unchecked", .{pkg_counts.unchecked});
             try ctx.out.writeAll("\n");
         }
@@ -905,6 +906,7 @@ fn applyPass(
                 .{pkg_counts.marked},
             );
             if (pkg_counts.astray > 0) try ctx.out.print(", {d} astray", .{pkg_counts.astray});
+            if (pkg_counts.removed > 0) try ctx.out.print(", {d} removed", .{pkg_counts.removed});
             if (pkg_counts.unchecked > 0) try ctx.out.print(", {d} unchecked", .{pkg_counts.unchecked});
             if (pkg_counts.attempted > 0) try ctx.out.print(
                 " ({d} row(s) in failed batches may have landed)",
@@ -934,11 +936,12 @@ fn applyPass(
     // A blocked script (its fact contract could not be resolved), a compose
     // failure, an unwritable target, or lock contention is a genuine failure:
     // rc 2. Drift left untouched (skipped, not forced), or a package left
-    // astray, is a normal, actionable non-success: rc 1. Neither: rc 0.
+    // astray or removed for a decision, is a normal, actionable non-success:
+    // rc 1. Neither: rc 0.
     const error_class = counts.fail + pre_result.failed + post_result.failed +
         pre_result.blocked + post_result.blocked + pkg_counts.failed;
     if (error_class > 0) return 2;
-    if (counts.drift > 0 or pkg_counts.astray > 0) return 1;
+    if (counts.drift > 0 or pkg_counts.astray > 0 or pkg_counts.removed > 0) return 1;
     return 0;
 }
 
@@ -1177,13 +1180,19 @@ const PackageCounts = struct {
     /// Installed rows their manager holds astray, left as they are: the
     /// repair can uninstall, and mox never does.
     astray: usize = 0,
+    /// Desired rows this machine held and lost, not installed again: an
+    /// uninstall the manifest does not know of yet is left for a decision.
+    removed: usize = 0,
     /// Installed rows, or whole backends, not judged for being held astray.
     /// Said, and counted in nothing else: what apply installs is known all
     /// the same.
     unchecked: usize = 0,
 };
 
-/// Install every package the manifest declares and this machine lacks.
+/// Install every package the manifest declares and this machine lacks,
+/// except one this machine was seen holding and has lost: that one was
+/// uninstalled here, most likely on purpose, and is withheld and named for
+/// `mox commit` to settle rather than installed again.
 ///
 /// Runs after the pre stage and its re-capture, so a gate on a tool or
 /// fact a pre-script provided holds here; what it installs or bootstraps
@@ -1191,7 +1200,10 @@ const PackageCounts = struct {
 /// the post scripts see, exactly like one a script installed.
 ///
 /// Only ever installs. An untracked package is reported by `mox status` and
-/// reconciled by `mox commit`; nothing here removes one.
+/// reconciled by `mox commit`; nothing here removes one. A real run then
+/// records, per backend, the desired packages verified on the machine
+/// (`seen.zig`), which is what tells a later lost one apart from one this
+/// machine never had.
 fn applyPackages(
     ctx: *app.Ctx,
     context: app.Context,
@@ -1290,6 +1302,7 @@ fn applyPackages(
     var bootstrap_ran: usize = 0;
     var bootstrap_failed: usize = 0;
     var failed_backends: []const []const u8 = &.{};
+    var bootstrapped_backends: []const []const u8 = &.{};
     var would_bootstrap: std.ArrayList([]const u8) = .empty;
     // Held from the bootstrap that cached a credential until the installs
     // below are done, whichever way this function leaves.
@@ -1301,6 +1314,7 @@ fn applyPackages(
         bootstrap_ran = done.ran;
         bootstrap_failed = done.failed;
         failed_backends = done.failed_backends;
+        bootstrapped_backends = done.bootstrapped_backends;
     } else {
         for (manifest.bootstrap) |b| {
             if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
@@ -1328,6 +1342,25 @@ fn applyPackages(
         }
     }
 
+    // A manager bootstrapped here is a new install, so what the record says
+    // this machine held through the one before it is not in effect.
+    var machine: mox.packages.seen.Machine = .{
+        .arena = ctx.alloc,
+        .io = ctx.io,
+        .runner = pkg_backends.runner(),
+        .env = pkg_env,
+        .fixed = if (builtin.is_test) app.identity_override else null,
+    };
+    const loaded = mox.packages.seen.load(ctx.alloc, ctx.io, context.paths.state_dir, &machine, registry.backends, bootstrapped_backends) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            try ctx.err.print("mox apply: packages: the records of what this machine held could not be read: {s}\n", .{mox.packages.exec.errorText(e)});
+            try ctx.err.flush();
+            return .{ .in_use = true, .failed = 1 };
+        },
+    };
+    for (loaded.notes) |note| try ctx.out.print("  note            {s}\n", .{note});
+
     const rep = mox.packages.report.fromManifest(
         ctx.alloc,
         manifest,
@@ -1335,7 +1368,7 @@ fn applyPackages(
         bindings,
         would_bootstrap.items,
         .judge,
-        .none,
+        loaded.seen,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -1394,6 +1427,13 @@ fn applyPackages(
                 .{ b.backend, u.row.name, u.why },
             );
         }
+        for (b.drift.removed) |r| {
+            try ctx.err.print(
+                "mox apply: {s}: {s} is not installed here any more, so it was not reinstalled; mox commit can remove its row, keep it off this machine, or have the next apply install it\n",
+                .{ b.backend, r.row.name },
+            );
+            counts.removed += 1;
+        }
         counts.unchecked += @intFromBool(b.unchecked != null) + b.drift.unchecked.len;
     }
     try ctx.err.flush();
@@ -1442,8 +1482,52 @@ fn applyPackages(
     // that installed is asked again, and a row it held before and holds no
     // longer goes back through its install, which for an installed package
     // is the adapter's own way of recording it.
-    if (installed_here.items.len > 0) try restoreRegressed(ctx, &pkg_backends, registry, manifest, bindings, rep, installed_here.items, &counts);
+    const after = if (installed_here.items.len > 0) try restoreRegressed(ctx, &pkg_backends, registry, manifest, bindings, rep, installed_here.items, &counts) else null;
+    if (!dry_run) try updateRecords(ctx, context, registry, &machine, loaded, rep, after, installed_here.items);
     return counts;
+}
+
+/// Write each backend's record of what this machine held: what it held and
+/// some row still declares, plus what is desired here and verified
+/// installed -- by the read after the installs where one covered the
+/// backend, else by the read before. A backend assumed, broken, or whose
+/// record could not be read or is a newer mox's keeps its record as it is,
+/// and so does every backend when the machine's identity could not be read.
+/// A write that fails is said and fails nothing: the packages are installed.
+fn updateRecords(
+    ctx: *app.Ctx,
+    context: app.Context,
+    registry: mox.packages.backend.Registry,
+    machine: *mox.packages.seen.Machine,
+    loaded: mox.packages.seen.Loaded,
+    before: mox.packages.report.Report,
+    after: ?mox.packages.report.Report,
+    installed_here: []const []const u8,
+) !void {
+    for (before.backends) |b| {
+        if (b.assumed) continue;
+        const backend = registry.find(b.backend) orelse continue;
+        if (!backend.canTellPresent()) continue;
+        const state = loaded.stateOf(b.backend) orelse continue;
+        if (!state.writable) continue;
+        var installed = b.explicit;
+        if (containsName(installed_here, b.backend)) if (after) |a| for (a.backends) |ab| {
+            if (std.mem.eql(u8, ab.backend, b.backend)) installed = ab.explicit;
+        };
+        const ids = try mox.packages.seen.next(ctx.alloc, loaded.seen.of(b.backend) orelse &.{}, b.declared_ids, b.desired_ids, installed);
+        // Nothing to write and nothing there to empty: the identity need
+        // not be read for it.
+        if (ids.len == 0 and !state.exists) continue;
+        const owner = try machine.owner() orelse {
+            if (try machine.failureNote()) |note| try ctx.out.print("  note            {s}\n", .{note});
+            return;
+        };
+        mox.packages.seen.replace(ctx.alloc, ctx.io, context.paths.state_dir, b.backend, &owner, ids) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            try ctx.err.print("mox apply: {s}: the record of the packages this machine held could not be written: {s}\n", .{ b.backend, @errorName(e) });
+            try ctx.err.flush();
+        };
+    }
 }
 
 /// Hand `rows` to `backend` in one batch and count what came of it.
@@ -1511,7 +1595,9 @@ fn installRows(
 
 /// Ask each backend in `backends` again what it holds, and hand back to its
 /// install every desired row it held when `before` was taken and holds no
-/// longer.
+/// longer. Returns that read, or null when it could not be made. It puts no
+/// record in effect: a row `before` judged removed is not one an install
+/// unrecorded, and reads as missing here.
 fn restoreRegressed(
     ctx: *app.Ctx,
     pkg_backends: *app.PackageBackends,
@@ -1521,7 +1607,7 @@ fn restoreRegressed(
     before: mox.packages.report.Report,
     backends: []const []const u8,
     counts: *PackageCounts,
-) !void {
+) !?mox.packages.report.Report {
     var diag: mox.packages.manifest.Diag = .{};
     const after = mox.packages.report.fromManifest(ctx.alloc, manifest, registry, bindings, &.{}, .reconcile, .none, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -1531,7 +1617,7 @@ fn restoreRegressed(
                 .{diag.capture() orelse mox.packages.exec.errorText(e)},
             );
             try ctx.err.flush();
-            return;
+            return null;
         },
     };
     // A backend the second report could not read is said by name: the rows
@@ -1557,6 +1643,7 @@ fn restoreRegressed(
         for (before.backends) |prev| {
             if (!std.mem.eql(u8, prev.backend, b.backend)) continue;
             for (prev.drift.missing) |m| try was_missing.put(m.id, {});
+            for (prev.drift.removed) |m| try was_missing.put(m.id, {});
         }
         var rows: std.ArrayList(mox.packages.manifest.Row) = .empty;
         for (b.drift.missing) |m| {
@@ -1566,6 +1653,7 @@ fn restoreRegressed(
         }
         if (rows.items.len > 0) try installRows(ctx, pkg_backends, backend, b.backend, rows.items, counts);
     }
+    return after;
 }
 
 fn containsName(names: []const []const u8, name: []const u8) bool {
@@ -3029,7 +3117,7 @@ pub const command = app.command(Spec, .{
     .name = "apply",
     .usage = "mox apply [--flags] [<paths...>]",
     .summary = "Compose all managed files and write to live paths",
-    .details = "Never prompts about drift. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent. Exit 0 clean, 1 drift or an astray package left for a decision, 2 a genuine failure.",
+    .details = "Never prompts about drift. --dry-run: report only; --overwrite: write through drifted files, scoped to any paths given; --skip-scripts: compose and write files, run no scripts, install no packages. A repo with a data/packages/ manifest has every package it declares and this machine lacks installed, after bootstrapping any declared manager that is absent; one this machine held and lost is left uninstalled for mox commit to settle. Exit 0 clean, 1 drift, or an astray or removed package left for a decision, 2 a genuine failure.",
     .group = .general,
     .needs_context = true,
 }, run);

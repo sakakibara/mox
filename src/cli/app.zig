@@ -78,6 +78,10 @@ pub var elevation_override: ?mox.packages.admin.Elevation = null;
 /// What refreshes a cached sudo timestamp during a run, when it should not
 /// be a real `sudo -n -v`. Null means real.
 pub var admin_refresh_override: ?mox.packages.admin.Refresh = null;
+/// This machine's identity, when it should not be read from the OS: the
+/// test harness names one, so a record is filed under the same owner on
+/// every machine running the suite. Null means read it.
+pub var identity_override: ?mox.packages.seen.Identity = null;
 
 /// How a step needing administrator access may get it on this run.
 pub fn elevation() mox.packages.admin.Elevation {

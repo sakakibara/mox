@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const apply_write = @import("../apply/write.zig");
 const backend = @import("backend.zig");
 const exec = @import("exec.zig");
+const report = @import("report.zig");
 
 const Io = std.Io;
 const EnvironMap = std.process.Environ.Map;
@@ -261,6 +262,166 @@ pub fn replace(arena: std.mem.Allocator, io: Io, state_dir: []const u8, backend_
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
+}
+
+/// This machine's owner, read at most once a run and only when first asked:
+/// a run with no record on disk and nothing to write never asks the OS.
+pub const Machine = struct {
+    arena: std.mem.Allocator,
+    io: Io,
+    runner: exec.Runner,
+    env: ?*const EnvironMap,
+    /// The identity to use instead of reading the OS's: a test's.
+    fixed: ?Identity = null,
+    got: ?Identity = null,
+    noted: bool = false,
+
+    /// The owner records are filed under, or null when the identity could
+    /// not be read.
+    pub fn owner(self: *Machine) !?[owner_len]u8 {
+        if (self.got == null) self.got = self.fixed orelse try readIdentity(self.arena, self.io, self.runner, self.env);
+        return switch (self.got.?) {
+            .known => |id| ownerOf(id),
+            .failed => null,
+        };
+    }
+
+    /// What to say about a failed identity read, the first time only.
+    pub fn failureNote(self: *Machine) !?[]const u8 {
+        const got = self.got orelse return null;
+        if (got != .failed or self.noted) return null;
+        self.noted = true;
+        return try std.fmt.allocPrint(self.arena, "this machine's identity could not be read ({s}), so no record of the packages it held is used or written", .{got.failed});
+    }
+};
+
+/// The records a run puts in effect, and which it may write back.
+pub const Loaded = struct {
+    /// For `report.fromManifest`.
+    seen: report.Seen = .none,
+    /// What could not be used, each said once.
+    notes: []const []const u8 = &.{},
+    /// One per backend that answers `present`.
+    backends: []const State = &.{},
+
+    pub const State = struct {
+        backend: []const u8,
+        /// The identity was read, or did not need to be, and the record is
+        /// neither a newer mox's nor unreadable.
+        writable: bool,
+        /// A record file is there for this machine.
+        exists: bool = false,
+    };
+
+    pub fn stateOf(self: Loaded, name: []const u8) ?State {
+        for (self.backends) |s| if (std.mem.eql(u8, s.backend, name)) return s;
+        return null;
+    }
+};
+
+/// Read the record of every backend in `backends` that answers `present`,
+/// and put in effect each that holds ids and is not in `exclude` (the
+/// backends this run bootstrapped). The identity is read only when the
+/// records directory holds a file for one of them: with none there, every
+/// record is absent whoever the machine is. A record that is unusable is
+/// writable, so the next write replaces it; one a newer mox wrote, or one
+/// that could not be read at all, is neither in effect nor writable.
+pub fn load(
+    arena: std.mem.Allocator,
+    io: Io,
+    state_dir: []const u8,
+    machine: *Machine,
+    backends: []const backend.Backend,
+    exclude: []const []const u8,
+) !Loaded {
+    var states: std.ArrayList(Loaded.State) = .empty;
+    var records: std.ArrayList(report.Seen.Record) = .empty;
+    var notes: std.ArrayList([]const u8) = .empty;
+
+    const any = try anyRecord(arena, io, state_dir, backends);
+    const owner: ?[owner_len]u8 = if (any) try machine.owner() else null;
+    if (try machine.failureNote()) |n| try notes.append(arena, n);
+
+    for (backends) |b| {
+        if (!b.canTellPresent()) continue;
+        if (!any) {
+            try states.append(arena, .{ .backend = b.name, .writable = true });
+            continue;
+        }
+        const o = owner orelse {
+            try states.append(arena, .{ .backend = b.name, .writable = false });
+            continue;
+        };
+        const got = read(arena, io, state_dir, b.name, &o) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: the record of the packages this machine held could not be read ({s}); it is neither used nor written", .{ b.name, @errorName(e) }));
+            try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
+            continue;
+        };
+        switch (got) {
+            .absent => try states.append(arena, .{ .backend = b.name, .writable = true }),
+            .ids => |ids| {
+                try states.append(arena, .{ .backend = b.name, .writable = true, .exists = true });
+                if (!contains(exclude, b.name)) try records.append(arena, .{ .backend = b.name, .ids = ids });
+            },
+            .unusable => |why| {
+                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: the record of the packages this machine held is unusable ({s}); it is not used, and apply replaces it", .{ b.name, why }));
+                try states.append(arena, .{ .backend = b.name, .writable = true, .exists = true });
+            },
+            .newer => {
+                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: the record of the packages this machine held was written by a newer mox; upgrade mox", .{b.name}));
+                try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
+            },
+        }
+    }
+    return .{
+        .seen = .{ .records = try records.toOwnedSlice(arena) },
+        .notes = try notes.toOwnedSlice(arena),
+        .backends = try states.toOwnedSlice(arena),
+    };
+}
+
+/// Whether the records directory holds a file named for one of `backends`
+/// that answers `present`, for any owner. A directory that cannot be listed
+/// is taken to hold one, so each record's own read says what is wrong.
+fn anyRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, backends: []const backend.Backend) !bool {
+    const dir_path = try std.fs.path.join(arena, &.{ state_dir, dir_name });
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return true) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".txt")) continue;
+        for (backends) |b| {
+            if (!b.canTellPresent()) continue;
+            if (entry.name.len == b.name.len + 1 + owner_len + ".txt".len and
+                std.mem.startsWith(u8, entry.name, b.name) and entry.name[b.name.len] == '-') return true;
+        }
+    }
+    return false;
+}
+
+fn contains(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// What a backend's record holds after a run: what it held and some row
+/// still declares, under any gate, plus what is desired here and verified
+/// installed. `held` is the record that was in effect, empty when none was.
+pub fn next(
+    arena: std.mem.Allocator,
+    held: []const []const u8,
+    declared: []const []const u8,
+    desired: []const []const u8,
+    installed: []const []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (held) |id| if (contains(declared, id)) try out.append(arena, id);
+    for (desired) |id| if (contains(installed, id) and !contains(out.items, id)) try out.append(arena, id);
+    return out.toOwnedSlice(arena);
 }
 
 const testing = std.testing;
@@ -533,4 +694,120 @@ test "windowsIdentity: no SystemRoot, a spawn failure, a timeout, a nonzero exit
         try testing.expect(got == .failed);
         try testing.expect(std.mem.startsWith(u8, got.failed, "C:\\Windows\\System32\\reg.exe"));
     }
+}
+
+const test_backend = @import("test_backend.zig");
+
+fn testMachine(a: std.mem.Allocator, identity: Identity) Machine {
+    return .{ .arena = a, .io = testing.io, .runner = undefined, .env = null, .fixed = identity };
+}
+
+test "load: with no record on disk the identity is never read, and every backend that answers present is writable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    var plug: test_backend.Fake = .{ .name = "plug", .tells_present = false };
+    var machine = testMachine(a, .{ .failed = "unreadable" });
+
+    const got = try load(a, testing.io, state, &machine, &.{ brew.backend(), plug.backend() }, &.{});
+    try testing.expect(machine.got == null);
+    try testing.expectEqual(@as(usize, 0), got.notes.len);
+    try testing.expectEqual(@as(usize, 0), got.seen.records.len);
+    try testing.expectEqual(@as(usize, 1), got.backends.len);
+    try testing.expect(got.stateOf("brew").?.writable);
+    try testing.expect(!got.stateOf("brew").?.exists);
+    try testing.expect(got.stateOf("plug") == null);
+}
+
+test "load: this machine's record is in effect unless excluded, and another machine's file is not this one's" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    var apt: test_backend.Fake = .{ .name = "apt" };
+    try replace(a, io, state, "brew", &ownerOf("machine-a"), &.{"ripgrep"});
+    try replace(a, io, state, "apt", &ownerOf("machine-b"), &.{"fd"});
+
+    var machine = testMachine(a, .{ .known = "machine-a" });
+    const got = try load(a, io, state, &machine, &.{ brew.backend(), apt.backend() }, &.{});
+    try testing.expectEqualStrings("ripgrep", got.seen.of("brew").?[0]);
+    try testing.expect(got.seen.of("apt") == null);
+    try testing.expect(got.stateOf("brew").?.exists);
+    try testing.expect(!got.stateOf("apt").?.exists);
+    try testing.expect(got.stateOf("apt").?.writable);
+
+    var again = testMachine(a, .{ .known = "machine-a" });
+    const excluded = try load(a, io, state, &again, &.{ brew.backend(), apt.backend() }, &.{"brew"});
+    try testing.expect(excluded.seen.of("brew") == null);
+    try testing.expect(excluded.stateOf("brew").?.writable);
+}
+
+test "load: a failed identity read puts nothing in effect, makes nothing writable, and is said once" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    var apt: test_backend.Fake = .{ .name = "apt" };
+    try replace(a, io, state, "brew", &ownerOf("machine-a"), &.{"ripgrep"});
+
+    var machine = testMachine(a, .{ .failed = "ioreg exited 1" });
+    const got = try load(a, io, state, &machine, &.{ brew.backend(), apt.backend() }, &.{});
+    try testing.expectEqual(@as(usize, 0), got.seen.records.len);
+    try testing.expectEqual(@as(usize, 1), got.notes.len);
+    try testing.expect(std.mem.indexOf(u8, got.notes[0], "ioreg exited 1") != null);
+    try testing.expect(!got.stateOf("brew").?.writable);
+    try testing.expect(!got.stateOf("apt").?.writable);
+    try testing.expect(try machine.failureNote() == null);
+}
+
+test "load: an unusable record is said and writable, a newer one is said as a newer mox's and not writable, an unreadable one neither" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    const owner = ownerOf("machine-a");
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    var apt: test_backend.Fake = .{ .name = "apt" };
+    var dnf: test_backend.Fake = .{ .name = "dnf" };
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ state, dir_name }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try path(a, state, "brew", &owner), .data = "mox-seen 1\nnot an id\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try path(a, state, "apt", &owner), .data = "mox-seen 2\nfd\n" });
+    try Io.Dir.cwd().createDirPath(io, try path(a, state, "dnf", &owner));
+
+    var machine = testMachine(a, .{ .known = "machine-a" });
+    const got = try load(a, io, state, &machine, &.{ brew.backend(), apt.backend(), dnf.backend() }, &.{});
+    try testing.expectEqual(@as(usize, 0), got.seen.records.len);
+    try testing.expectEqual(@as(usize, 3), got.notes.len);
+    try testing.expect(std.mem.indexOf(u8, got.notes[0], "brew: ") != null and std.mem.indexOf(u8, got.notes[0], "unusable (line 2 is not a package id)") != null);
+    try testing.expect(std.mem.endsWith(u8, got.notes[1], "written by a newer mox; upgrade mox"));
+    try testing.expect(std.mem.indexOf(u8, got.notes[2], "dnf: ") != null and std.mem.indexOf(u8, got.notes[2], "could not be read") != null);
+    try testing.expect(got.stateOf("brew").?.writable);
+    try testing.expect(!got.stateOf("apt").?.writable);
+    try testing.expect(!got.stateOf("dnf").?.writable);
+}
+
+test "next: what was held and is still declared, plus what is desired and installed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const got = try next(a, &.{ "gated", "dropped", "kept" }, &.{ "gated", "kept", "new", "absent" }, &.{ "kept", "new", "absent" }, &.{ "kept", "new", "undeclared" });
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqualStrings("gated", got[0]);
+    try testing.expectEqualStrings("kept", got[1]);
+    try testing.expectEqualStrings("new", got[2]);
 }
