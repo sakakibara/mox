@@ -25,6 +25,12 @@ pub const Encoder = struct {
     lenient: bool,
     captures: u32 = 0,
     refused: ?Refused = null,
+    /// Values written into YAML plain scalars, checked once each scalar is
+    /// whole: `finish` asks whether the scalar reads back as a string.
+    plain: std.ArrayList(Plain) = .empty,
+    plain_arena: ?std.mem.Allocator = null,
+
+    const Plain = struct { capture: []const u8, start: usize, len: usize };
 
     pub fn init(kind: root.Kind, buf: *const std.ArrayList(u8), lenient: bool) Encoder {
         return .{ .tracker = root.Tracker.init(kind), .buf = buf, .lenient = lenient };
@@ -62,6 +68,10 @@ pub const Encoder = struct {
                 return value;
             },
         };
+        if (ctx.enc == .yaml_plain and !e.lenient) {
+            try e.plain.append(arena, .{ .capture = capture, .start = e.buf.items.len + line.len, .len = bytes.len });
+            e.plain_arena = arena;
+        }
         // The re-lex: the encoded value must leave the context as it was.
         var after = e.tracker;
         after.feed(bytes);
@@ -108,6 +118,77 @@ pub const Encoder = struct {
     pub fn finish(e: *Encoder) ?[]const u8 {
         e.catchUp("");
         if (e.lenient or e.captures == 0) return null;
-        return e.tracker.finish();
+        const why = e.tracker.finish();
+        if (why == null) e.checkPlain();
+        return why;
+    }
+
+    /// Refuse the first value whose YAML plain scalar, as written with the
+    /// text around it, would not read back as a string: the check is on the
+    /// whole scalar a reader sees, not on the value alone.
+    fn checkPlain(e: *Encoder) void {
+        if (e.plain.items.len == 0) return;
+        const arena = e.plain_arena orelse return;
+        const text = e.buf.items;
+        const where = encode_mod.name(.yaml_plain);
+        const spans = root.yaml.plainScalars(arena, text) catch
+            return e.noteAt(e.plain.items[0].capture, e.plain.items[0].start, .{ .where = where, .reason = "mox ran out of memory checking it", .remedy = "try again" });
+        for (e.plain.items) |p| {
+            if (root.yaml.plainValueProblem(spans, text, p.start, p.len)) |why|
+                e.noteAt(p.capture, p.start, .{ .where = where, .reason = why, .remedy = "quote it in the source" });
+        }
     }
 };
+
+/// Whether `value`, written at the end of `prefix` with `suffix` after it in
+/// a YAML file, is refused.
+fn yamlRefused(prefix: []const u8, value: []const u8, suffix: []const u8) !bool {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    var e = Encoder.init(.yaml, &buf, false);
+    const bytes = try e.encodeAt(a, prefix, "c", value, null);
+    try buf.appendSlice(a, prefix);
+    try buf.appendSlice(a, bytes);
+    try buf.appendSlice(a, suffix);
+    _ = e.finish();
+    return e.refused != null;
+}
+
+test "encoder: a YAML plain value is judged by the whole scalar it lands in" {
+    for ([_][3][]const u8{
+        .{ "key: ", "10080", "\n" },
+        .{ "key: ", "yes", "\n" },
+        .{ "key: ", "yEs", "\n" },
+        .{ "key: ", "1st", "\n" },
+        .{ "key: ", "0123", "\n" },
+        .{ "key: ", ":sym", "\n" },
+        .{ "key: ", "", "\n" },
+        .{ "key: 1", "st", "\n" },
+        .{ "key: -", "5", "\n" },
+        .{ "key: ", "y", "es # c\n" },
+        .{ "- ", "true", "\n" },
+        .{ "{a: ", "yes", "}\n" },
+        .{ "l: [", "?x", "]\n" },
+        .{ "m: {", "?x", ": 1}\n" },
+        .{ "l: [", "a:b", "]\n" },
+        .{ "l: [", "x?y", "]\n" },
+        .{ "l: [x", "?", "y]\n" },
+        .{ "", "k" ** 1025, ": v\n" },
+    }) |c| try std.testing.expect(try yamlRefused(c[0], c[1], c[2]));
+    for ([_][3][]const u8{
+        .{ "key: ", "en_US.UTF-8", "\n" },
+        .{ "key: ", "Asia/Tokyo", "\n" },
+        .{ "key: hello ", "yes", "\n" },
+        .{ "key: abc", "", "\n" },
+        .{ "key: v", "1.2.3", " # c\n" },
+        .{ "- ", "darwin", "\n" },
+        .{ "{a: ", "darwin", "}\n" },
+        .{ "key: abc ", "", "\n" },
+        .{ "key: abc ", "", " # c\n" },
+        .{ "key: ", "?x", "\n" },
+        .{ "", "k" ** 1024, ": v\n" },
+        .{ "key: ", "k" ** 1025, "\n" },
+    }) |c| try std.testing.expect(!try yamlRefused(c[0], c[1], c[2]));
+}

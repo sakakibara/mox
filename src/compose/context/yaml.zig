@@ -3,6 +3,7 @@
 //! collections, enough to name the encoding of a capture's position.
 
 const std = @import("std");
+const yaml = @import("yaml");
 const types = @import("types.zig");
 
 const Context = types.Context;
@@ -143,6 +144,10 @@ pub const Tracker = struct {
             .sq => "an unclosed single-quoted scalar",
             else => if (t.flow > 0) "an unclosed flow collection" else null,
         };
+    }
+
+    fn inPlain(t: *const Tracker) bool {
+        return t.mode == .plain or t.mode == .plain_ws or t.mode == .plain_colon;
     }
 
     fn step(t: *Tracker, b: u8) void {
@@ -437,6 +442,60 @@ fn encOf(text: []const u8) types.Encoding {
     return ctxOf(text).enc;
 }
 
+/// A plain scalar in a text: its bytes `text[start..end]`, the blanks after
+/// it up to `ws_end`, whether it sits in a flow collection, and whether it
+/// is an implicit key (it ends at a key's `:`).
+pub const Span = struct { start: usize, end: usize, ws_end: usize, flow: bool, key: bool };
+
+/// The plain scalars of `text`, in order, as the tracker reads them: each
+/// ends at a line break, a comment, a key's `:` or a flow indicator.
+pub fn plainScalars(arena: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]Span {
+    var out: std.ArrayList(Span) = .empty;
+    var t: Tracker = .{};
+    var tok_start: usize = 0;
+    var cur: Span = .{ .start = 0, .end = 0, .ws_end = 0, .flow = false, .key = false };
+    for (text, 0..) |b, i| {
+        const was_plain = t.inPlain();
+        const was_pending = t.mode == .pending;
+        const was_colon = t.mode == .plain_colon;
+        if (!was_plain and !was_pending) tok_start = i;
+        t.step(b);
+        const now_plain = t.inPlain();
+        if (now_plain and !was_plain) {
+            cur.start = if (was_pending) tok_start else i;
+            cur.end = if (was_pending and t.mode == .plain_colon) i else cur.start;
+            cur.flow = t.flow > 0;
+        }
+        if (now_plain and t.mode == .plain and !isBlank(b) and b != '\r') cur.end = i + 1;
+        if (now_plain and was_colon and t.mode == .plain) cur.end = i + 1;
+        if (was_plain and !now_plain) {
+            cur.ws_end = i;
+            cur.key = was_colon;
+            try out.append(arena, cur);
+        }
+    }
+    if (t.inPlain()) {
+        cur.ws_end = text.len;
+        cur.key = false;
+        try out.append(arena, cur);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Why a value written at `text[at..][0..len]`, in a plain scalar, would not
+/// read back as a string with the text around it, or null. `spans` are
+/// `plainScalars(text)`.
+pub fn plainValueProblem(spans: []const Span, text: []const u8, at: usize, len: usize) ?[]const u8 {
+    for (spans) |sp| {
+        if (sp.start <= at and at + len <= sp.ws_end) {
+            if (len > 0 and at + len > sp.end) return "it would change what follows it";
+            if (sp.start == sp.end) break;
+            return if (yaml.isPlainSafe(text[sp.start..sp.end], .{ .flow = sp.flow, .key = sp.key })) null else "with the text around it, a YAML reader would not read the scalar as this string";
+        }
+    }
+    return "it leaves the value empty, which YAML reads as null";
+}
+
 /// Whether feeding `value` after `prefix` leaves the state as it was.
 fn keeps(prefix: []const u8, value: []const u8) bool {
     var t = after(prefix);
@@ -640,4 +699,20 @@ test "the tracker is a value type" {
     a.feed("x\"");
     try testing.expectEqual(types.Encoding.yaml_dq, b.context().enc);
     try testing.expect(a.context().refuse != null);
+}
+
+test "plain scalars: spans end at a line break, a comment, a key's colon or a flow indicator" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const text = "key: hello world  # c\nurl: http://x:1\n- -5\n{a: b, c: d}\nend";
+    const spans = try plainScalars(a, text);
+    var got: std.ArrayList([]const u8) = .empty;
+    for (spans) |sp| try got.append(a, text[sp.start..sp.end]);
+    try testing.expect(!spans[0].flow and spans[5].flow);
+    try testing.expect(spans[0].key and !spans[1].key and spans[5].key and !spans[6].key);
+    try testing.expectEqualStrings("hello world  ", text[spans[1].start..spans[1].ws_end]);
+    const want = [_][]const u8{ "key", "hello world", "url", "http://x:1", "-5", "a", "b", "c", "d", "end" };
+    try testing.expectEqual(want.len, got.items.len);
+    for (want, got.items) |w, g| try testing.expectEqualStrings(w, g);
 }

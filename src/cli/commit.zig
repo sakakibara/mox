@@ -7168,7 +7168,17 @@ fn interpolatedRoute(
     // A fact's value is encoded for its context; a default is template text,
     // spliced as written.
     const at = lexical.contextAfter(kind, try std.mem.concat(arena, u8, &.{ preceding, new_line[0..cap.at] }));
-    const value = try lexical.encode.decode(arena, cap.value, at);
+    const value = value: {
+        const v = (try lexical.encode.decode(arena, cap.value, at)) orelse break :value null;
+        // A YAML plain value is judged with the scalar it sits in, as compose
+        // judges it.
+        if (kind == .yaml and at.enc == .yaml_plain) {
+            const text = try std.mem.concat(arena, u8, &.{ preceding, new_line });
+            const spans = try lexical.yaml.plainScalars(arena, text);
+            if (lexical.yaml.plainValueProblem(spans, text, preceding.len + cap.at, cap.value.len) != null) break :value null;
+        }
+        break :value v;
+    };
     // A name or value `persist` would refuse (a control character, or a name
     // that is not a valid TOML bare key) must never reach the write phase:
     // caught here, before any [f]/[d] choice is offered, so the hunk can only

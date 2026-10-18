@@ -13,8 +13,8 @@
             .hash = "json-0.3.0-YtF7JetzBwAFwsuTXCOdDJweONb0496nU39LEU8EC1rk",
         },
         .yaml = .{
-            .url = "https://github.com/sakakibara/yaml-zig/archive/refs/tags/v0.4.0.tar.gz",
-            .hash = "yaml-0.4.0-MIhruAM0DACwZy0OjnLmCJk0lNXds6_XmHfZBYSgrLnG",
+            .url = "https://github.com/sakakibara/yaml-zig/archive/refs/tags/v0.5.1.tar.gz",
+            .hash = "yaml-0.5.1-MIhruG1tDQDxdYRLkNeEhP7i6qStuGzCPIoHbp9H4k2M",
         },
         .cli = .{
             .url = "https://github.com/sakakibara/cli-zig/archive/refs/tags/v0.3.0.tar.gz",

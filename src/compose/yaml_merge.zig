@@ -216,3 +216,17 @@ test "yaml merge: exact block-style emit" {
     ;
     try std.testing.expectEqualStrings(expected, aw.written());
 }
+
+test "yaml merge: a string a YAML 1.1 reader would read as another type stays quoted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const base = try yaml.parse(a, "enabled: \"yes\"\nport: \"0123\"\nos: darwin\n", .{});
+    const overlay = try yaml.parse(a, "rank: \"1st\"\n", .{});
+    const merged = try deepMerge(a, base, overlay);
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try yaml.emit(&aw.writer, merged, .{});
+    try std.testing.expectEqualStrings("enabled: \"yes\"\nport: \"0123\"\nos: darwin\nrank: \"1st\"\n", aw.written());
+}

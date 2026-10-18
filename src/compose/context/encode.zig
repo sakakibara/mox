@@ -49,10 +49,7 @@ pub fn encode(arena: std.mem.Allocator, value: []const u8, ctx: Context) !Result
             refuse(.yaml_sq, "it holds a line break", "use a block scalar")
         else
             .{ .bytes = try doubled(arena, value, "'") },
-        .yaml_plain => if (yamlPlainProblem(value)) |why|
-            refuse(.yaml_plain, why, "quote it in the source")
-        else
-            .{ .bytes = value },
+        .yaml_plain => .{ .bytes = value },
         .yaml_block => if (hasYamlBreak(value))
             refuse(.yaml_block, "it holds U+0085, U+2028 or U+2029", "use a double-quoted scalar")
         else
@@ -548,30 +545,6 @@ fn yamlDq(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Why `value` cannot stand as one YAML plain scalar that both a YAML 1.1
-/// and a YAML 1.2 core reader take as this string, or null.
-fn yamlPlainProblem(value: []const u8) ?[]const u8 {
-    if (value.len == 0) return "it is empty";
-    if (hasNewline(value) or hasYamlBreak(value)) return "it holds a line break";
-    if (value[0] == ' ' or value[0] == '\t' or value[value.len - 1] == ' ' or value[value.len - 1] == '\t') return "it starts or ends with a space";
-    if (std.mem.indexOfScalar(u8, "-?:,[]{}#&*!|>'\"%@`", value[0]) != null) return "it starts with a YAML indicator";
-    if (std.mem.indexOf(u8, value, ": ") != null or std.mem.indexOf(u8, value, " #") != null or value[value.len - 1] == ':') return "it holds `: ` or ` #`";
-    if (yamlNonString(value)) return "a YAML reader would not read it as a string";
-    return null;
-}
-
-/// True when a YAML 1.1 or core reader resolves the plain scalar `value`
-/// to something other than a string: null, a boolean, a number, a date.
-fn yamlNonString(value: []const u8) bool {
-    const words = [_][]const u8{ "~", "null", "y", "yes", "n", "no", "true", "false", "on", "off", "=", "<<" };
-    for (words) |w| if (std.ascii.eqlIgnoreCase(value, w)) return true;
-    const body = if (value[0] == '+' or value[0] == '-') value[1..] else value;
-    for ([_][]const u8{ ".inf", ".nan" }) |w| if (std.ascii.eqlIgnoreCase(body, w)) return true;
-    // Numbers in any base, sexagesimal numbers and dates use only these.
-    for (value) |c| if (!(std.ascii.isHex(c) or std.mem.indexOfScalar(u8, "+-._:xXoO", c) != null)) return false;
-    return std.ascii.isDigit(body[0]) or (body.len > 1 and body[0] == '.' and std.ascii.isDigit(body[1]));
-}
-
 /// `value` with every line after the first indented by `n` spaces. A block
 /// scalar's own line break ends the value, so a value's one trailing newline
 /// is not written twice.
@@ -682,15 +655,13 @@ test "encode: TOML basic strings escape quotes, backslashes and controls; litera
     try testing.expect((try encode(a, "a b", .{ .enc = .toml_bare_key })) == .refused);
 }
 
-test "encode: YAML double quotes escape line separators; plain scalars refuse what would not read back as this string" {
+test "encode: YAML double quotes escape line separators; plain values are written as they are and checked as a whole scalar by the encoder" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try testing.expectEqualStrings("a\\Lb\\\"", bytesOf(try encode(a, "a\u{2028}b\"", .{ .enc = .yaml_dq })));
     try testing.expectEqualStrings("it''s", bytesOf(try encode(a, "it's", .{ .enc = .yaml_sq })));
-    for ([_][]const u8{ "10080", "true", "No", "null", "~", "0123", ".inf", "-.Inf", "1:20", "2026-10-18", "a: b", "x #y", "#x", "", " a" }) |v|
-        try testing.expect((try encode(a, v, .{ .enc = .yaml_plain })) == .refused);
-    for ([_][]const u8{ "en_US.UTF-8", "Asia/Tokyo", "hello world", "v1.2.3", "abc" }) |v|
+    for ([_][]const u8{ "en_US.UTF-8", "Asia/Tokyo", "yes", "" }) |v|
         try testing.expectEqualStrings(v, bytesOf(try encode(a, v, .{ .enc = .yaml_plain })));
     try testing.expectEqualStrings("l1\n    l2", bytesOf(try encode(a, "l1\nl2\n", .{ .enc = .yaml_block, .indent = 4 })));
     try testing.expect((try encode(a, "a\u{85}b", .{ .enc = .yaml_block, .indent = 2 })) == .refused);
