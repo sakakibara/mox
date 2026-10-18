@@ -1,15 +1,22 @@
-//! Appending a reconciled row to a manifest file.
+//! Writing reconciled rows to a manifest file.
 //!
-//! An append, never an edit: the new block goes at the end of the file, so
-//! every existing byte -- comments, ordering, spacing, a row someone is
-//! mid-thought on -- is preserved exactly. toml-zig's document editors refuse
-//! array-of-tables paths anyway, and a whole-array rewrite would re-emit the
-//! list canonically and drop its comments.
+//! A new row is an append, never an edit: the block goes at the end of the
+//! file, so every existing byte -- comments, ordering, spacing, a row someone
+//! is mid-thought on -- is preserved exactly. toml-zig's document editors
+//! refuse array-of-tables paths anyway, and a whole-array rewrite would
+//! re-emit the list canonically and drop its comments.
+//!
+//! Removing a row, or gating it off one machine, splices only that row's own
+//! lines, found through the lossless item scan. The edited bytes are loaded
+//! back and must equal the original but for that one change before anything
+//! is written.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const toml = @import("toml");
 
 const apply_write = @import("../apply/write.zig");
+const partial = @import("../apply/partial.zig");
 const axis = @import("../dsl/axis.zig");
 const resolver_mod = @import("../dsl/resolver.zig");
 const backend_mod = @import("backend.zig");
@@ -228,10 +235,10 @@ pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, header: [
 /// filesystem may refuse the lock anywhere; the append then runs as it would
 /// with no lock at all, where the per-writer staging path still keeps the two
 /// rewrites out of one inode and leaves at most a dropped row.
-const DirLock = struct {
+pub const DirLock = struct {
     file: ?Io.File,
 
-    fn acquire(io: Io, dir_path: []const u8) DirLock {
+    pub fn acquire(io: Io, dir_path: []const u8) DirLock {
         if (builtin.os.tag == .windows) return .{ .file = null };
         Io.Dir.cwd().createDirPath(io, dir_path) catch {};
         const f = Io.Dir.cwd().openFile(io, dir_path, .{}) catch return .{ .file = null };
@@ -242,12 +249,276 @@ const DirLock = struct {
         return .{ .file = f };
     }
 
-    fn release(self: DirLock, io: Io) void {
+    pub fn release(self: DirLock, io: Io) void {
         const f = self.file orelse return;
         f.unlock(io);
         f.close(io);
     }
 };
+
+/// What came of editing a row in place.
+pub const Edit = union(enum) {
+    /// The file holds the change.
+    written,
+    /// The file was left as it was, and why, for the user to act on.
+    left: []const u8,
+};
+
+const RowChange = union(enum) {
+    remove,
+    /// Gate the row off the machine of this `machine` axis value.
+    keep_off: []const u8,
+};
+
+/// Delete `row`'s `[[packages]]` element from the file it came from, for
+/// every machine: its header through its last key, comments between its keys
+/// included. Lines before the header and after the last key stay; where that
+/// leaves two blank lines meeting, one goes.
+pub fn removeRow(arena: std.mem.Allocator, io: Io, row: manifest_mod.Row) !Edit {
+    return editRow(arena, io, row, .remove);
+}
+
+/// Gate `row` off the machine whose `machine` axis value is `machine`, on
+/// the element's own `when`: `not machine="<m>"`, or `(<W>) and not
+/// machine="<m>"` around the `when` it has. A new `when` line goes directly
+/// after the `name` line, in that line's line ending; an existing one is
+/// replaced in place, keeping its trailing comment.
+pub fn setWhen(arena: std.mem.Allocator, io: Io, row: manifest_mod.Row, machine: []const u8) !Edit {
+    return editRow(arena, io, row, .{ .keep_off = machine });
+}
+
+/// `row`'s element in `row.origin`, located by content in the file as it is
+/// now, changed in memory, loaded back and compared, then written atomically
+/// through any symlink, all under the manifest directory's lock so that no
+/// other writer's change is lost between the read and the write.
+fn editRow(arena: std.mem.Allocator, io: Io, row: manifest_mod.Row, change: RowChange) !Edit {
+    const path = try resolveLinks(arena, io, row.origin);
+    const guard = DirLock.acquire(io, std.fs.path.dirname(path) orelse ".");
+    defer guard.release(io);
+    const content = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(manifest_mod.max_file_bytes)) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .left = try std.fmt.allocPrint(arena, "it could not be read ({s})", .{@errorName(e)}) },
+    };
+
+    var diag: manifest_mod.Diag = .{};
+    const original = manifest_mod.loadFile(arena, row.origin, row.label, false, content, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .left = try std.fmt.allocPrint(arena, "it no longer loads: {s}", .{diag.capture() orelse @errorName(e)}) },
+    };
+    const scan = partial.tomlScan(arena, content) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .left = "it could not be scanned line by line; edit it by hand" },
+    };
+    const items = scan.doc.items.items;
+
+    var headers: std.ArrayList(usize) = .empty;
+    for (items, 0..) |item, i| switch (item) {
+        .header => |h| if (h.is_array and isPackagesPath(h.path_segments)) try headers.append(arena, i),
+        .kv => |kv| if (scan.encl[i] == null and isPackagesPath(kv.full_path_segments))
+            return .{ .left = "its rows are written inline (packages = [...]), which mox does not edit; edit it by hand" },
+        else => {},
+    };
+    if (headers.items.len != original.packages.len)
+        return .{ .left = "its [[packages]] rows could not be told apart line by line; edit it by hand" };
+
+    var target: ?usize = null;
+    var matches: usize = 0;
+    for (original.packages, 0..) |r, k| {
+        if (!sameRow(r, row)) continue;
+        matches += 1;
+        target = k;
+    }
+    if (matches == 0) return .{ .left = "no row in it is the one reported any more" };
+    if (matches > 1) return .{ .left = try std.fmt.allocPrint(arena, "{d} rows in it match the one reported", .{matches}) };
+    const k = target.?;
+
+    const head = headers.items[k];
+    var past = head + 1;
+    while (past < items.len and items[past] != .header) past += 1;
+    var last: ?usize = null;
+    var name_at: ?usize = null;
+    var when_at: ?usize = null;
+    for (head + 1..past) |i| {
+        const kv = switch (items[i]) {
+            .kv => |kv| kv,
+            else => continue,
+        };
+        last = i;
+        if (isRowKey(kv.full_path_segments, "name")) name_at = i;
+        if (isRowKey(kv.full_path_segments, "when")) when_at = i;
+    }
+    // The loader refused an element without a name.
+    const end = last orelse return .{ .left = "its row has no keys to edit; edit it by hand" };
+
+    var out: std.ArrayList(u8) = .empty;
+    var new_when: ?[]const u8 = null;
+    switch (change) {
+        .remove => {
+            var resume_at = end + 1;
+            if (head > 0 and items[head - 1] == .blank and resume_at < items.len and items[resume_at] == .blank) resume_at += 1;
+            try out.appendSlice(arena, content[0..scan.offs[head]]);
+            if (resume_at < items.len) try out.appendSlice(arena, content[scan.offs[resume_at]..]);
+        },
+        .keep_off => |machine| {
+            const gate = try std.fmt.allocPrint(arena, "not machine=\"{s}\"", .{machine});
+            if (when_at) |w| {
+                const kv = items[w].kv;
+                const value = kv.raw[kv.value_offset..][0..kv.value_len];
+                if (std.mem.startsWith(u8, value, "\"\"\"") or std.mem.startsWith(u8, value, "'"))
+                    return .{ .left = "its \"when\" is a multi-line or literal string, which mox does not edit; edit it by hand" };
+                const own = ownWhen(scan.doc.parsed, k) orelse
+                    return .{ .left = "its \"when\" could not be read line by line; edit it by hand" };
+                const raw = try std.fmt.allocPrint(arena, "({s}) and {s}", .{ own, gate });
+                new_when = raw;
+                try out.appendSlice(arena, content[0..scan.offs[w]]);
+                try out.appendSlice(arena, kv.raw[0..kv.value_offset]);
+                try out.print(arena, "{f}", .{Quoted{ .s = raw }});
+                try out.appendSlice(arena, kv.raw[kv.value_offset + kv.value_len ..]);
+                try out.appendSlice(arena, content[scan.ends[w]..]);
+            } else {
+                const n = name_at orelse return .{ .left = "its row has no name line to follow; edit it by hand" };
+                new_when = gate;
+                const name_raw = items[n].rawBytes();
+                const ending = lineEnding(name_raw) orelse lineEnding(items[head].rawBytes()) orelse "\n";
+                try out.appendSlice(arena, content[0..scan.ends[n]]);
+                // A name line that ends the file gets its newline first; the
+                // new line then ends the file as the name line did, without one.
+                const at_eof = lineEnding(name_raw) == null;
+                if (at_eof) try out.appendSlice(arena, ending);
+                try out.print(arena, "when = {f}", .{Quoted{ .s = gate }});
+                if (!at_eof) try out.appendSlice(arena, ending);
+                try out.appendSlice(arena, content[scan.ends[n]..]);
+            }
+        },
+    }
+
+    var cand_diag: manifest_mod.Diag = .{};
+    const candidate = manifest_mod.loadFile(arena, row.origin, row.label, false, out.items, &cand_diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return .{ .left = try std.fmt.allocPrint(arena, "the edited file would not load ({s}); edit it by hand", .{cand_diag.capture() orelse @errorName(e)}) },
+    };
+    const expected_when: ?[]const u8 = if (new_when) |w|
+        manifest_mod.combineWhen(arena, original.sources[0].when, w) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return .{ .left = "the gate would be too deeply nested; edit it by hand" },
+        }
+    else
+        null;
+    if (!onlyChange(original, candidate, k, change, expected_when))
+        return .{ .left = "the edited file would change more than this row; edit it by hand" };
+
+    try apply_write.writeAtomic(io, path, out.items, try modeOf(io, path));
+    return .written;
+}
+
+fn isPackagesPath(segs: []const []const u8) bool {
+    return segs.len == 1 and std.mem.eql(u8, segs[0], "packages");
+}
+
+fn isRowKey(segs: []const []const u8, key: []const u8) bool {
+    return segs.len == 2 and std.mem.eql(u8, segs[0], "packages") and std.mem.eql(u8, segs[1], key);
+}
+
+/// The line ending `raw` closes with, or null when it ends the file.
+fn lineEnding(raw: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, raw, "\r\n")) return "\r\n";
+    if (std.mem.endsWith(u8, raw, "\n")) return "\n";
+    return null;
+}
+
+/// Element `k`'s own `when`, decoded, before the file gate is combined in.
+fn ownWhen(parsed: toml.Value, k: usize) ?[]const u8 {
+    if (parsed != .table) return null;
+    const arr = parsed.table.get("packages") orelse return null;
+    if (arr != .array or k >= arr.array.items.len) return null;
+    const el = arr.array.items[k];
+    if (el != .table) return null;
+    const w = el.table.get("when") orelse return null;
+    return if (w == .string) w.string else null;
+}
+
+/// The same package row as the loader reads it: name, backend, merged gate
+/// and adapter fields, in any key order. Where it sits is not compared, so a
+/// row moved by an edit between prompts is still found.
+fn sameRow(a: manifest_mod.Row, b: manifest_mod.Row) bool {
+    if (!std.mem.eql(u8, a.name, b.name) or !std.mem.eql(u8, a.backend, b.backend)) return false;
+    if (!optEql(a.when, b.when)) return false;
+    return sameFields(a.fields, b.fields);
+}
+
+fn sameFields(a: []const manifest_mod.Pair, b: []const manifest_mod.Pair) bool {
+    if (a.len != b.len) return false;
+    outer: for (a) |p| {
+        for (b) |q| {
+            if (std.mem.eql(u8, p.key, q.key)) {
+                if (!fieldEql(p.value, q.value)) return false;
+                continue :outer;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+fn fieldEql(a: manifest_mod.Field, b: manifest_mod.Field) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .string => |v| std.mem.eql(u8, v, b.string),
+        .int => |v| v == b.int,
+        .boolean => |v| v == b.boolean,
+        .strings => |vs| blk: {
+            if (vs.len != b.strings.len) break :blk false;
+            for (vs, b.strings) |x, y| if (!std.mem.eql(u8, x, y)) break :blk false;
+            break :blk true;
+        },
+    };
+}
+
+fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+/// Whether `candidate` is `original` with exactly `change` made to package
+/// row `k`: the file-level keys, every blacklist and bootstrap row, and every
+/// other package row equal, and row `k` gone or carrying `expected_when`.
+fn onlyChange(original: Manifest, candidate: Manifest, k: usize, change: RowChange, expected_when: ?[]const u8) bool {
+    const so = original.sources[0];
+    const sc = candidate.sources[0];
+    if (!optEql(so.default_backend, sc.default_backend) or !optEql(so.when, sc.when)) return false;
+
+    if (original.blacklist.len != candidate.blacklist.len) return false;
+    for (original.blacklist, candidate.blacklist) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.backend, y.backend) or !sameFields(x.fields, y.fields)) return false;
+    }
+    if (original.bootstrap.len != candidate.bootstrap.len) return false;
+    for (original.bootstrap, candidate.bootstrap) |x, y| {
+        if (!std.mem.eql(u8, x.backend, y.backend) or !std.mem.eql(u8, x.url, y.url) or
+            !std.mem.eql(u8, x.sha256, y.sha256) or !optEql(x.when, y.when)) return false;
+    }
+
+    switch (change) {
+        .remove => {
+            if (candidate.packages.len + 1 != original.packages.len) return false;
+            for (candidate.packages, 0..) |c, j| {
+                if (!sameRow(c, original.packages[if (j < k) j else j + 1])) return false;
+            }
+        },
+        .keep_off => {
+            if (candidate.packages.len != original.packages.len) return false;
+            for (original.packages, candidate.packages, 0..) |o, c, j| {
+                if (j != k) {
+                    if (!sameRow(o, c)) return false;
+                    continue;
+                }
+                var want = o;
+                want.when = expected_when;
+                if (!sameRow(want, c)) return false;
+            }
+        },
+    }
+    return true;
+}
 
 const max_link_hops: usize = 8;
 
@@ -1141,4 +1412,379 @@ test "append: concurrent writers of one manifest lose no row" {
             try testing.expect(std.mem.indexOf(u8, final, row) != null);
         }
     }
+}
+
+const EditFixture = struct {
+    a: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    repo: []const u8,
+    private: []const u8,
+
+    fn init(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir) !EditFixture {
+        try tmp.dir.createDirPath(io, "repo/data/packages");
+        try tmp.dir.createDirPath(io, "private/data/packages");
+        const cwd = try std.process.currentPathAlloc(io, a);
+        const root = try std.fs.path.join(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+        return .{
+            .a = a,
+            .io = io,
+            .root = root,
+            .repo = try std.fs.path.join(a, &.{ root, "repo" }),
+            .private = try std.fs.path.join(a, &.{ root, "private" }),
+        };
+    }
+
+    fn pathOf(self: EditFixture, layer: []const u8, name: []const u8) ![]const u8 {
+        return std.fs.path.join(self.a, &.{ self.root, layer, "data", "packages", name });
+    }
+
+    fn put(self: EditFixture, name: []const u8, content: []const u8) !void {
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = try self.pathOf("repo", name), .data = content });
+    }
+
+    fn read(self: EditFixture, name: []const u8) ![]const u8 {
+        return Io.Dir.cwd().readFileAlloc(self.io, try self.pathOf("repo", name), self.a, .limited(1 << 20));
+    }
+
+    fn load(self: EditFixture) !Manifest {
+        return manifest_mod.load(self.a, self.io, self.repo, self.private, null);
+    }
+
+    /// The loaded row named `name`, as commit holds it when it asks.
+    fn row(self: EditFixture, name: []const u8) !manifest_mod.Row {
+        for ((try self.load()).packages) |r| if (std.mem.eql(u8, r.name, name)) return r;
+        return error.TestUnexpectedResult;
+    }
+};
+
+fn expectLeft(got: Edit, why: []const u8) !void {
+    try testing.expect(got == .left);
+    try testing.expect(std.mem.indexOf(u8, got.left, why) != null);
+}
+
+test "removeRow: the row's own lines go, comments between its keys included; comments above its header and after its last key stay" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml",
+        \\backend = "brew"
+        \\
+        \\# formulae
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\# about ripgrep
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\# why it is pinned
+        \\pin = true
+        \\# after the last key
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+    );
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("ripgrep")));
+    try testing.expectEqualStrings(
+        \\backend = "brew"
+        \\
+        \\# formulae
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\# about ripgrep
+        \\# after the last key
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+    , try fx.read("darwin.toml"));
+}
+
+test "removeRow: two blank lines meeting where the row was collapse to one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"\n\n[[packages]]\nname = \"c\"\n");
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("b")));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"c\"\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow: a last row with no final newline goes, and what came before it stays byte for byte" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"");
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("b")));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow: CRLF line endings are kept" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\r\n\r\n[[packages]]\r\nname = \"a\"\r\n\r\n[[packages]]\r\nname = \"b\"\r\n");
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("a")));
+    try testing.expectEqualStrings("backend = \"brew\"\r\n\r\n[[packages]]\r\nname = \"b\"\r\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow and setWhen: a [[blacklist]] row between package rows is left alone" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "a"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+        \\[[packages]]
+        \\name = "b"
+        \\
+    );
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("a")));
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("b"), "work"));
+    try testing.expectEqualStrings(
+        \\backend = "brew"
+        \\
+        \\[[blacklist]]
+        \\name = "usage"
+        \\
+        \\[[packages]]
+        \\name = "b"
+        \\when = "not machine=\"work\""
+        \\
+    , try fx.read("darwin.toml"));
+    const m = try fx.load();
+    try testing.expectEqual(@as(usize, 1), m.blacklist.len);
+    try testing.expectEqualStrings("not machine=\"work\"", m.packages[0].when.?);
+}
+
+test "removeRow: two removals from one file, each from the rows as first loaded" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"\n\n[[packages]]\nname = \"c\"\n");
+    const a_row = try fx.row("a");
+    const c_row = try fx.row("c");
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, a_row));
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, c_row));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"b\"\n\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow: a file edited after the row was reported is searched by content, and a row that changed is left" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"\n");
+    const b_row = try fx.row("b");
+    const a_row = try fx.row("a");
+    // Someone adds a row ahead of both and gives a another field, between
+    // the prompt that reported them and the answers.
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"new\"\n\n[[packages]]\nname = \"a\"\npin = true\n\n[[packages]]\nname = \"b\"\n");
+
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, b_row));
+    try expectLeft(try removeRow(fx.a, io, a_row), "no row in it is the one reported any more");
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"new\"\n\n[[packages]]\nname = \"a\"\npin = true\n\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow: a symlinked manifest is edited where the link points, and the link survives" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try tmp.dir.createDirPath(io, "real");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/darwin.toml", .data = "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"\n" });
+    try tmp.dir.symLink(io, "../../../real/darwin.toml", "repo/data/packages/darwin.toml", .{});
+
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("a")));
+    const link = try fx.pathOf("repo", "darwin.toml");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expectEqualStrings("../../../real/darwin.toml", buf[0..try Io.Dir.cwd().readLink(io, link, &buf)]);
+    const real = try std.fs.path.join(fx.a, &.{ fx.root, "real", "darwin.toml" });
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"b\"\n", try Io.Dir.cwd().readFileAlloc(io, real, fx.a, .limited(1 << 20)));
+}
+
+test "removeRow and setWhen: a file in the private layer is edited there" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    const path = try fx.pathOf("private", "local.toml");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"\n" });
+    const a_row = try fx.row("a");
+    try testing.expectEqualStrings("data/packages/local.toml (private layer)", a_row.label);
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, a_row));
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("b"), "work"));
+    try testing.expectEqualStrings(
+        "backend = \"brew\"\n\n[[packages]]\nname = \"b\"\nwhen = \"not machine=\\\"work\\\"\"\n",
+        try Io.Dir.cwd().readFileAlloc(io, path, fx.a, .limited(1 << 20)),
+    );
+}
+
+test "removeRow and setWhen: rows written inline are refused, to be edited by hand" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    const original = "backend = \"brew\"\npackages = [{ name = \"a\" }, { name = \"b\" }]\n";
+    try fx.put("darwin.toml", original);
+    try expectLeft(try removeRow(fx.a, io, try fx.row("a")), "written inline");
+    try expectLeft(try setWhen(fx.a, io, try fx.row("b"), "work"), "edit it by hand");
+    try testing.expectEqualStrings(original, try fx.read("darwin.toml"));
+}
+
+test "setWhen: a row without a when gains one directly after its name line" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\n# the terminal\nname = \"ghostty\"\nkind = \"cask\"\n");
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("ghostty"), "work"));
+    try testing.expectEqualStrings(
+        "backend = \"brew\"\n\n[[packages]]\n# the terminal\nname = \"ghostty\"\nwhen = \"not machine=\\\"work\\\"\"\nkind = \"cask\"\n",
+        try fx.read("darwin.toml"),
+    );
+}
+
+test "setWhen: a when there already is wrapped in place, keeping its trailing comment" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\nwhen = \"os=darwin\"  # laptops only\npin = true\n");
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("a"), "work"));
+    try testing.expectEqualStrings(
+        "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\nwhen = \"(os=darwin) and not machine=\\\"work\\\"\"  # laptops only\npin = true\n",
+        try fx.read("darwin.toml"),
+    );
+    try testing.expectEqualStrings("(os=darwin) and not machine=\"work\"", (try fx.row("a")).when.?);
+}
+
+test "setWhen: a name line that ends the file gets its newline first, and the file still ends without one" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"");
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("a"), "work"));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\nwhen = \"not machine=\\\"work\\\"\"", try fx.read("darwin.toml"));
+}
+
+test "setWhen: CRLF line endings are kept, the new line taking the name line's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\r\n\r\n[[packages]]\r\nname = \"a\"\r\npin = true\r\n");
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("a"), "work"));
+    try testing.expectEqualStrings("backend = \"brew\"\r\n\r\n[[packages]]\r\nname = \"a\"\r\nwhen = \"not machine=\\\"work\\\"\"\r\npin = true\r\n", try fx.read("darwin.toml"));
+}
+
+test "setWhen: under a file-level when the row's own when is written, and the merged gate is the two combined" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\nwhen = \"os=darwin\"\n\n[[packages]]\nname = \"a\"\n");
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("a"), "work"));
+    try testing.expectEqualStrings("backend = \"brew\"\nwhen = \"os=darwin\"\n\n[[packages]]\nname = \"a\"\nwhen = \"not machine=\\\"work\\\"\"\n", try fx.read("darwin.toml"));
+    const want = (try manifest_mod.combineWhen(fx.a, "os=darwin", "not machine=\"work\"")).?;
+    try testing.expectEqualStrings(want, (try fx.row("a")).when.?);
+    try testing.expectEqualStrings("os=darwin", (try fx.load()).sources[0].when.?);
+}
+
+test "setWhen: a when written as a multi-line or literal string is refused, to be edited by hand" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    for ([_][]const u8{
+        "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\nwhen = \"\"\"\nos=darwin\"\"\"\n",
+        "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\nwhen = 'os=darwin'\n",
+    }) |original| {
+        try fx.put("darwin.toml", original);
+        try expectLeft(try setWhen(fx.a, io, try fx.row("a"), "work"), "multi-line or literal string");
+        try testing.expectEqualStrings(original, try fx.read("darwin.toml"));
+    }
+}
+
+test "setWhen: a machine name outside ASCII is written quoted, and gates as written" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n");
+    try testing.expectEqual(Edit.written, try setWhen(fx.a, io, try fx.row("a"), "caf\xc3\xa9"));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\nwhen = \"not machine=\\\"caf\xc3\xa9\\\"\"\n", try fx.read("darwin.toml"));
+    const when = (try fx.row("a")).when.?;
+    try testing.expectEqualStrings("not machine=\"caf\xc3\xa9\"", when);
+
+    var here = std.StringHashMap([]const u8).init(fx.a);
+    try here.put("machine", "caf\xc3\xa9");
+    const r: Resolver = .{ .live = &.{ .bindings = &here } };
+    try testing.expect(!axis.evaluate(try axis.parseString(fx.a, when), &r));
 }

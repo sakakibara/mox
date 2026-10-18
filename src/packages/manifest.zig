@@ -29,7 +29,7 @@ const Io = std.Io;
 
 pub const Diag = diag_mod.Diag;
 
-const max_file_bytes: usize = 1 << 20;
+pub const max_file_bytes: usize = 1 << 20;
 
 /// An adapter field's value. A float, date, or time is refused rather than
 /// stringified: no adapter needs one, and accepting it would make a mistyped
@@ -178,102 +178,11 @@ pub fn load(
             if (diag) |d| d.set("{s}: unreadable: {s}", .{ f.label, @errorName(e) });
             return Error.MalformedPackageFile;
         };
-        if (std.mem.startsWith(u8, content, utf8_bom)) {
-            if (diag) |d| d.set("{s}: begins with a byte order mark; save the file without one", .{f.label});
-            return Error.MalformedPackageFile;
-        }
-        const doc = toml.parse(arena, content, .{}) catch |e| {
-            if (diag) |d| d.set("{s}: TOML parse failed: {s}", .{ f.label, @errorName(e) });
-            return Error.MalformedPackageFile;
-        };
-        if (doc != .table) {
-            if (diag) |d| d.set("{s}: not a TOML table", .{f.label});
-            return Error.MalformedPackageFile;
-        }
-        // `[[package]]` would otherwise load as zero rows and a clean report.
-        for (doc.table.keys()) |k| {
-            if (isFileKey(k)) continue;
-            if (diag) |d| d.set(
-                "{s}: unknown top-level key \"{s}\" (a manifest file takes \"backend\", \"when\", \"packages\", \"blacklist\", \"bootstrap\")",
-                .{ f.label, k },
-            );
-            return Error.MalformedPackageFile;
-        }
-
-        const file_backend: ?[]const u8 = blk: {
-            const v = doc.table.get("backend") orelse break :blk null;
-            if (v != .string or v.string.len == 0) {
-                if (diag) |d| d.set("{s}: file-level \"backend\" must be a non-empty string", .{f.label});
-                return Error.MalformedPackageFile;
-            }
-            break :blk v.string;
-        };
-        // A file-level gate applies to every packages and bootstrap row in
-        // the file, so a manifest organised per OS says `when = "os=darwin"`
-        // once rather than on each of a hundred rows. A row's own `when`
-        // narrows it further.
-        const file_when: ?[]const u8 = blk: {
-            const v = doc.table.get("when") orelse break :blk null;
-            if (v != .string or v.string.len == 0) {
-                if (diag) |d| d.set("{s}: file-level \"when\" must be a non-empty string", .{f.label});
-                return Error.MalformedPackageFile;
-            }
-            _ = axis.parseString(arena, v.string) catch {
-                if (diag) |d| d.set("{s}: file-level \"when\" is not a valid axis expression: {s}", .{ f.label, v.string });
-                return Error.MalformedPackageFile;
-            };
-            break :blk v.string;
-        };
-
-        try sources.append(arena, .{
-            .path = f.path,
-            .label = f.label,
-            .default_backend = file_backend,
-            .when = file_when,
-            .private = f.private,
-        });
-
-        if (doc.table.get("packages")) |v| {
-            if (v != .array) {
-                if (diag) |d| d.set("{s}: \"packages\" must be a [[packages]] array", .{f.label});
-                return Error.MalformedPackageFile;
-            }
-            for (v.array.items, 0..) |el, i| {
-                if (el != .table) {
-                    if (diag) |d| d.set("{s}: row {d} is not a table", .{ f.label, i });
-                    return Error.MalformedPackageRow;
-                }
-                try packages.append(arena, try parseRow(arena, f, el.table, file_backend, file_when, i, diag));
-            }
-        }
-
-        if (doc.table.get("bootstrap")) |v| {
-            if (v != .array) {
-                if (diag) |d| d.set("{s}: \"bootstrap\" must be a [[bootstrap]] array", .{f.label});
-                return Error.MalformedPackageFile;
-            }
-            for (v.array.items, 0..) |el, i| {
-                if (el != .table) {
-                    if (diag) |d| d.set("{s}: bootstrap row {d} is not a table", .{ f.label, i });
-                    return Error.MalformedPackageRow;
-                }
-                try bootstrap.append(arena, try parseBootstrapRow(arena, f, el.table, file_backend, file_when, i, diag));
-            }
-        }
-
-        if (doc.table.get("blacklist")) |v| {
-            if (v != .array) {
-                if (diag) |d| d.set("{s}: \"blacklist\" must be a [[blacklist]] array", .{f.label});
-                return Error.MalformedPackageFile;
-            }
-            for (v.array.items, 0..) |el, i| {
-                if (el != .table) {
-                    if (diag) |d| d.set("{s}: blacklist row {d} is not a table", .{ f.label, i });
-                    return Error.MalformedPackageRow;
-                }
-                try blacklist.append(arena, try parseBlacklistRow(arena, f, el.table, file_backend, file_when, i, diag));
-            }
-        }
+        const one = try loadFile(arena, f.path, f.label, f.private, content, diag);
+        try packages.appendSlice(arena, one.packages);
+        try blacklist.appendSlice(arena, one.blacklist);
+        try bootstrap.appendSlice(arena, one.bootstrap);
+        try sources.appendSlice(arena, one.sources);
     }
 
     return .{
@@ -283,6 +192,129 @@ pub fn load(
         .sources = try sources.toOwnedSlice(arena),
         .files = files.len,
         .directory = found.directory,
+    };
+}
+
+/// The rows of one manifest file held in `content`, read exactly as `load`
+/// reads each file it finds: a candidate built in memory loads the way the
+/// file would once written.
+pub fn loadFile(
+    arena: std.mem.Allocator,
+    path: []const u8,
+    label: []const u8,
+    private: bool,
+    content: []const u8,
+    diag: ?*Diag,
+) !Manifest {
+    const f: SourceFile = .{ .path = path, .label = label, .private = private };
+    var packages: std.ArrayList(Row) = .empty;
+    var blacklist: std.ArrayList(BlacklistRow) = .empty;
+    var bootstrap: std.ArrayList(BootstrapRow) = .empty;
+    var sources: std.ArrayList(Source) = .empty;
+
+    if (std.mem.startsWith(u8, content, utf8_bom)) {
+        if (diag) |d| d.set("{s}: begins with a byte order mark; save the file without one", .{f.label});
+        return Error.MalformedPackageFile;
+    }
+    const doc = toml.parse(arena, content, .{}) catch |e| {
+        if (diag) |d| d.set("{s}: TOML parse failed: {s}", .{ f.label, @errorName(e) });
+        return Error.MalformedPackageFile;
+    };
+    if (doc != .table) {
+        if (diag) |d| d.set("{s}: not a TOML table", .{f.label});
+        return Error.MalformedPackageFile;
+    }
+    // `[[package]]` would otherwise load as zero rows and a clean report.
+    for (doc.table.keys()) |k| {
+        if (isFileKey(k)) continue;
+        if (diag) |d| d.set(
+            "{s}: unknown top-level key \"{s}\" (a manifest file takes \"backend\", \"when\", \"packages\", \"blacklist\", \"bootstrap\")",
+            .{ f.label, k },
+        );
+        return Error.MalformedPackageFile;
+    }
+
+    const file_backend: ?[]const u8 = blk: {
+        const v = doc.table.get("backend") orelse break :blk null;
+        if (v != .string or v.string.len == 0) {
+            if (diag) |d| d.set("{s}: file-level \"backend\" must be a non-empty string", .{f.label});
+            return Error.MalformedPackageFile;
+        }
+        break :blk v.string;
+    };
+    // A file-level gate applies to every packages and bootstrap row in
+    // the file, so a manifest organised per OS says `when = "os=darwin"`
+    // once rather than on each of a hundred rows. A row's own `when`
+    // narrows it further.
+    const file_when: ?[]const u8 = blk: {
+        const v = doc.table.get("when") orelse break :blk null;
+        if (v != .string or v.string.len == 0) {
+            if (diag) |d| d.set("{s}: file-level \"when\" must be a non-empty string", .{f.label});
+            return Error.MalformedPackageFile;
+        }
+        _ = axis.parseString(arena, v.string) catch {
+            if (diag) |d| d.set("{s}: file-level \"when\" is not a valid axis expression: {s}", .{ f.label, v.string });
+            return Error.MalformedPackageFile;
+        };
+        break :blk v.string;
+    };
+
+    try sources.append(arena, .{
+        .path = f.path,
+        .label = f.label,
+        .default_backend = file_backend,
+        .when = file_when,
+        .private = f.private,
+    });
+
+    if (doc.table.get("packages")) |v| {
+        if (v != .array) {
+            if (diag) |d| d.set("{s}: \"packages\" must be a [[packages]] array", .{f.label});
+            return Error.MalformedPackageFile;
+        }
+        for (v.array.items, 0..) |el, i| {
+            if (el != .table) {
+                if (diag) |d| d.set("{s}: row {d} is not a table", .{ f.label, i });
+                return Error.MalformedPackageRow;
+            }
+            try packages.append(arena, try parseRow(arena, f, el.table, file_backend, file_when, i, diag));
+        }
+    }
+
+    if (doc.table.get("bootstrap")) |v| {
+        if (v != .array) {
+            if (diag) |d| d.set("{s}: \"bootstrap\" must be a [[bootstrap]] array", .{f.label});
+            return Error.MalformedPackageFile;
+        }
+        for (v.array.items, 0..) |el, i| {
+            if (el != .table) {
+                if (diag) |d| d.set("{s}: bootstrap row {d} is not a table", .{ f.label, i });
+                return Error.MalformedPackageRow;
+            }
+            try bootstrap.append(arena, try parseBootstrapRow(arena, f, el.table, file_backend, file_when, i, diag));
+        }
+    }
+
+    if (doc.table.get("blacklist")) |v| {
+        if (v != .array) {
+            if (diag) |d| d.set("{s}: \"blacklist\" must be a [[blacklist]] array", .{f.label});
+            return Error.MalformedPackageFile;
+        }
+        for (v.array.items, 0..) |el, i| {
+            if (el != .table) {
+                if (diag) |d| d.set("{s}: blacklist row {d} is not a table", .{ f.label, i });
+                return Error.MalformedPackageRow;
+            }
+            try blacklist.append(arena, try parseBlacklistRow(arena, f, el.table, file_backend, file_when, i, diag));
+        }
+    }
+
+    return .{
+        .packages = try packages.toOwnedSlice(arena),
+        .blacklist = try blacklist.toOwnedSlice(arena),
+        .bootstrap = try bootstrap.toOwnedSlice(arena),
+        .sources = try sources.toOwnedSlice(arena),
+        .files = 1,
     };
 }
 
@@ -473,7 +505,7 @@ fn parseRow(
 /// gates that each parse can exceed the limit together, and the refusal has to
 /// come from the loader, which knows the file and the row, rather than from an
 /// evaluation that knows neither.
-fn combineWhen(arena: std.mem.Allocator, file_when: ?[]const u8, own: ?[]const u8) !?[]const u8 {
+pub fn combineWhen(arena: std.mem.Allocator, file_when: ?[]const u8, own: ?[]const u8) !?[]const u8 {
     if (file_when == null) return own;
     if (own == null) return file_when;
     const combined = try std.fmt.allocPrint(arena, "({s}) and ({s})", .{ file_when.?, own.? });

@@ -806,7 +806,7 @@ fn iniEql(a: ini.Value, b: ini.Value) bool {
 
 // TOML
 
-const TomlScan = struct {
+pub const TomlScan = struct {
     doc: toml.Document,
     /// Byte offset of each item; items concatenated reproduce the source.
     offs: []usize,
@@ -816,7 +816,8 @@ const TomlScan = struct {
     len: usize,
 };
 
-fn tomlScan(arena: std.mem.Allocator, live: []const u8) LocateError!TomlScan {
+/// `live` as the lossless Document's items, each with its byte span.
+pub fn tomlScan(arena: std.mem.Allocator, live: []const u8) LocateError!TomlScan {
     const doc = toml.Document.parse(arena, live, .{}) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.LiveUnparseable,

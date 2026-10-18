@@ -7981,6 +7981,8 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/packages/seen.zig", "replace", 3 },
         .{ "src/packages/windows.zig", "installedExplicitImpl", 1 },
         .{ "src/packages/write.zig", "append", 2 },
+        .{ "src/packages/write.zig", "editRow", 1 },
+        .{ "src/packages/write.zig", "put", 1 },
         .{ "src/packages/write.zig", "seededManifest", 1 },
         .{ "src/secret/resolver.zig", "resolveCmdViaScript", 2 },
         .{ "src/source/attributes.zig", "loadText", 1 },
