@@ -268,8 +268,33 @@ All notable changes to mox are documented here. The format follows
   never a source.
 - A record whose live path is now a directory is forgotten once, with a
   note, instead of failing every run.
+- A capture's value is written the way the context it sits in reads it
+  back: escaped inside a TOML, YAML, INI or gitconfig quoted string, a
+  shell, fish or PowerShell quote or heredoc, and a YAML block scalar
+  indented to its block; written as it is where the context takes any
+  text. Each layer of a TOML, YAML or INI merge has its captures expanded
+  this way before the merge reads it, so a bare capture in a merged layer
+  works, and the merged output is written in the emitter's style (a TOML
+  key bare where it can be, `darwin`; a YAML string quoted wherever a YAML
+  1.1 reader in common use would read it as another type, `"yes"`,
+  `"0123"`). A layer that does not parse once its captures are written is
+  reported at its own line.
+- A value that cannot be written where its capture sits without changing
+  what the file means is refused, naming the capture, its line, the
+  context and the remedy: a line break in a single-line string, a quote an
+  unquoted INI value cannot hold, or a YAML plain scalar that, with the
+  text around the capture, would not read back as a string (`yes`, `0123`,
+  `1st`, an empty value). `mox commit` offers an edited fact only when
+  compose could write it back where it sits.
+- The `# mox: secret` directive writes its lines only where a line starts
+  outside every string, heredoc, block scalar and bracket; anywhere else
+  the file is refused naming the directive.
 
 ### Upgrading
+- A value that 0.12.4 wrote as it is can now be refused where it would
+  change what the file means (see Changed); quote the capture in the
+  source, as each refusal says. Merged TOML and YAML output, and any value
+  now escaped for its context, differs byte for byte from 0.12.4's.
 - In a JSON-family generator template, a capture outside a string with a
   default emits the default as a JSON string: `{"n": <id.nm | default
   "null">}` gave `{"n": null}` in 0.12.4 and gives `{"n": "null"}` now. A
