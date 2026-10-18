@@ -158,6 +158,7 @@ pub const Distro = struct {
         .installRefused = installRefusedImpl,
         .installMarked = installMarkedImpl,
         .installUnmarked = installUnmarkedImpl,
+        .present = presentImpl,
         .declare = declareImpl,
     };
 
@@ -267,6 +268,57 @@ pub const Distro = struct {
             try out.append(arena, line);
         }
         return out.toOwnedSlice(arena);
+    }
+
+    /// The rows the manager has on the machine, whoever asked for them, in
+    /// one local read of its whole installed set: dpkg's, pacman's, rpm's.
+    ///
+    /// apt counts a package dpkg holds in any state but `not-installed` and
+    /// `config-files`, spelled as apt-mark spells it. A package left
+    /// `unpacked` or `half-configured` is on the disk, so its row stays
+    /// missing and the install configures it; one removed down to its
+    /// configuration files is gone.
+    fn presentImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Distro = @ptrCast(@alignCast(ctx));
+        if (rows.len == 0) return &.{};
+        var out: std.ArrayList([]const u8) = .empty;
+        switch (self.manager) {
+            .apt => {
+                const native = try self.aptNativeArch(arena);
+                const held = try self.aptArches(arena, .any);
+                for (rows) |row| {
+                    if (aptHolds(held, native, row.name)) try out.append(arena, row.name);
+                }
+            },
+            .dnf, .pacman => {
+                const have = try self.installedNames(arena);
+                for (rows) |row| {
+                    if (have.contains(row.name)) try out.append(arena, row.name);
+                }
+            },
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Every package pacman or rpm has installed. rpm rather than dnf
+    /// because it reads the local database alone, where `dnf repoquery`
+    /// reaches for repository metadata.
+    fn installedNames(self: *Distro, arena: std.mem.Allocator) anyerror!std.StringHashMap(void) {
+        const argv: []const []const u8 = if (self.manager == .pacman)
+            &.{ "pacman", "-Qq" }
+        else
+            &.{ "rpm", "-qa", "--qf", "%{NAME}\n" };
+        const res = try self.runner.run(arena, argv);
+        try exec.checkTimedOut(res);
+        if (!res.ok) return Error.DistroQueryFailed;
+        var have = std.StringHashMap(void).init(arena);
+        var it = std.mem.splitScalar(u8, res.stdout, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            try have.put(line, {});
+        }
+        return have;
     }
 
     /// The whole set in one invocation: these managers resolve a batch in a
@@ -604,7 +656,7 @@ pub const Distro = struct {
     /// So this answers what the REPOSITORIES carry natively, and nothing
     /// about what is already on the machine. A package installed from a .deb
     /// is in no repository, so it is absent here and its row is judged
-    /// against `aptInstalledArches` instead.
+    /// against `aptArches` instead.
     ///
     /// About 1.2 MiB on Debian trixie and 1.8 MiB on Ubuntu 24.04, well
     /// inside a captured call's cap. A qualified name is asked about per row
@@ -836,10 +888,13 @@ pub const Distro = struct {
     /// manual, after which `apt-mark showmanual` reports it. Its architecture
     /// is what says which spelling apt-mark will use.
     ///
-    /// Only a package dpkg calls `installed` counts: a removed one left in
-    /// `config-files` is a name `apt-get install` answers with "Unable to
-    /// locate package" when no repository carries it (verified on all four).
-    fn aptInstalledArches(self: *Distro, arena: std.mem.Allocator) anyerror!Arches {
+    /// For that oracle only a package dpkg calls `installed` counts
+    /// (`.installed`): a removed one left in `config-files` is a name
+    /// `apt-get install` answers with "Unable to locate package" when no
+    /// repository carries it (verified on all four). `.any` counts every
+    /// state but `not-installed` and `config-files`: whatever dpkg has put on
+    /// the disk.
+    fn aptArches(self: *Distro, arena: std.mem.Allocator, counted: DpkgStates) anyerror!Arches {
         const res = try self.runner.run(arena, &.{ "dpkg-query", "-W", "-f", "${Package} ${Architecture} ${Status}\\n" });
         try exec.checkCaptureTimedOut(res);
         if (!res.ok) return Error.DistroQueryFailed;
@@ -856,7 +911,11 @@ pub const Distro = struct {
             _ = fields.next() orelse continue;
             _ = fields.next() orelse continue;
             const state = fields.next() orelse continue;
-            if (!std.mem.eql(u8, state, "installed")) continue;
+            const counts = switch (counted) {
+                .installed => std.mem.eql(u8, state, "installed"),
+                .any => !std.mem.eql(u8, state, "not-installed") and !std.mem.eql(u8, state, "config-files"),
+            };
+            if (!counts) continue;
             const slot = try out.getOrPut(name);
             if (!slot.found_existing) slot.value_ptr.* = .empty;
             try slot.value_ptr.append(arena, arch);
@@ -1265,11 +1324,20 @@ pub const Distro = struct {
         /// architecture and for `all`, `name:<arch>` for a foreign one -- is
         /// installed and configured here.
         fn hasConfigured(self: AptMachine, name: []const u8) bool {
-            const bare = backend_mod.bareName(name);
-            if (backend_mod.archOf(name)) |arch| return hasArch(self.installed, bare, arch);
-            return hasArch(self.installed, bare, self.native) or hasArch(self.installed, bare, "all");
+            return aptHolds(self.installed, self.native, name);
         }
     };
+
+    /// Whether `arches` has the package apt-mark spells `name`: bare for
+    /// `native` and for `all`, `name:<arch>` for a foreign architecture.
+    fn aptHolds(arches: Arches, native: []const u8, name: []const u8) bool {
+        const bare = backend_mod.bareName(name);
+        if (backend_mod.archOf(name)) |arch| return hasArch(arches, bare, arch);
+        return hasArch(arches, bare, native) or hasArch(arches, bare, "all");
+    }
+
+    /// Which dpkg states `aptArches` counts.
+    const DpkgStates = enum { installed, any };
 
     /// What dpkg says of this machine, refused whole where apt is answering
     /// about a different one.
@@ -1308,7 +1376,7 @@ pub const Distro = struct {
         }
         return .{
             .native = native,
-            .installed = try self.aptInstalledArches(arena),
+            .installed = try self.aptArches(arena, .installed),
         };
     }
 
@@ -5198,6 +5266,134 @@ test "installedExplicit: apt's manual set holds only what dpkg has configured" {
     try testing.expectEqualStrings("cowsay", got[0]);
     try testing.expectEqualStrings("libc6", got[1]);
     try testing.expectEqualStrings("libc6:armhf", got[2]);
+}
+
+test "present: apt counts what dpkg has on the disk, unconfigured included, and not what it removed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A manual package stuck `unpacked` or `half-configured` is on the
+    // machine, so its row stays missing and the install configures it. One
+    // removed down to `config-files`, or never installed, is not.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{
+            .argv = apt_installed_call,
+            .stdout = "sl arm64 install ok unpacked\ncowsay all install ok half-configured\nbat arm64 install ok installed\nmox-gone arm64 deinstall ok config-files\nmox-never arm64 unknown ok not-installed\n",
+        },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
+
+    const got = (try d.backend().present(a, &.{
+        rowOf("sl", &.{}),
+        rowOf("cowsay", &.{}),
+        rowOf("bat", &.{}),
+        rowOf("mox-gone", &.{}),
+        rowOf("mox-never", &.{}),
+        rowOf("fd-find", &.{}),
+    })).?;
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqualStrings("sl", got[0]);
+    try testing.expectEqualStrings("cowsay", got[1]);
+    try testing.expectEqualStrings("bat", got[2]);
+}
+
+test "present: apt spells a foreign-architecture package qualified, as apt-mark does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // dpkg has `libfoo` for armhf alone: the row `libfoo:armhf` names it and
+    // the bare row, which means the native package, does not.
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .stdout = "libfoo armhf install ok installed\nlibc6 arm64 install ok installed\n" },
+    } };
+    var d: Distro = .{ .manager = .apt, .runner = fake.runner(), .force_elevate = true };
+
+    const got = (try d.backend().present(a, &.{
+        rowOf("libfoo:armhf", &.{}),
+        rowOf("libfoo", &.{}),
+        rowOf("libc6", &.{}),
+        rowOf("libc6:armhf", &.{}),
+    })).?;
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("libfoo:armhf", got[0]);
+    try testing.expectEqualStrings("libc6", got[1]);
+}
+
+test "present: a failed or killed dpkg query is an error, never an empty answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var failed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .code = 2 },
+    } };
+    var df: Distro = .{ .manager = .apt, .runner = failed.runner(), .force_elevate = true };
+    try testing.expectError(Error.DistroQueryFailed, df.backend().present(a, &.{rowOf("sl", &.{})}));
+
+    var killed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "dpkg --print-architecture", .stdout = "arm64\n" },
+        .{ .argv = apt_installed_call, .timed_out = true },
+    } };
+    var dk: Distro = .{ .manager = .apt, .runner = killed.runner(), .force_elevate = true };
+    try testing.expectError(error.CaptureTimedOut, dk.backend().present(a, &.{rowOf("sl", &.{})}));
+}
+
+test "present: pacman counts every package it has, dependencies included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qq", .stdout = "glibc\nripgrep\npcre2\n" },
+    } };
+    var d: Distro = .{ .manager = .pacman, .runner = fake.runner(), .force_elevate = true };
+
+    const got = (try d.backend().present(a, &.{ rowOf("pcre2", &.{}), rowOf("bat", &.{}) })).?;
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("pcre2", got[0]);
+}
+
+test "present: dnf asks rpm, and a missing rpm is an error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\noniguruma\n" },
+    } };
+    var d: Distro = .{ .manager = .dnf, .runner = fake.runner(), .force_elevate = true };
+    const got = (try d.backend().present(a, &.{ rowOf("oniguruma", &.{}), rowOf("jq", &.{}) })).?;
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("oniguruma", got[0]);
+
+    var gone: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .fail = error.FileNotFound },
+    } };
+    var dg: Distro = .{ .manager = .dnf, .runner = gone.runner(), .force_elevate = true };
+    try testing.expectError(error.FileNotFound, dg.backend().present(a, &.{rowOf("jq", &.{})}));
+}
+
+test "present: a failed or killed pacman or rpm query is an error, never an empty answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var pacman: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "pacman -Qq", .code = 1 },
+    } };
+    var dp: Distro = .{ .manager = .pacman, .runner = pacman.runner(), .force_elevate = true };
+    try testing.expectError(Error.DistroQueryFailed, dp.backend().present(a, &.{rowOf("bat", &.{})}));
+
+    var rpm: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .timed_out = true },
+    } };
+    var dr: Distro = .{ .manager = .dnf, .runner = rpm.runner(), .force_elevate = true };
+    try testing.expectError(error.TimedOut, dr.backend().present(a, &.{rowOf("jq", &.{})}));
 }
 
 test "install: apt is asked which architecture it resolves against, and agreeing costs the run nothing" {

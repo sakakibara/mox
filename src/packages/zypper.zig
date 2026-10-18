@@ -75,6 +75,7 @@ pub const Zypper = struct {
         .installSpawned = installSpawnedImpl,
         .installRefused = installRefusedImpl,
         .installLanded = installLandedImpl,
+        .present = presentImpl,
         .declare = declareImpl,
     };
 
@@ -166,6 +167,15 @@ pub const Zypper = struct {
         const recorded = try self.ledger.read(arena);
         if (recorded.len == 0) return &.{};
         return self.presentOf(arena, recorded, false);
+    }
+
+    /// The rows rpm has installed, whoever asked for them. rpm missing is an
+    /// error like any other query that could not be made.
+    fn presentImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Zypper = @ptrCast(@alignCast(ctx));
+        const ids = try arena.alloc([]const u8, rows.len);
+        for (rows, ids) |row, *id| id.* = row.name;
+        return self.presentOf(arena, ids, false);
     }
 
     /// The names of `ids` that rpm reports installed, in order. rpm is the
@@ -684,6 +694,51 @@ test "installedExplicit: a package removed behind mox's back is reported missing
     // The record still names it; the system does not have it. Trusting the
     // record alone would leave it uninstalled forever.
     try testing.expectEqual(@as(usize, 0), (try z.backend().installedExplicit(a)).len);
+}
+
+test "present: any package rpm has counts, recorded or not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .stdout = "bash\nripgrep\nglibc\n" },
+    } };
+    var z = try tmpZypper(a, io, &tmp.sub_path, &fake);
+
+    const got = (try z.backend().present(a, &.{ rowOf("ripgrep", &.{}), rowOf("bat", &.{}) })).?;
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("ripgrep", got[0]);
+}
+
+test "present: a failed, killed or missing rpm is an error, never an empty answer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var failed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .code = 1 },
+    } };
+    var zf = try tmpZypper(a, io, &tmp.sub_path, &failed);
+    try testing.expectError(Error.ZypperQueryFailed, zf.backend().present(a, &.{rowOf("ripgrep", &.{})}));
+
+    var killed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .timed_out = true },
+    } };
+    var zk = try tmpZypper(a, io, &tmp.sub_path, &killed);
+    try testing.expectError(error.TimedOut, zk.backend().present(a, &.{rowOf("ripgrep", &.{})}));
+
+    var gone: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "rpm -qa --qf %{NAME}\n", .fail = error.FileNotFound },
+    } };
+    var zg = try tmpZypper(a, io, &tmp.sub_path, &gone);
+    try testing.expectError(error.FileNotFound, zg.backend().present(a, &.{rowOf("ripgrep", &.{})}));
 }
 
 test "installedExplicit: a failed rpm query is an error, never an empty set" {

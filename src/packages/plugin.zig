@@ -484,6 +484,17 @@ test "not runnable: no bootstrap, no limitation, and nothing is ever spawned" {
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
+test "present: the protocol has no such verb, so nothing is asked and no row is answered" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var p: Plugin = .{ .io = std.testing.io, .name = "macports", .argv0 = &.{"mox-macports"}, .runner = fake.runner(), .alloc = a };
+    try testing.expect((try p.backend().present(a, &.{rowOf("x", &.{})})) == null);
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
 test "available: exit 0 is present, exit 1 is absent, and anything else is broken" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

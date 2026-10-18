@@ -471,6 +471,13 @@ pub const Backend = struct {
         /// for an adapter whose manager keeps no binding that can move off
         /// the package, where the answer is always none.
         astray: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror!Judged = null,
+        /// Of these rows, none of them in `installedExplicit`'s answer, the
+        /// ids the manager holds on the machine in any form. Elevates nothing
+        /// and refreshes no index, except that winget may update a stale
+        /// source while answering. An error is an answer that could not be
+        /// had. Absent for an adapter that cannot say, whose rows are then
+        /// never judged removed.
+        present: ?*const fn (ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 = null,
         /// The row that would name an observed installed id: the inverse of
         /// `idOf`, for writing a hand-installed package back into the
         /// manifest. `idOf` of the result must equal the id given.
@@ -565,6 +572,12 @@ pub const Backend = struct {
     pub fn astray(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror!Judged {
         const f = self.vtable.astray orelse return .{};
         return f(self.ctx, arena, rows);
+    }
+
+    /// The `present` verb's answer, or null for an adapter without it.
+    pub fn present(self: Backend, arena: std.mem.Allocator, rows: []const Row) anyerror!?[]const []const u8 {
+        const f = self.vtable.present orelse return null;
+        return try f(self.ctx, arena, rows);
     }
 
     pub fn declare(self: Backend, arena: std.mem.Allocator, id: []const u8) anyerror!Declaration {

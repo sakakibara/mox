@@ -132,6 +132,7 @@ pub const Scoop = struct {
         .install = installImpl,
         .installSpawned = installSpawnedImpl,
         .installRefused = installRefusedImpl,
+        .present = scoopPresentImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
         .installerExit = installerExitImpl,
@@ -286,6 +287,12 @@ pub const Scoop = struct {
     /// compares it.
     fn idOfImpl(_: *anyopaque, arena: std.mem.Allocator, row: Row) anyerror![]const u8 {
         return foldId(arena, row.name);
+    }
+
+    /// No row is present: `scoop export` lists every app scoop has, so one it
+    /// has is in `installedExplicit`'s answer already, and nothing is asked.
+    fn scoopPresentImpl(_: *anyopaque, _: std.mem.Allocator, _: []const Row) anyerror![]const []const u8 {
+        return &.{};
     }
 
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
@@ -640,6 +647,7 @@ pub const Winget = struct {
         .installedExplicit = installedExplicitImpl,
         .install = installImpl,
         .installMarked = installMarkedImpl,
+        .present = wingetPresentImpl,
         .declare = declareImpl,
     };
 
@@ -830,13 +838,41 @@ pub const Winget = struct {
     /// width and ends what it cut with an ellipsis, and the id is the column
     /// that would be cut.
     fn isInstalled(self: *Winget, arena: std.mem.Allocator, id: []const u8) !bool {
-        const res = try self.runner.run(arena, &.{
+        const res = try self.list(arena, id);
+        try exec.checkCaptureTimedOut(res);
+        return res.ok;
+    }
+
+    fn list(self: *Winget, arena: std.mem.Allocator, id: []const u8) !exec.Result {
+        return self.runner.run(arena, &.{
             "winget",  "list",
             "--id",    id,
             "--exact", "--accept-source-agreements",
         });
-        try exec.checkCaptureTimedOut(res);
-        return res.ok;
+    }
+
+    /// The low byte of `APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND`
+    /// (`0x8A150014`), which `list` terminates with when nothing matches.
+    const no_applications_found: u8 = 0x14;
+
+    /// Each row asked of `list` on its own, as `isInstalled` asks, except
+    /// that only the two answers count: exit 0 is present and
+    /// `no_applications_found` is not. Any other exit, a kill or a spawn
+    /// failure is an error, since `isInstalled` reading it as "not
+    /// installed" would call the row removed.
+    fn wingetPresentImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Winget = @ptrCast(@alignCast(ctx));
+        var out: std.ArrayList([]const u8) = .empty;
+        for (rows) |row| {
+            const res = try self.list(arena, row.name);
+            try exec.checkTimedOut(res);
+            if (res.ok) {
+                try out.append(arena, row.name);
+            } else if (res.code != no_applications_found) {
+                return Error.WingetQueryFailed;
+            }
+        }
+        return out.toOwnedSlice(arena);
     }
 
     fn installMarkedImpl(ctx: *anyopaque) usize {
@@ -1394,6 +1430,19 @@ test "scoop: an unparseable export is an error, never an empty set" {
     try testing.expectError(Error.UnreadableExport, s.backend().installedExplicit(a));
 }
 
+test "scoop: no row is present, and nothing is asked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var s: Scoop = .{ .runner = fake.runner() };
+
+    const got = (try s.backend().present(a, &.{ scoopRow("ripgrep", &.{}), scoopRow("7zip", &.{}) })).?;
+    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
 test "scoop: validate refuses a key meant for another manager" {
     var fake: exec.Fake = .{ .arena = undefined, .entries = &.{} };
     var s: Scoop = .{ .runner = fake.runner() };
@@ -1471,6 +1520,52 @@ test "winget: an export missing Sources is an error, never an empty set" {
 }
 
 const winget_absent = "winget list --id Git.Git --exact --accept-source-agreements";
+
+test "winget: present asks each row, exit 0 present and 0x14 not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "winget list --id Microsoft.PowerShell --exact --accept-source-agreements" },
+        .{ .argv = winget_absent, .code = 0x14 },
+    } };
+    var w: Winget = .{ .runner = fake.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
+
+    const got = (try w.backend().present(a, &.{
+        wingetRow("Microsoft.PowerShell", &.{}),
+        wingetRow("Git.Git", &.{}),
+    })).?;
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("Microsoft.PowerShell", got[0]);
+    try testing.expectEqual(@as(usize, 2), fake.calls.items.len);
+}
+
+test "winget: present reads any other exit, a kill or a spawn failure as an error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `isInstalled` reads each of these as "not installed", which is safe for
+    // an install that then runs; here it would call the row removed.
+    var other: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = winget_absent, .code = 0x2d },
+    } };
+    var wo: Winget = .{ .runner = other.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
+    try testing.expectError(Error.WingetQueryFailed, wo.backend().present(a, &.{wingetRow("Git.Git", &.{})}));
+
+    var killed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = winget_absent, .timed_out = true },
+    } };
+    var wk: Winget = .{ .runner = killed.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
+    try testing.expectError(error.TimedOut, wk.backend().present(a, &.{wingetRow("Git.Git", &.{})}));
+
+    var gone: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = winget_absent, .fail = error.AccessDenied },
+    } };
+    var wg: Winget = .{ .runner = gone.runner(), .io = std.testing.io, .temp_dir = "/tmp" };
+    try testing.expectError(error.AccessDenied, wg.backend().present(a, &.{wingetRow("Git.Git", &.{})}));
+}
 
 test "winget: install carries source, scope and override, and both agreements" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

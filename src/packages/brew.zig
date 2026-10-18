@@ -136,6 +136,7 @@ pub const Brew = struct {
         .installMarked = installMarkedImpl,
         .installUnmarked = installUnmarkedImpl,
         .astray = astrayImpl,
+        .present = presentImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
         .installerExit = installerExitImpl,
@@ -386,6 +387,25 @@ pub const Brew = struct {
             .astray = try astray.toOwnedSlice(arena),
             .unchecked = try unchecked.toOwnedSlice(arena),
         };
+    }
+
+    /// A formula row is present when brew has the formula in any form,
+    /// asked for or pulled in behind another. A cask row is never present:
+    /// the cask query lists the whole Caskroom, so a cask brew has is in
+    /// `installedExplicit`'s answer already, and none is asked.
+    fn presentImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        var formulae: std.ArrayList(Row) = .empty;
+        for (rows) |row| {
+            if (try kindOf(row) == .formula) try formulae.append(arena, row);
+        }
+        if (formulae.items.len == 0) return &.{};
+        const all = try self.allFormulae(arena);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (formulae.items) |row| {
+            if (all.contains(row.name)) try out.append(arena, row.name);
+        }
+        return out.toOwnedSlice(arena);
     }
 
     const Places = struct {
@@ -682,24 +702,11 @@ pub const Brew = struct {
     /// the question `--installed-on-request` deliberately does not answer.
     /// `--full-name` for the same reason the explicit query carries it: a
     /// tapped formula must come back spelled the way a row spells it.
-    ///
-    /// A query that cannot be answered yields nothing rather than failing the
-    /// batch, which leaves every row to `brew install` as before; the rows
-    /// that cannot converge that way are said so the run does not look
-    /// clean.
-    fn installedFormulae(self: *Brew, arena: std.mem.Allocator) std.mem.Allocator.Error!std.StringHashMap(void) {
+    fn allFormulae(self: *Brew, arena: std.mem.Allocator) anyerror!std.StringHashMap(void) {
+        const res = try self.runner.run(arena, &(query_env ++ .{ self.exe, "list", "--formula", "--full-name" }));
+        try exec.checkTimedOut(res);
+        if (!res.ok) return error.BrewQueryFailed;
         var set: std.StringHashMap(void) = .init(arena);
-        const res = self.runner.run(arena, &(query_env ++ .{ self.exe, "list", "--formula", "--full-name" })) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => {
-                self.sayUnlistable();
-                return set;
-            },
-        };
-        if (res.timed_out or !res.ok) {
-            self.sayUnlistable();
-            return set;
-        }
         var lines = std.mem.splitScalar(u8, res.stdout, '\n');
         while (lines.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
@@ -707,6 +714,20 @@ pub const Brew = struct {
             try set.put(line, {});
         }
         return set;
+    }
+
+    /// `allFormulae` for an install. A query that cannot be answered yields
+    /// nothing rather than failing the batch, which leaves every row to `brew
+    /// install` as before; the rows that cannot converge that way are said so
+    /// the run does not look clean.
+    fn installedFormulae(self: *Brew, arena: std.mem.Allocator) std.mem.Allocator.Error!std.StringHashMap(void) {
+        return self.allFormulae(arena) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                self.sayUnlistable();
+                return .init(arena);
+            },
+        };
     }
 
     fn sayUnlistable(self: *Brew) void {
@@ -1567,6 +1588,71 @@ test "installedExplicit: a failed query is an error, never an empty set" {
     const be = b.backend();
 
     try testing.expectError(error.BrewQueryFailed, be.installedExplicit(a));
+}
+
+test "present: a formula held as a dependency is present, one brew lacks is not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{
+            .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name",
+            .stdout = "openssl@3\nd12frosted/emacs-plus/emacs-plus@30\nripgrep\n",
+        },
+    } };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    const got = (try b.backend().present(a, &.{
+        rowOf("openssl@3", &.{}),
+        rowOf("fd", &.{}),
+        rowOf("d12frosted/emacs-plus/emacs-plus@30", &.{}),
+    })).?;
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("openssl@3", got[0]);
+    try testing.expectEqualStrings("d12frosted/emacs-plus/emacs-plus@30", got[1]);
+}
+
+test "present: a cask row is not present, and no query is made for it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    const got = (try b.backend().present(a, &.{
+        rowOf("ghostty", &.{.{ .key = "kind", .value = .{ .string = "cask" } }}),
+    })).?;
+    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+}
+
+test "present: a failed or killed query is an error, never an empty answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // An empty answer would call every candidate removed.
+    var failed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name", .code = 1 },
+    } };
+    var w: std.Io.Writer.Allocating = .init(a);
+    var b: Brew = .{ .runner = failed.runner(), .err = &w.writer };
+    try testing.expectError(error.BrewQueryFailed, b.backend().present(a, &.{rowOf("ripgrep", &.{})}));
+    try testing.expectEqual(@as(usize, 0), w.written().len);
+
+    var killed: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name", .timed_out = true },
+    } };
+    var k: Brew = .{ .runner = killed.runner() };
+    try testing.expectError(error.TimedOut, k.backend().present(a, &.{rowOf("ripgrep", &.{})}));
+
+    var gone: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "env -u HOMEBREW_NO_INSTALL_FROM_API HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ASK=1 brew list --formula --full-name", .fail = error.FileNotFound },
+    } };
+    var g: Brew = .{ .runner = gone.runner() };
+    try testing.expectError(error.FileNotFound, g.backend().present(a, &.{rowOf("ripgrep", &.{})}));
 }
 
 test "available: present when brew answers, absent when it is not there" {
