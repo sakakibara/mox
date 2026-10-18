@@ -12,7 +12,9 @@
 # one: `mox apply` fetches the pinned installer, verifies its digest, installs
 # scoop under a fixture profile and one app through it, and a fresh `mox
 # status` sees both. That runs only under CI, because the installer edits
-# the user's PATH in the registry.
+# the user's PATH in the registry. The app is then uninstalled with scoop:
+# `mox status --porcelain` must report it package_removed, and the next
+# `mox apply` must leave it off the machine and exit 1.
 #
 # A manager that is absent anywhere else SKIPS, loudly and counted. A skip is
 # never a pass: "this runner had no scoop" must never read as "the scoop
@@ -27,6 +29,9 @@
 # a bound, because a Windows image that stages an App Installer it cannot
 # register leaves the command on PATH and hanging. A winget that does answer
 # is a hard gate like any other: from there, anything wrong is the adapter's.
+# This script installs nothing through winget, so winget's answer to whether
+# it holds a recorded package off its explicit list is proven by fixtures
+# alone.
 $ErrorActionPreference = 'Stop'
 # mox's exit code is read from $LASTEXITCODE: rc 1 for drift is an answer,
 # not an error to stop on.
@@ -229,6 +234,33 @@ name = "7zip"
                 No "$backend`: 7zip is still MISSING after apply" (Tail $status.Out)
             } else {
                 Ok "$backend`: the drift is clean after apply"
+            }
+
+            # The other way round: the app the apply recorded, uninstalled
+            # with scoop, must read REMOVED, and apply must leave it off. The
+            # app directory is the oracle, read without asking scoop.
+            $appDir = Join-Path $fixtureHome 'scoop\apps\7zip'
+            if (-not (Test-Path -LiteralPath $appDir)) {
+                No "$backend`: 7zip is not under $appDir, so the removal check has no oracle" (Tail $status.Out)
+                return
+            }
+            & scoop uninstall 7zip *> $null
+            if (Test-Path -LiteralPath $appDir) {
+                No "$backend`: scoop did not uninstall 7zip, so the removal check proves nothing" $appDir
+                return
+            }
+            $removed = Invoke-Mox $case @('status', '--porcelain')
+            if ($removed.Out -split "`r?`n" -contains "package_removed`tscoop`t7zip") {
+                Ok "$backend`: a recorded app scoop uninstalled reads package_removed"
+            } else {
+                No "$backend`: expected package_removed for 7zip after the uninstall" (Tail ($removed.Out + $removed.Err))
+            }
+            $reapply = Invoke-Mox $case @('apply')
+            if ($reapply.Rc -eq 1 -and -not (Test-Path -LiteralPath $appDir) -and
+                $reapply.Err -match [regex]::Escape("mox apply: scoop: 7zip is not installed here any more, so it was not reinstalled")) {
+                Ok "$backend`: apply leaves the removed app off the machine, says why, and exits 1"
+            } else {
+                No "$backend`: apply reinstalled the removed app, or did not exit 1 over it (exit $($reapply.Rc))" (Tail ($reapply.Out + $reapply.Err))
             }
         } finally {
             Remove-Item Env:\MOX_REPO, Env:\MOX_STATE_DIR -ErrorAction SilentlyContinue

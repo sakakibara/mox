@@ -684,3 +684,60 @@ test "brew: every formula asked for by name is judged for an alias that moved" {
     // records no alias.
     if (onCi()) try testing.expectEqual(@as(usize, 0), judged.astray.len);
 }
+
+fn formulaRows(arena: std.mem.Allocator, names: []const []const u8) ![]const packages.manifest.Row {
+    var rows: std.ArrayList(packages.manifest.Row) = .empty;
+    for (names) |name| {
+        try rows.append(arena, .{ .name = name, .backend = "brew", .origin = "/dev/null", .label = "data/packages/brew.toml", .index = rows.items.len });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+test "brew: present answers for a formula held only as a dependency" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // What keeps a row whose package was demoted to a dependency from being
+    // judged removed: brew still holds it, just not on request.
+    const all = try rawLines(a, io, &.{ "brew", "list", "--formula", "--full-name" });
+    const requested = try rawLines(a, io, &.{ "brew", "list", "--formula", "--full-name", "--installed-on-request" });
+    var deps: std.ArrayList([]const u8) = .empty;
+    for (all) |name| {
+        if (!contains(requested, name)) try deps.append(a, name);
+    }
+    if (deps.items.len == 0) return skipUnlessCi("no formula is held only as a dependency");
+
+    var p: packages.exec.Process = .{ .io = io };
+    var b: packages.brew.Brew = .{ .runner = p.runner() };
+    const got = (try b.backend().present(a, try formulaRows(a, deps.items))).?;
+    for (deps.items) |name| {
+        if (!contains(got, name)) {
+            std.debug.print("'{s}' is held as a dependency but present did not answer it\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try testing.expectEqual(deps.items.len, got.len);
+}
+
+test "brew: present leaves out a formula brew does not hold" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try needBrew(a, io);
+
+    // No formula may begin with `zzz-mox-`, so brew holds none by this name.
+    const name = "zzz-mox-not-a-formula";
+    const all = try rawLines(a, io, &.{ "brew", "list", "--formula", "--full-name" });
+    try testing.expect(!contains(all, name));
+
+    var p: packages.exec.Process = .{ .io = io };
+    var b: packages.brew.Brew = .{ .runner = p.runner() };
+    const got = (try b.backend().present(a, try formulaRows(a, &.{name}))).?;
+    try testing.expectEqual(@as(usize, 0), got.len);
+}

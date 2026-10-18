@@ -1118,9 +1118,9 @@ answered without the real thing:
 
 | Gate | Covers |
 |---|---|
-| `zig build test-backends` | brew, read-only, differential against brew's own output |
-| `sh tests/linux_backends_test.sh` | apt, dnf (both generations), zypper, pacman -- a full install round trip per image, in containers; and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply |
-| `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget: read-only where present; on a runner without scoop, a bootstrap from the pinned installer plus one install |
+| `zig build test-backends` | brew, read-only, differential against brew's own output, including that a formula held only as a dependency is present and one brew does not hold is not |
+| `sh tests/linux_backends_test.sh` | apt, dnf (both generations), zypper, pacman -- a full install round trip per image, in containers, and a removal one: the recorded package uninstalled with the manager reads REMOVED and stays off the next apply, which exits 1, and back as another package's dependency it reads MISSING (zypper: not REMOVED, its ledger answering); and Homebrew bootstrapped from its pinned installer in a Debian container, installing one formula in the same apply, then held not on request (MISSING) and uninstalled (REMOVED) |
+| `pwsh -NoProfile -File tests/windows_backends_test.ps1` | scoop, winget: read-only where present; on a runner without scoop, a bootstrap from the pinned installer plus one install, which uninstalled with scoop reads REMOVED and stays off the next apply. winget's answer for a recorded package off its explicit list is proven by fixtures only |
 
 All three run nightly in CI, or on demand; the Windows one runs on every
 push as well, a schedule firing only from the default branch. Only the real

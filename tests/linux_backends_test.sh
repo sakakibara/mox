@@ -25,6 +25,12 @@
 # the same fetch, digest check and non-interactive install a fresh machine
 # gets -- before installing the package through it.
 #
+# Each manager also runs the round trip the other way: a package mox
+# installed and recorded is uninstalled with the manager and must read
+# REMOVED, which apply leaves off the machine, while the same package held
+# again as a dependency must read MISSING. Both rest on the adapter's answer
+# to whether the manager holds a row in any form.
+#
 # Several cases run the other way round, because a name a manager resolves to
 # something other than itself is a fact about the manager that no fake can
 # establish: `apt-get install -y vim nano-` removes nano; `apt-get install --
@@ -315,7 +321,8 @@ sha256 = "$brew_installer_sha256"
 [[packages]]
 name = "$pkg"
 EOF
-  cat >"$case_dir/user.sh" <<'EOF'
+  printf 'pkg=%s\n' "$pkg" >"$case_dir/user.sh"
+  cat >>"$case_dir/user.sh" <<'EOF'
 set -e
 export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/home/tester
 echo "--- before ---"
@@ -323,7 +330,19 @@ echo "--- before ---"
 echo "--- apply ---"
 /w/mox apply || true
 echo "--- after ---"
-PATH="/home/linuxbrew/.linuxbrew/bin:$PATH" /w/mox status || true
+export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+/w/mox status || true
+echo "--- demoted ---"
+brew tab --no-installed-on-request "$pkg" >/dev/null 2>&1 || echo "demote-failed"
+/w/mox status --porcelain || true
+echo "--- removed ---"
+brew uninstall "$pkg" >/dev/null 2>&1 || echo "uninstall-failed"
+/w/mox status --porcelain || true
+echo "--- reapply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "reapply-exit=$rc"
+if brew list --formula "$pkg" >/dev/null 2>&1; then echo "reapplied-held=yes"; else echo "reapplied-held=no"; fi
 EOF
   # What Homebrew's installer needs on Debian, and a user it will run as.
   cat >"$case_dir/root.sh" <<'EOF'
@@ -346,7 +365,7 @@ EOF
   fi
 
   apply="$(sed -n '/--- apply ---/,/--- after ---/p' "$out")"
-  after="$(sed -n '/--- after ---/,$p' "$out")"
+  after="$(sed -n '/--- after ---/,/--- demoted ---/p' "$out")"
 
   # The label column's width is mox's business, not this gate's.
   if echo "$apply" | grep -qE "bootstrapping[[:space:]]+$backend"; then
@@ -371,6 +390,39 @@ EOF
     no "$backend ($image): still MISSING after apply" "$(echo "$after" | tail -5)"
   else
     ok "$backend ($image): the drift is clean after apply"
+  fi
+
+  # The `present` round trip, on the formula the apply just recorded. brew
+  # keeps no separate dependency state: a formula nothing asked for by name
+  # is one whose receipt says it was not installed on request, which `brew
+  # tab` sets without pulling in a second formula. Held so, the row is
+  # present and MISSING; uninstalled, it is REMOVED, and apply leaves it off.
+  tab="$(printf '\t')"
+  demoted="$(sed -n '/--- demoted ---/,/--- removed ---/p' "$out")"
+  removed="$(sed -n '/--- removed ---/,/--- reapply ---/p' "$out")"
+  reapply="$(sed -n '/--- reapply ---/,$p' "$out")"
+  if echo "$demoted" | grep -q "^demote-failed"; then
+    no "$backend ($image): brew tab could not mark $pkg as not asked for" "$(echo "$demoted" | tail -3)"
+  elif echo "$demoted" | grep -qxF "package_missing$tab$backend$tab$pkg"; then
+    ok "$backend ($image): a recorded formula held but not on request is present, so MISSING rather than REMOVED"
+  else
+    no "$backend ($image): expected package_missing for $pkg held but not on request" "$(echo "$demoted" | tail -5)"
+  fi
+
+  if echo "$removed" | grep -q "^uninstall-failed"; then
+    no "$backend ($image): brew could not uninstall $pkg, so the case proves nothing" "$(echo "$removed" | tail -3)"
+  elif echo "$removed" | grep -qxF "package_removed$tab$backend$tab$pkg"; then
+    ok "$backend ($image): a recorded formula brew uninstalled reads package_removed"
+  else
+    no "$backend ($image): expected package_removed for $pkg after the uninstall" "$(echo "$removed" | tail -5)"
+  fi
+
+  if echo "$reapply" | grep -q "^reapply-exit=1" && echo "$reapply" | grep -q "^reapplied-held=no" &&
+    echo "$reapply" | grep -qF "mox apply: $backend: $pkg is not installed here any more, so it was not reinstalled"; then
+    ok "$backend ($image): apply leaves the removed formula off the machine, says why, and exits 1"
+  else
+    no "$backend ($image): apply reinstalled the removed formula, or did not exit 1 over it" \
+      "$(echo "$reapply" | grep -E 'not installed here|Packages:|^reapply-exit=|^reapplied-held=' | tail -4)"
   fi
 }
 
@@ -4212,6 +4264,186 @@ CASE
   fi
 }
 
+# A declared package the user uninstalls with the manager, and the same
+# package back on the machine as another package's dependency. Both turn on
+# the adapter's `present` answer -- does the manager hold this row in any
+# form -- which only the real manager can give: apt's dpkg states, pacman's
+# local database and rpm's on the dnf and zypper families.
+#
+# The round trip is the one a user sees: the row is declared, `mox apply`
+# installs and records it, the manager uninstalls it, and `mox status
+# --porcelain` must say package_removed; the next `mox apply` must leave it
+# off the machine and exit 1, the row being left for the user's decision.
+# Then `parent` pulls the package back in as its dependency, and the row must
+# read package_missing, never package_removed: held in any form is held.
+#
+# zypper keeps its explicit set as a ledger narrowed to what rpm has, so a
+# ledger id rpm holds reads explicit however it got there, and `present` is
+# never asked about it; its dependency leg asserts only that the row is not
+# REMOVED.
+run_removed_case() {
+  image="$1"
+  manager="$2"
+  pkg="$3"
+  parent="$4"
+  backend="$manager removed"
+
+  case_dir="$(mktemp -d "$work/$manager-removed.XXXXXX")"
+  mkdir -p "$case_dir/repo/src" "$case_dir/repo/data/packages" "$case_dir/state"
+  cp "$mox_bin" "$case_dir/mox"
+  cat >"$case_dir/repo/data/packages/$manager.toml" <<EOF
+backend = "$manager"
+
+[[packages]]
+name = "$pkg"
+EOF
+
+  # What the case asks of the manager directly, never through mox: whether it
+  # holds the package, whether it reports it asked for, and the uninstall and
+  # parent install that move it between the two.
+  case "$manager" in
+    apt)
+      cat >"$case_dir/manager.sh" <<EOF
+export DEBIAN_FRONTEND=noninteractive
+prep() { apt-get update >/dev/null; }
+held() { dpkg-query -W -f '\${Status}\n' $pkg 2>/dev/null | grep -q ' installed\$'; }
+asked() { apt-mark showmanual | grep -qx $pkg; }
+uninstall() { apt-get remove -y -- $pkg; }
+install_parent() { apt-get install -y --no-install-recommends -- $parent; }
+EOF
+      ;;
+    dnf)
+      cat >"$case_dir/manager.sh" <<EOF
+prep() { :; }
+held() { rpm -q $pkg >/dev/null 2>&1; }
+asked() { dnf -q repoquery --userinstalled --qf '%{name}\n' | grep -qx $pkg; }
+uninstall() { dnf remove -y $pkg; }
+install_parent() { dnf install -y $parent; }
+EOF
+      ;;
+    pacman)
+      cat >"$case_dir/manager.sh" <<EOF
+prep() { pacman -Sy --noconfirm >/dev/null 2>&1 || true; }
+held() { pacman -Q -- $pkg >/dev/null 2>&1; }
+asked() { pacman -Qeq | grep -qx $pkg; }
+uninstall() { pacman -R --noconfirm -- $pkg; }
+install_parent() { pacman -S --noconfirm -- $parent; }
+EOF
+      ;;
+    zypper)
+      cat >"$case_dir/manager.sh" <<EOF
+prep() { :; }
+held() { rpm -q $pkg >/dev/null 2>&1; }
+asked() { false; }
+uninstall() { zypper -n remove $pkg; }
+install_parent() { zypper -n install $parent; }
+EOF
+      ;;
+  esac
+  cat >"$case_dir/case.sh" <<'CASE'
+set -e
+export MOX_REPO=/w/repo MOX_STATE_DIR=/w/state HOME=/root
+. /w/manager.sh
+yn() { if "$@"; then echo yes; else echo no; fi; }
+prep
+echo "premise-held=$(yn held)"
+echo "--- apply ---"
+/w/mox apply || true
+echo "installed-held=$(yn held)"
+echo "--- uninstall ---"
+uninstall >/dev/null 2>&1 || echo "uninstall-failed"
+echo "uninstalled-held=$(yn held)"
+echo "--- removed ---"
+/w/mox status --porcelain || true
+echo "--- reapply ---"
+rc=0
+/w/mox apply || rc=$?
+echo "reapply-exit=$rc"
+echo "reapplied-held=$(yn held)"
+echo "--- parent ---"
+install_parent >/dev/null 2>&1 || echo "parent-failed"
+echo "parent-held=$(yn held)"
+echo "parent-asked=$(yn asked)"
+echo "--- dependency ---"
+/w/mox status --porcelain || true
+CASE
+
+  out="$case_dir/out.txt"
+  pull_image "$image" "$backend" "$case_dir" || return 0
+  if [ "$manager" = pacman ]; then
+    pacman_can_sync "$image" "$backend" || return 0
+  fi
+
+  if ! docker run --rm --platform "$platform" -v "$case_dir:/w" "$image" sh /w/case.sh >"$out" 2>&1; then
+    no "$backend ($image): container run failed" "$(tail -3 "$out")"
+    return
+  fi
+
+  tab="$(printf '\t')"
+  removed_line="package_removed$tab$manager$tab$pkg"
+  missing_line="package_missing$tab$manager$tab$pkg"
+  apply="$(sed -n '/--- apply ---/,/--- uninstall ---/p' "$out")"
+  removed="$(sed -n '/--- removed ---/,/--- reapply ---/p' "$out")"
+  reapply="$(sed -n '/--- reapply ---/,/--- parent ---/p' "$out")"
+  dependency="$(sed -n '/--- dependency ---/,$p' "$out")"
+
+  if grep -q "^premise-held=no" "$out" && grep -q "^installed-held=yes" "$out" &&
+    echo "$apply" | grep -q "Packages: 1 installed, 0 failed"; then
+    ok "$backend ($image): apply installed $pkg, which the machine lacked"
+  else
+    no "$backend ($image): the case could not install $pkg through mox" \
+      "$(grep -E '^premise-held=|^installed-held=|Packages:' "$out" | tail -3)"
+    return
+  fi
+
+  if ! grep -q "^uninstalled-held=no" "$out"; then
+    no "$backend ($image): $manager did not uninstall $pkg, so the case proves nothing" \
+      "$(grep -E '^uninstall-failed|^uninstalled-held=' "$out")"
+    return
+  fi
+
+  if echo "$removed" | grep -qxF "$removed_line"; then
+    ok "$backend ($image): a recorded package the manager uninstalled reads package_removed"
+  else
+    no "$backend ($image): expected '$removed_line' after the uninstall" "$(echo "$removed" | tail -5)"
+  fi
+
+  if grep -q "^reapply-exit=1" "$out" && grep -q "^reapplied-held=no" "$out" &&
+    echo "$reapply" | grep -qF "mox apply: $manager: $pkg is not installed here any more, so it was not reinstalled"; then
+    ok "$backend ($image): apply leaves the removed package off the machine, says why, and exits 1"
+  else
+    no "$backend ($image): apply reinstalled the removed package, or did not exit 1 over it" \
+      "$(echo "$reapply" | grep -E 'not installed here|Packages:|^reapply-exit=|^reapplied-held=' | tail -4)"
+  fi
+
+  if ! grep -q "^parent-held=yes" "$out"; then
+    no "$backend ($image): installing $parent did not pull $pkg back in" \
+      "$(grep -E '^parent-failed|^parent-held=' "$out")"
+    return
+  fi
+  if [ "$manager" != zypper ] && ! grep -q "^parent-asked=no" "$out"; then
+    no "$backend ($image): $manager reports $pkg asked for, so it is not a dependency and the case proves nothing" \
+      "$(grep -E '^parent-asked=' "$out")"
+    return
+  fi
+
+  if echo "$dependency" | grep -qxF "$removed_line"; then
+    no "$backend ($image): a package held as a dependency still reads package_removed" "$(echo "$dependency" | tail -5)"
+  elif [ "$manager" = zypper ]; then
+    if echo "$dependency" | grep -qxF "$missing_line"; then
+      no "$backend ($image): a ledger id rpm holds reads package_missing" "$(echo "$dependency" | tail -5)"
+    else
+      ok "$backend ($image): the package back as a dependency is no longer REMOVED"
+    fi
+    na "$backend ($image): a package held as a dependency is answered by present" \
+      "zypper's explicit set is its ledger narrowed to rpm, so a ledger id rpm holds reads explicit however it got there and present is never asked about it"
+  elif echo "$dependency" | grep -qxF "$missing_line"; then
+    ok "$backend ($image): the package back as a dependency is present, so MISSING rather than REMOVED"
+  else
+    no "$backend ($image): expected '$missing_line' once $parent pulled $pkg in" "$(echo "$dependency" | tail -5)"
+  fi
+}
+
 if [ "$#" -gt 0 ]; then
   while [ "$#" -ge 3 ]; do
     run_case "$1" "$2" "$3"
@@ -4243,6 +4475,7 @@ else
   run_apt_arch_desync_case debian:stable "$foreign_arch"
   run_dependency_case debian:stable apt
   run_apt_held_dependency_case debian:stable
+  run_removed_case debian:stable apt libjq1 jq
   # The flat-index refusal differs by apt version -- 2.6.1 prints no policy
   # stanza for an architecture dpkg has not enabled, 3.0.3 prints one -- so
   # the pinned release and the floating one both run.
@@ -4269,6 +4502,8 @@ else
   run_dependency_case rockylinux:9 dnf
   run_dependency_case fedora:42 dnf
   run_dependency_case fedora:latest dnf
+  run_removed_case rockylinux:9 dnf oniguruma jq
+  run_removed_case fedora:latest dnf oniguruma jq
   run_dnf_no_repository_case rockylinux:9
   run_dnf_no_repository_case fedora:latest
   run_dnf_assumeno_case rockylinux:9
@@ -4291,6 +4526,7 @@ else
   # Tumbleweed's 1.14.101. Leap ships what its repositories hold, so curl
   # steps back one build to give the lock an update to stop.
   run_zypper_installed_lock_case opensuse/leap:15.6 ripgrep curl
+  run_removed_case opensuse/tumbleweed zypper libjq1 jq
   # Arch publishes no arm64 image, so these cases skip on an arm64 host.
   run_case archlinux:latest pacman ripgrep
   run_pacman_group_case archlinux:latest
@@ -4303,6 +4539,7 @@ else
   run_pacman_upgrade_dependency_case archlinux:latest
   run_pacman_sync_search_case archlinux:latest bat
   run_dependency_case archlinux:latest pacman
+  run_removed_case archlinux:latest pacman oniguruma jq
   run_pacman_no_sync_case archlinux:latest
   run_pacman_unsatisfiable_case archlinux:latest cowsay
   run_pacman_conflict_case archlinux:latest cowsay
