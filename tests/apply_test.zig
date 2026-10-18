@@ -7977,6 +7977,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/packages/ledger.zig", "add", 1 },
         .{ "src/packages/manifest.zig", "expectRefusal", 1 },
         .{ "src/packages/plugin.zig", "bootstrapImpl", 2 },
+        .{ "src/packages/seen.zig", "replace", 3 },
         .{ "src/packages/windows.zig", "installedExplicitImpl", 1 },
         .{ "src/packages/write.zig", "append", 2 },
         .{ "src/packages/write.zig", "seededManifest", 1 },

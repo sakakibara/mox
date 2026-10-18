@@ -19,6 +19,7 @@ pub const discover = @import("discover.zig");
 pub const report = @import("report.zig");
 pub const write = @import("write.zig");
 pub const space = @import("space.zig");
+pub const seen = @import("seen.zig");
 
 test {
     // Force test discovery in submodules whose `pub const` re-export above
@@ -41,4 +42,5 @@ test {
     _ = report;
     _ = write;
     _ = space;
+    _ = seen;
 }

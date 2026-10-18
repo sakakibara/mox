@@ -73,8 +73,8 @@ pub fn accept(arena: std.mem.Allocator, io: Io, state_dir: []const u8, origin: O
 /// a first run can leave it: an OS file, a lock file holding nothing or a
 /// holder line, `bin/` holding only the running mox, `coupling/` holding
 /// the coupling graph and declines, the trigger state, the scripts' PATH
-/// note, zypper's ledger, commit's recovery copies, and a check hook's
-/// staging.
+/// note, zypper's ledger, the packages each machine was seen holding,
+/// commit's recovery copies, and a check hook's staging.
 fn freshEntry(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent.Entry) !bool {
     if (isOsFile(e)) return true;
     const path = try std.fs.path.join(arena, &.{ state_dir, e.name });
@@ -84,6 +84,7 @@ fn freshEntry(arena: std.mem.Allocator, io: Io, state_dir: []const u8, e: dirent
     if (std.mem.eql(u8, e.name, trigger_state.state_basename)) return e.kind == .file and triggerForm(arena, io, path);
     if (std.mem.eql(u8, e.name, "mox-path")) return e.kind == .file and moxPathForm(arena, io, path);
     if (std.mem.eql(u8, e.name, "zypper.txt")) return e.kind == .file and try ledgerForm(arena, io, path);
+    if (std.mem.eql(u8, e.name, "seen")) return e.kind == .directory and try seenOnly(arena, io, path);
     if (std.mem.eql(u8, e.name, "commit-recovery")) return e.kind == .directory and try recoveryOnly(arena, io, path);
     return switch (run_scripts.checkStaging(e.name) orelse return false) {
         .dir => e.kind == .directory and try checkDirForm(arena, io, path),
@@ -114,6 +115,17 @@ fn ledgerForm(arena: std.mem.Allocator, io: Io, path: []const u8) !bool {
     while (it.next()) |id_| {
         if (id_.len == 0 or std.mem.indexOfAny(u8, id_, " \t\r") != null) return false;
         if ((try seen.fetchPut(arena, id_, {})) != null) return false;
+    }
+    return true;
+}
+
+/// `seen/` holds only regular `*.txt` files, whatever they say, and OS
+/// files: a record mox cannot read is still one it replaces.
+fn seenOnly(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
+    const entries = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
+    for (entries) |e| {
+        if (isOsFile(e)) continue;
+        if (e.kind != .file or e.name.len <= ".txt".len or !std.mem.endsWith(u8, e.name, ".txt")) return false;
     }
     return true;
 }
@@ -292,7 +304,8 @@ fn readMarker(arena: std.mem.Allocator, io: Io, state_dir: []const u8) !Marker {
 /// The entries of a state directory, beside the store, the lock files, the
 /// private layer and `bin/`, that mox makes: the coupling graph, commit's
 /// recovery copies, the scripts' PATH note, the trigger state, zypper's
-/// ledger, and a check hook's staging.
+/// ledger, the packages each machine was seen holding, and a check hook's
+/// staging.
 pub fn isMadeByMox(name: []const u8) bool {
     const fixed = [_][]const u8{
         "coupling",
@@ -300,6 +313,7 @@ pub fn isMadeByMox(name: []const u8) bool {
         "mox-path",
         trigger_state.state_basename,
         "zypper.txt",
+        "seen",
     };
     for (fixed) |n| if (std.mem.eql(u8, name, n)) return true;
     return run_scripts.isCheckStaging(name);
@@ -393,7 +407,7 @@ test "accept: a directory holding only lock files and OS files is fresh, and an 
     try testing.expect((try accept(a, io, dir, .explicit)) == .refused);
 }
 
-test "accept: mox-path, zypper.txt, commit-recovery/ and a check hook's staging are fresh in the forms mox writes them, and foreign in any other" {
+test "accept: mox-path, zypper.txt, seen/, commit-recovery/ and a check hook's staging are fresh in the forms mox writes them, and foreign in any other" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -426,6 +440,12 @@ test "accept: mox-path, zypper.txt, commit-recovery/ and a check hook's staging 
         &.{.{ .path = "mox-path", .data = try std.mem.concat(a, u8, &.{ abs, "\n\n", abs, "\n" }) }},
         &.{.{ .path = "zypper.txt", .data = "" }},
         &.{.{ .path = "zypper.txt", .data = "ripgrep\nfd\n" }},
+        &.{.{ .path = "seen" }},
+        &.{
+            .{ .path = "seen/brew-0123456789abcdef.txt", .data = "mox-seen 1\nripgrep\n" },
+            .{ .path = "seen/apt-fedcba9876543210.txt", .data = "mox-seen 2\nanything at all\n" },
+            .{ .path = "seen/.DS_Store", .data = "" },
+        },
         &.{.{ .path = "commit-recovery" }},
         &.{
             .{ .path = "commit-recovery/20240101T000000Z/repo/src/.zshrc", .data = "x\n" },
@@ -453,6 +473,11 @@ test "accept: mox-path, zypper.txt, commit-recovery/ and a check hook's staging 
         &.{.{ .path = "zypper.txt", .data = "my notes\n" }},
         &.{.{ .path = "zypper.txt", .data = "fd\n\nripgrep\n" }},
         &.{.{ .path = "zypper.txt", .data = "fd\nfd\n" }},
+        &.{.{ .path = "seen", .data = "" }},
+        &.{.{ .path = "seen/notes", .data = "x\n" }},
+        &.{.{ .path = "seen/.txt", .data = "" }},
+        &.{.{ .path = "seen/brew-0123456789abcdef.txt" }},
+        &.{.{ .path = "seen/sub/brew-0123456789abcdef.txt", .data = "" }},
         &.{.{ .path = "commit-recovery", .data = "" }},
         &.{.{ .path = "commit-recovery/notes", .data = "x\n" }},
         &.{.{ .path = "commit-recovery/20240101T000000Z", .data = "x\n" }},
@@ -475,6 +500,11 @@ test "accept: mox-path, zypper.txt, commit-recovery/ and a check hook's staging 
         try tmp.dir.createDirPath(io, "link/commit-recovery/20240101T000000Z/repo");
         try tmp.dir.symLink(io, "/bin/sh", "link/commit-recovery/20240101T000000Z/repo/sh", .{});
         try testing.expect((try accept(a, io, try std.fs.path.join(a, &.{ abs, "link" }), .explicit)) == .refused);
+    }
+    if (@import("builtin").os.tag != .windows) {
+        try tmp.dir.createDirPath(io, "seenlink/seen");
+        try tmp.dir.symLink(io, "/etc/hosts", "seenlink/seen/brew-0123456789abcdef.txt", .{});
+        try testing.expect((try accept(a, io, try std.fs.path.join(a, &.{ abs, "seenlink" }), .explicit)) == .refused);
     }
 }
 

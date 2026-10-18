@@ -298,6 +298,7 @@ test "actionFor: private preserved by default, removed on purge; trash and the h
     try testing.expectEqual(Action.preserve, actionFor(readers_name, true));
     try testing.expectEqual(Action.preserve, actionFor(gate_name, true));
     try testing.expectEqual(Action.remove, actionFor("coupling", false));
+    try testing.expectEqual(Action.remove, actionFor("seen", false));
     for ([_][]const u8{ "applied", "snapshots" }) |n| try testing.expectEqual(Action.foreign, actionFor(n, false));
     try testing.expectEqual(Action.remove, actionFor("check-0123456789abcdef.out", false));
     try testing.expectEqual(Action.foreign, actionFor("check-list.txt", false));
