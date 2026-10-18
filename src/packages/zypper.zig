@@ -7,9 +7,10 @@
 //! explicit set, intersected with what rpm reports actually present.
 //!
 //! The intersection is what makes the ledger safe. A record alone would claim
-//! a package is installed after someone removed it, and apply would never put
-//! it back; a package that is gone drops out of the explicit set instead, is
-//! reported missing, and is reinstalled.
+//! a package is installed after someone removed it; a package that is gone
+//! drops out of the explicit set instead, and is judged like any other
+//! declared package off it: removed when this machine's record names it as
+//! held, missing otherwise.
 //!
 //! The cost is stated in `limitation`: a package installed by hand is
 //! invisible here, so it is never offered for tracking.

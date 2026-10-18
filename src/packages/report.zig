@@ -1,7 +1,8 @@
 //! One pass from manifest to per-backend drift, shared by every command that
-//! needs it: `status` prints it, `apply` installs what it reports missing,
-//! `commit` reconciles what it reports untracked. Building it once keeps
-//! those three from drifting apart in what they consider desired.
+//! needs it: `status` prints it, `apply` installs what it reports missing
+//! and withholds what it reports removed, `commit` reconciles what it
+//! reports untracked or removed. Building it once keeps those three from
+//! drifting apart in what they consider desired.
 //!
 //! What the machine was seen holding comes in from the caller as `Seen`:
 //! reading and writing the record is the caller's, since only it knows

@@ -431,12 +431,15 @@ placeholders are never written live; re-apply the source instead.
 
 A `data/packages/*.toml` manifest declares which packages belong on a machine,
 gated by the same axes your files use. `mox status` grows a `packages:` section
-naming what each manager is `MISSING`, what it has `UNTRACKED`, and what it
-holds `ASTRAY` under a name that has moved to another package; `mox apply`
-installs the missing ones, bootstrapping a declared manager that is not there
-yet; `mox commit` offers each untracked package `[y/b/s]` -- record it in the
-manifest, blacklist it so it is never offered again, or leave it. Apply only
-ever installs: nothing is uninstalled behind you. A repo with no
+naming what each manager is `MISSING`, what this machine held and has lost
+(`REMOVED`), what it has `UNTRACKED`, and what it holds `ASTRAY` under a name
+that has moved to another package; `mox apply` installs the missing ones,
+bootstrapping a declared manager that is not there yet, and leaves a removed
+one off the machine; `mox commit` offers each untracked package `[y/b/s]` --
+record it in the manifest, blacklist it so it is never offered again, or
+leave it -- and each removed one `[r/k/i/s]` -- remove its row, keep it off
+this machine, have the next apply install it, or leave it. Apply never
+uninstalls: nothing is removed behind you. A repo with no
 `data/packages/` directory is not using any of this, and queries no package
 manager at all. The manifest format, the seven shipped backends, and the
 plugin contract for any other manager are in [packages.md](packages.md).

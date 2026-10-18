@@ -12,7 +12,7 @@
 //! on THIS machine, which is exactly what the state directory holds. It is a
 //! candidate set, never the answer on its own -- an adapter intersects it with
 //! what the system actually has, so a package removed behind mox's back drops
-//! out and is reported missing rather than assumed present.
+//! out of the explicit set rather than being assumed present.
 
 const std = @import("std");
 

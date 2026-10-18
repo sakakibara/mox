@@ -33,9 +33,10 @@ each in the form mox writes it: the lock files (`mox.lock`, `readers.lock`,
 `mox`; `coupling/` holding only the coupling graph and its declines;
 `triggers.txt` holding only trigger records; `mox-path` holding only blank
 lines and absolute paths; `zypper.txt` empty or holding distinct package
-ids, one per line; `commit-recovery/` holding only run-id directories of
-commit's recovery copies (`repo/` and `private/` trees, `facts`, and
-`other/` files named by a number); a check hook's `check-<16 hex>` directory
+ids, one per line; `seen/` holding only regular `*.txt` files, the record
+of what each machine was seen holding; `commit-recovery/` holding only
+run-id directories of commit's recovery copies (`repo/` and `private/`
+trees, `facts`, and `other/` files named by a number); a check hook's `check-<16 hex>` directory
 holding at most one regular file and its `.out` file; and the files a file
 browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`). mox creates the
 state directory, with the marker, when it first writes; a command that only
@@ -315,8 +316,8 @@ There is no global refusal for an unresolved fact -- that is a
 per-script concern (below), not this pass's to fail wholesale.
 
 A repo carrying a `data/packages/` manifest also installs what that
-manifest declares and the machine lacks, after the pre stage and its
-re-capture; the machine is re-read again after any install or bootstrap,
+manifest declares and the machine lacks, apart from a package the machine
+has lost (below), after the pre stage and its re-capture; the machine is re-read again after any install or bootstrap,
 so a package installed here is a tool the post scripts see. A manager the
 manifest declares a `[[bootstrap]]` row for is installed first when absent,
 from its verified installer, and used by this same run; if that bootstrap
@@ -331,8 +332,8 @@ to proceed. brew's casks whose install elevates go first, together in one
 asked once more when their downloads are done: Homebrew clears sudo's
 cached credential in each brew process that first needs it. Any failure is an error class (rc 2), and a failed batch or a
 bootstrap alone still triggers the re-capture, since the machine changed.
-apply only ever installs -- an untracked package is
-reported by `mox status` and reconciled by `mox commit`, never uninstalled.
+apply never uninstalls: an untracked package is reported by `mox status`
+and reconciled by `mox commit`.
 An `ASTRAY` package (see [status](#status)) is left as it is for the same
 reason: apply names it on stderr with what repairs it, counts it in the
 summary (`, N astray`), and exits 1, as for file drift it leaves untouched.
@@ -1580,8 +1581,8 @@ so a lock it cannot take stops it with nothing removed. `mox.lock`,
 `readers.lock` and `readers.gate`, the lock files, are kept and listed as
 kept, whatever the flags. Only the entries mox makes in the state directory
 are removed (its stores, `bin/`, `coupling/`, `commit-recovery/`,
-`mox-path`, `triggers.txt`, `zypper.txt`, a check hook's leftover `check-<16
-hex>` directory and its `.out` capture, and `private/` with
+`mox-path`, `triggers.txt`, `zypper.txt`, `seen/`, a check hook's leftover
+`check-<16 hex>` directory and its `.out` capture, and `private/` with
 `--purge-private`); any other entry is listed as kept, "not made by mox",
 and never followed or removed. `bin/` and `trash/` are names a home
 directory holds too, so each is mox's only while it is a directory holding

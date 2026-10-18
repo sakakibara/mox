@@ -626,6 +626,13 @@ app. So a first `mox status` there reports a great deal untracked, and none
 of it is wrong -- it is what the manager can see. `mox commit` is how that
 set comes down: declare what you meant to keep, blacklist the rest.
 
+**Presence.** Whether a recorded package is on the machine in any form (see
+[Drift](#drift)) is a question a plugin cannot be asked: the protocol has no
+verb for it, so a plugin's packages are never reported removed, and one this
+machine lost is MISSING and installed again. winget has no list of every
+installed package by id, so it is asked once per package, by `status` too,
+and may refresh a stale source while it answers.
+
 ### zypper's ledger
 
 zypper has no explicitly-installed query (`--userinstalled` is not a flag it
@@ -633,8 +640,11 @@ knows, and `--installed-only` includes every dependency), so mox records what
 it installed in `<state dir>/zypper.txt` and treats that as the explicit set.
 
 That record is never trusted on its own: it is intersected with what `rpm`
-reports actually present, so a package removed behind mox's back drops out,
-is reported missing, and is reinstalled rather than assumed to be there. A
+reports actually present, so a package removed behind mox's back drops out
+rather than being assumed to be there. Like any other, it is then REMOVED
+when this machine's record names it as held (see [Drift](#drift)), and
+MISSING otherwise. A package back on the machine as another's dependency is
+in the ledger and in `rpm`'s answer, so it reads installed. A
 batch that failed part-way is read back the same way, so the rows that did
 land are recorded rather than retried forever.
 
@@ -650,6 +660,11 @@ under the backend rather than leaving it to be discovered.
 ## Drift
 
 - **MISSING** -- declared for this machine, not installed.
+- **REMOVED** -- declared for this machine, held by it before, and now held
+  by its manager in no form, a dependency included (`REMOVED   brew
+  ripgrep`). `status` counts it toward the exit code; `apply` leaves it off
+  the machine and exits 1; `commit` asks what to do with its row (see
+  [Installing and reconciling](#installing-and-reconciling)).
 - **UNTRACKED** -- installed, declared nowhere in the manifest, not
   blacklisted.
 - **ERROR** -- the manifest itself was refused, so no backend was reached
@@ -679,6 +694,53 @@ Untracked is measured against every row the manifest declares, not only the
 ones desired here: a package gated to another profile is already tracked, and
 offering to re-add it would write a second row for something the manifest
 already carries.
+
+What this machine held is a record per backend, under the state directory
+as `seen/<backend>-<owner>.txt`. The owner is derived from the machine's own
+identity -- `/etc/machine-id` (else `/var/lib/dbus/machine-id`) on Linux,
+the platform UUID on macOS, `MachineGuid` on Windows -- so machines sharing a
+state directory each keep their own record. A real `mox apply` that ran its
+package step writes it: the desired packages it verified installed, plus
+whatever the record held before that some `[[packages]]` row still declares
+under any gate, so a row gated off for a while keeps its uninstall. `status`
+never writes it; `commit` changes it only for its remove and install
+answers.
+
+The record is in effect, and a package can be REMOVED, only when it exists
+and can be read, the machine's identity could be read, the backend can be
+asked whether a package is on the machine, and, for apply, the manager was
+not bootstrapped in that run. Otherwise a declared package that is not
+installed is MISSING. A record a newer mox wrote is neither read nor
+replaced, and is noted as such; one that cannot be parsed is noted and
+replaced by the next apply; an identity that cannot be read is noted, and no
+record is used or written.
+
+A declared package off the manager's explicit list but in the record is
+asked about once more: is it on the machine in any form? One that is -- a
+keg-only formula brew records as no longer installed on request after
+another formula's upgrade, a package `apt-mark auto` was run on -- is
+MISSING, and apply marks it (below). One that is not is REMOVED. A manager
+that answered its list and then fails this question is BROKEN for the run.
+What each manager is asked:
+
+| Backend | Asked |
+|---|---|
+| brew | `brew list --formula --full-name`, every formula a dependency included. A cask is not asked: the cask list is the whole Caskroom, so a recorded cask off it is not on the machine |
+| apt | `dpkg-query -W`; present in any state but not installed or reduced to its configuration files, so a manual package left unconfigured stays MISSING and apply configures it |
+| pacman | `pacman -Qq` |
+| dnf, zypper | `rpm -qa` |
+| scoop | Not asked: `scoop export` lists every app directory, so a recorded app its list does not hold is taken as not on the machine |
+| winget | `winget list --id <id> --exact`, once per package |
+| plugin | Never asked, and never REMOVED (see [What a manager cannot be asked](#what-a-manager-cannot-be-asked)) |
+
+mox reports what it observed, not why. A formula or cask renamed upstream
+is not present under its old name, so its row can read REMOVED: remove the
+row with `mox commit`, and the package under its new name is then
+untracked, which commit offers to add. A manager reinstalled by hand, or two
+environments sharing one machine identity (a container bind-mounting the
+host's `/etc/machine-id`), can leave packages REMOVED that were never
+uninstalled on purpose; commit's `I` sets every one of a backend to install
+again.
 
 Package drift counts toward `mox status`'s exit code exactly as file drift
 does, and `--json` / `--porcelain` carry both sets (see
@@ -794,8 +856,20 @@ that would have needed the import contributes no name to them. Where
 accepting that key is a decision to take deliberately, import it before the
 first `mox apply`.
 
-apply **only ever installs**. Removal is never automatic: an untracked
-package is reported and reconciled, never uninstalled behind you. (What a
+apply **never uninstalls**. Removal is never automatic: an untracked
+package is reported and reconciled, never uninstalled behind you.
+
+A REMOVED package is **withheld**: apply installs nothing for it, says so on
+stderr, counts it in its summary (`, N removed`), and exits 1, leaving the
+decision to `mox commit`:
+
+```
+mox apply: brew: ripgrep is not installed here any more, so it was not reinstalled; mox commit can remove its row, keep it off this machine, or have the next apply install it
+```
+
+One that comes back during the run as a dependency of another install is
+not reported as restored; the next run finds it present, so MISSING, and
+marks it. (What a
 manager does on the way -- pacman's full upgrade, a dependency brew drops --
 is the manager's own behavior, not a mox decision.)
 
@@ -843,18 +917,44 @@ nothing, and leave the row missing.
 - **skip** -- leave it untracked; the default, so `--yes` records nothing
   and the run still exits 1 while anything is untracked
 
-A row is always **appended**, never edited in place, so every existing byte
-of that file -- comments, ordering, a row you were mid-thought on -- survives
-untouched. The read and the rewrite run under an exclusive lock on the
+Then it offers each REMOVED package `[r/k/i/s]`, as `removed package:
+<backend> <name> (<file>): installed here before, not any more`:
+
+- **remove** (`r`) -- delete its row from the manifest, for every machine,
+  and drop it from this machine's record unless another row still declares
+  it, so a row added back later is installed rather than reported removed
+- **keep off** (`k`) -- gate its row so this machine skips it: its own
+  `when` becomes `not machine="<m>"`, or `(<W>) and not machine="<m>"` when
+  it has one, `<m>` being this machine's `machine` value
+- **install** (`i`) -- drop it from this machine's record, so the next
+  apply installs it like any missing package
+- **skip** (`s`) -- decide later; the default, so `--yes` changes nothing
+  and the run still exits 1 while anything is removed
+
+`R`, `K` and `I` give that answer for this package and every remaining
+removed package of the same backend. No answer changes the machine.
+
+An added or blacklisted row is always **appended**, never edited in place,
+so every existing byte of that file -- comments, ordering, a row you were
+mid-thought on -- survives untouched. A removed or kept-off row is edited
+where it stands: `r` deletes its lines from its `[[packages]]` header
+through its last key, comments between its keys included, leaving comments
+above the header and after the last key; `k` adds or replaces the `when`
+line beside its `name`. Every other byte, line endings included, stays.
+Before either is written, the file is read again, the row found by its
+content, and the edited file loaded back and checked to differ from the
+original by exactly that change. A row commit cannot find exactly once, a
+row written inline (`packages = [{ ... }]`), and a `when` written as a
+multi-line or literal string are left as they are, with the reason, for a
+hand edit. The read and the rewrite run under an exclusive lock on the
 directory the manifest file lives in, so a second mox writing that file waits
 rather than reading the same bytes and dropping whichever row landed first --
 which the state lock alone would not prevent, keying as it does on a state
 directory that `mox commit` and `sudo mox commit` have one each of. A
 directory takes no such lock on Windows, where two runs are serialized only
-by the state lock they share. A row is appended the moment it is chosen:
-`q` at a package
-prompt ends the run before the file pass and says how many rows were already
-recorded (rc 1), and `--abort-on-prompt` exits 2 at the first package prompt
+by the state lock they share. Every answer is written the moment it is
+chosen: `q` at a package prompt ends the run before the file pass and says
+how many package changes were already written (rc 1), and `--abort-on-prompt` exits 2 at the first package prompt
 the same way. A path-scoped `mox commit <file>` names files and skips
 packages entirely.
 
@@ -865,8 +965,10 @@ above are compiled in because they are what mox supports out of the box, with
 no shell dependency; everything else is a **plugin**: an executable in the
 repo that speaks the protocol below. A plugin satisfies exactly the same
 contract as a compiled backend, so `status`, `apply` and `commit` cannot tell
-them apart. The one check the protocol has no verb for is `ASTRAY`, which only
-brew's compiled backend makes: a plugin's packages are never reported astray.
+them apart. The protocol has no verb for two checks: `ASTRAY`, which only
+brew's compiled backend makes, and whether a package is on the machine in
+any form, which `REMOVED` needs. A plugin's packages are never reported
+astray or removed.
 What stays fixed by mox is the set of things a backend is asked to do -- there
 is no `remove` or `upgrade` verb, and adding one is a mox change.
 

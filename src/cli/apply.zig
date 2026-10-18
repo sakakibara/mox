@@ -1199,7 +1199,7 @@ const PackageCounts = struct {
 /// triggers a re-capture of its own, so a package installed here is a tool
 /// the post scripts see, exactly like one a script installed.
 ///
-/// Only ever installs. An untracked package is reported by `mox status` and
+/// Never uninstalls. An untracked package is reported by `mox status` and
 /// reconciled by `mox commit`; nothing here removes one. A real run then
 /// records, per backend, the desired packages verified on the machine
 /// (`seen.zig`), which is what tells a later lost one apart from one this

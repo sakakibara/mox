@@ -4,6 +4,46 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- mox records, per package manager and per machine, the declared packages
+  each machine was seen holding, in `<state dir>/seen/`. Each `mox apply`
+  that runs its package step, `--dry-run` aside, writes it; machines sharing a state directory each
+  keep their own, keyed by the machine's identity. A state directory that
+  `MOX_STATE_DIR` names may hold it before it holds the marker, and `mox
+  uninstall` removes it.
+- `mox commit` offers each removed package (see Changed) after the untracked
+  ones: `r` deletes its row from the manifest, for every machine; `k` gates
+  the row off this machine with `not machine="<m>"`; `i` has the next apply
+  install it again; `s` (the default) decides later. `R`, `K` and `I` give
+  that answer for every remaining removed package of the same manager. A row
+  is edited only after the changed file loads back differing by exactly that
+  change, and no answer changes the machine.
+
+### Changed
+- BREAKING: `mox apply`, and so `mox update`, no longer reinstalls a
+  declared package this machine held and has lost -- one its manager now
+  holds in no form, a dependency included. It is named on stderr, counted
+  as `, N removed` in the summary, left uninstalled, and the run exits 1
+  while one is left for a decision; it was installed again and the run
+  exited 0. Run `mox commit` to remove its row, keep it off this machine, or
+  have the next apply install it. A package a plugin backend manages is
+  never judged removed.
+- BREAKING: `mox status` reports such a package as `REMOVED`, counted
+  toward the exit code and listed after the backend's missing packages;
+  `--porcelain` adds a `package_removed` record (`backend`, `id`), and
+  `--json` a package with `state: "removed"`. A script that reads either
+  must accept the new kind or state; it was reported `MISSING` before.
+- BREAKING: `mox commit` exits 1 in every mode (`--yes`, `--dry-run`, no
+  terminal) while a removed package remains, as it does for an untracked
+  one, and its package summary reads `packages: N recorded, N blacklisted,
+  N removed, N kept off this machine, N set to install, N still untracked,
+  N still removed`, with fields added mid-line; it read `N recorded, N
+  blacklisted, N still untracked`. A commit that stops early says `N
+  package change(s) already written` where it said `N package row(s)
+  already recorded`.
+
 ## [0.13.1] - 2026-10-19
 
 ### Fixed
