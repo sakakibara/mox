@@ -68,15 +68,25 @@ pub const BackendDrift = struct {
 /// The records in effect for a report: per backend, the ids this machine was
 /// seen holding through it (`seen.zig`). A backend with no entry has no
 /// record in effect, and every desired row it has not installed is missing.
-/// The caller leaves out a backend it bootstrapped in this run, one whose
-/// record is absent, unusable or newer, and every backend when the machine's
-/// identity could not be read.
+/// The caller leaves out a backend it bootstrapped in this run and one with
+/// no record of this machine's.
+///
+/// A backend whose record is there but cannot be used is `blocked` instead:
+/// treating it as having none would install again what the record says
+/// this machine lost, so the report calls it broken, asking it nothing.
 pub const Seen = struct {
     records: []const Record = &.{},
+    blocked: []const Blocked = &.{},
 
     pub const Record = struct {
         backend: []const u8,
         ids: []const []const u8,
+    };
+
+    pub const Blocked = struct {
+        backend: []const u8,
+        /// Why the record cannot be used, and what fixes it.
+        why: []const u8,
     };
 
     /// No record in effect for any backend.
@@ -86,6 +96,14 @@ pub const Seen = struct {
     pub fn of(self: Seen, backend: []const u8) ?[]const []const u8 {
         for (self.records) |rec| {
             if (std.mem.eql(u8, rec.backend, backend)) return rec.ids;
+        }
+        return null;
+    }
+
+    /// Why `backend`'s record cannot be used, or null when nothing blocks it.
+    pub fn blockedOf(self: Seen, backend: []const u8) ?[]const u8 {
+        for (self.blocked) |bl| {
+            if (std.mem.eql(u8, bl.backend, backend)) return bl.why;
         }
         return null;
     }
@@ -182,7 +200,20 @@ fn noteBroken(
     verb: []const u8,
     e: anyerror,
 ) !void {
-    const why = exec.errorText(e);
+    return noteBrokenWhy(arena, broken, notes, diag, m, name, verb, exec.errorText(e));
+}
+
+/// `noteBroken` for a failure said in words rather than by an error.
+fn noteBrokenWhy(
+    arena: std.mem.Allocator,
+    broken: *std.ArrayList(Broken),
+    notes: *std.ArrayList([]const u8),
+    diag: ?*Diag,
+    m: manifest_mod.Manifest,
+    name: []const u8,
+    verb: []const u8,
+    why: []const u8,
+) !void {
     if (!actedOn(m, name)) {
         try notes.append(arena, try std.fmt.allocPrint(
             arena,
@@ -225,7 +256,8 @@ pub const Purpose = enum { judge, reconcile };
 /// on the machine in any form are missing, the rest removed. A `present`
 /// that fails breaks the backend as a failed list does: a manager that
 /// answered its list and then failed one more query is not trusted for the
-/// rest of this report.
+/// rest of this report. A usable backend `seen` blocks is broken on its
+/// record, probe "record", before anything is asked of it.
 pub fn fromManifest(
     arena: std.mem.Allocator,
     m: manifest_mod.Manifest,
@@ -318,6 +350,10 @@ pub fn fromManifest(
         });
     }
     for (usable.items) |b| {
+        if (b.canTellPresent()) if (seen.blockedOf(b.name)) |why| {
+            try noteBrokenWhy(arena, &broken, &notes, diag, m, b.name, "record", why);
+            continue;
+        };
         const installed = b.installedExplicit(arena) catch |e| {
             try noteBroken(arena, &broken, &notes, diag, m, b.name, "list", e);
             continue;
@@ -1009,7 +1045,8 @@ test "fromManifest: a backend with no record in effect has every row it lacks mi
     // An entry, but a manager with no `present` to ask.
     const seen: Seen = .{ .records = &.{.{ .backend = "fake", .ids = &.{"ripgrep"} }} };
     var unaskable: test_backend.Fake = .{ .name = "fake", .tells_present = false };
-    const rep2 = try fromManifest(a, m, .{ .backends = &.{unaskable.backend()} }, &r, &.{}, .judge, seen, null);
+    const m2: manifest_mod.Manifest = .{ .packages = &.{rowOf("bat", "fake")}, .files = 1 };
+    const rep2 = try fromManifest(a, m2, .{ .backends = &.{unaskable.backend()} }, &r, &.{}, .judge, seen, null);
     try testing.expectEqual(@as(usize, 1), rep2.missingCount());
     try testing.expectEqual(@as(usize, 0), rep2.removedCount());
 
@@ -1077,6 +1114,40 @@ test "fromManifest: a present that fails breaks the backend as a failed list doe
     try testing.expectEqualStrings("present", rep.broken[0].probe);
     try testing.expect(d.capture() != null);
     try testing.expect(!rep.clean());
+}
+
+test "fromManifest: a blocked record breaks its backend on the record, asking it nothing, and leaves the others judged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var f: test_backend.Fake = .{ .name = "fake", .present_answer = error.Unreached };
+    var other: test_backend.Fake = .{ .name = "other" };
+    const m: manifest_mod.Manifest = .{ .packages = &.{ rowOf("bat", "fake"), rowOf("jq", "other") }, .files = 1 };
+    const seen: Seen = .{ .blocked = &.{.{ .backend = "fake", .why = "it was written by a newer mox; upgrade mox" }} };
+
+    var d: Diag = .{};
+    const rep = try fromManifest(a, m, .{ .backends = &.{ f.backend(), other.backend() } }, &r, &.{}, .judge, seen, &d);
+    try testing.expectEqual(@as(usize, 0), f.present_calls);
+    try testing.expectEqual(@as(usize, 1), rep.broken.len);
+    try testing.expectEqualStrings("fake", rep.broken[0].backend);
+    try testing.expectEqualStrings("record", rep.broken[0].probe);
+    try testing.expect(rep.broken[0].code == null);
+    try testing.expectEqualStrings("it was written by a newer mox; upgrade mox", rep.broken[0].why);
+    try testing.expectEqual(@as(usize, 1), rep.backends.len);
+    try testing.expectEqualStrings("other", rep.backends[0].backend);
+    try testing.expectEqual(@as(usize, 1), rep.missingCount());
+    try testing.expect(!rep.clean());
+
+    // A manager with no present keeps no record, so nothing blocks it.
+    var unaskable: test_backend.Fake = .{ .name = "fake", .tells_present = false };
+    const m2: manifest_mod.Manifest = .{ .packages = &.{rowOf("bat", "fake")}, .files = 1 };
+    const rep2 = try fromManifest(a, m2, .{ .backends = &.{unaskable.backend()} }, &r, &.{}, .judge, seen, null);
+    try testing.expectEqual(@as(usize, 0), rep2.broken.len);
+    try testing.expectEqual(@as(usize, 1), rep2.missingCount());
 }
 
 test "fromManifest: present is not asked when no seen row is missing" {

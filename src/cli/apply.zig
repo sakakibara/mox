@@ -976,13 +976,15 @@ fn bootstrapBackends(
     pkg_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
     keepalive: *mox.packages.admin.Keepalive,
-) !struct { bootstrapped: usize, ran: usize, failed: usize, failed_backends: []const []const u8, bootstrapped_backends: []const []const u8 } {
+) !struct { bootstrapped: usize, ran: usize, failed: usize, failed_backends: []const []const u8, ran_backends: []const []const u8 } {
     const machine_os = mox.machine.state.osAxis(ctx.alloc, context.env);
     var bootstrapped: usize = 0;
     var ran: usize = 0;
     var failed: usize = 0;
     var failed_names: std.ArrayList([]const u8) = .empty;
-    var bootstrapped_names: std.ArrayList([]const u8) = .empty;
+    // Every manager whose installer was started, whatever came of it: what
+    // the machine held through it before may be gone.
+    var ran_names: std.ArrayList([]const u8) = .empty;
     for (m.bootstrap) |b| {
         if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
         const backend = registry.find(b.backend) orelse {
@@ -1058,6 +1060,7 @@ fn bootstrapBackends(
                 keepalive.start(ctx.io, mox.packages.admin.refresh_interval_ms, (if (builtin.is_test) app.admin_refresh_override else null) orelse mox.packages.admin.sudo_refresh);
             },
         };
+        try ran_names.append(ctx.alloc, b.backend);
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
             const why = if (e == error.BootstrapInstallerFailed and backend.installerExit() != null)
                 if (unattended_admin)
@@ -1118,9 +1121,8 @@ fn bootstrapBackends(
             continue;
         }
         bootstrapped += 1;
-        try bootstrapped_names.append(ctx.alloc, b.backend);
     }
-    return .{ .bootstrapped = bootstrapped, .ran = ran, .failed = failed, .failed_backends = failed_names.items, .bootstrapped_backends = bootstrapped_names.items };
+    return .{ .bootstrapped = bootstrapped, .ran = ran, .failed = failed, .failed_backends = failed_names.items, .ran_backends = ran_names.items };
 }
 
 /// `sudo -v` on the terminal, so an installer that only asks `sudo -n` finds
@@ -1302,7 +1304,7 @@ fn applyPackages(
     var bootstrap_ran: usize = 0;
     var bootstrap_failed: usize = 0;
     var failed_backends: []const []const u8 = &.{};
-    var bootstrapped_backends: []const []const u8 = &.{};
+    var ran_backends: []const []const u8 = &.{};
     var would_bootstrap: std.ArrayList([]const u8) = .empty;
     // Held from the bootstrap that cached a credential until the installs
     // below are done, whichever way this function leaves.
@@ -1314,7 +1316,7 @@ fn applyPackages(
         bootstrap_ran = done.ran;
         bootstrap_failed = done.failed;
         failed_backends = done.failed_backends;
-        bootstrapped_backends = done.bootstrapped_backends;
+        ran_backends = done.ran_backends;
     } else {
         for (manifest.bootstrap) |b| {
             if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
@@ -1342,8 +1344,9 @@ fn applyPackages(
         }
     }
 
-    // A manager bootstrapped here is a new install, so what the record says
-    // this machine held through the one before it is not in effect.
+    // A manager whose installer ran here may be a new install, so what the
+    // record says this machine held through the one before it is not in
+    // effect, even where the installer then failed.
     var machine: mox.packages.seen.Machine = .{
         .arena = ctx.alloc,
         .io = ctx.io,
@@ -1351,7 +1354,7 @@ fn applyPackages(
         .env = pkg_env,
         .fixed = if (builtin.is_test) app.identity_override else null,
     };
-    const loaded = mox.packages.seen.load(ctx.alloc, ctx.io, context.paths.state_dir, &machine, registry.backends, bootstrapped_backends) catch |e| switch (e) {
+    const loaded = mox.packages.seen.load(ctx.alloc, ctx.io, context.paths.state_dir, &machine, registry.backends, ran_backends) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             try ctx.err.print("mox apply: packages: the records of what this machine held could not be read: {s}\n", .{mox.packages.exec.errorText(e)});
@@ -1359,7 +1362,6 @@ fn applyPackages(
             return .{ .in_use = true, .failed = 1 };
         },
     };
-    for (loaded.notes) |note| try ctx.out.print("  note            {s}\n", .{note});
 
     const rep = mox.packages.report.fromManifest(
         ctx.alloc,
@@ -1483,17 +1485,18 @@ fn applyPackages(
     // longer goes back through its install, which for an installed package
     // is the adapter's own way of recording it.
     const after = if (installed_here.items.len > 0) try restoreRegressed(ctx, &pkg_backends, registry, manifest, bindings, rep, installed_here.items, &counts) else null;
-    if (!dry_run) try updateRecords(ctx, context, registry, &machine, loaded, rep, after, installed_here.items);
+    if (!dry_run) try updateRecords(ctx, context, registry, &machine, loaded, rep, after, installed_here.items, failed_backends);
     return counts;
 }
 
 /// Write each backend's record of what this machine held: what it held and
 /// some row still declares, plus what is desired here and verified
 /// installed -- by the read after the installs where one covered the
-/// backend, else by the read before. A backend assumed, broken, or whose
-/// record could not be read or is a newer mox's keeps its record as it is,
-/// and so does every backend when the machine's identity could not be read.
-/// A write that fails is said and fails nothing: the packages are installed.
+/// backend, else by the read before. A backend assumed, broken, whose
+/// bootstrap failed, or whose record could not be read or is a newer mox's
+/// keeps its record as it is, and so does every backend when the machine's
+/// identity could not be read. A write that fails is said and fails
+/// nothing: the packages are installed.
 fn updateRecords(
     ctx: *app.Ctx,
     context: app.Context,
@@ -1503,9 +1506,11 @@ fn updateRecords(
     before: mox.packages.report.Report,
     after: ?mox.packages.report.Report,
     installed_here: []const []const u8,
+    failed_backends: []const []const u8,
 ) !void {
     for (before.backends) |b| {
         if (b.assumed) continue;
+        if (bootstrapFailedFor(failed_backends, b.backend)) continue;
         const backend = registry.find(b.backend) orelse continue;
         if (!backend.canTellPresent()) continue;
         const state = loaded.stateOf(b.backend) orelse continue;

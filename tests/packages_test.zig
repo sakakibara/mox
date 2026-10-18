@@ -8,6 +8,7 @@
 //! unnoticed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mox = @import("mox");
 
 const Io = std.Io;
@@ -5441,7 +5442,7 @@ test "apply: a record filed under another identity is not this machine's, so it 
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }
 
-test "apply: an identity that cannot be read puts no record in effect and writes none, and says so once" {
+test "apply: an identity that cannot be read writes no record, saying so once; with a record file there it breaks the backend and installs nothing" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5476,17 +5477,20 @@ test "apply: an identity that cannot be read puts no record in effect and writes
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r1.out, note));
     try std.testing.expect(!seenDirExists(h));
 
-    // A record there: it is not used, so fd is missing and installed.
+    // A record there, of any owner: which one is this machine's cannot be
+    // told, and falling back to none would install what it says was lost.
     try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
-    useFake(try brewWithRecorded(a, "ripgrep\n", "ripgrep\n", "fd\nripgrep\n", "", &.{
-        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
-    }));
+    const before = try seenBytes(h, "brew", testutil.test_identity);
+    const second = try brewWith(a, "ripgrep\n", "", &.{});
+    useFake(second);
     const r2 = try h.run(&.{ "mox", "apply" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r2.out, r2.err });
-    try std.testing.expectEqual(@as(u8, 0), r2.rc);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r2.out, note));
-    try std.testing.expect(std.mem.indexOf(u8, r2.out, "  installing      brew fd\n") != null);
-    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+    try std.testing.expectEqual(@as(u8, 2), r2.rc);
+    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
+    try std.testing.expect(std.mem.indexOf(u8, r2.err, try std.fmt.allocPrint(a, "mox apply: brew: record: {s}; its packages were left alone\n", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, note) == null);
+    for (second.calls.items) |c| try std.testing.expect(!std.mem.startsWith(u8, c, "env HOMEBREW_NO_ASK=1 brew install"));
+    try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
 }
 
 test "apply: a manager bootstrapped in the run ignores its record and starts it afresh" {
@@ -5544,6 +5548,68 @@ test "apply: a manager bootstrapped in the run ignores its record and starts it 
     try std.testing.expect(std.mem.indexOf(u8, r.out, "Packages: 1 installed, 0 failed\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "is not installed here any more") == null);
     try std.testing.expectEqualStrings("ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "apply: an installer that exits nonzero but leaves its manager there puts no record in effect and writes none" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/bash\nexit 1\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writeManifest(io, h, a, "darwin.toml", try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{hex}));
+    // What the brew that was there before held; the one the installer left
+    // holds nothing.
+    try writeSeen(h, "brew", testutil.test_identity, &.{ "fd", "ripgrep" });
+    const before = try seenBytes(h, "brew", testutil.test_identity);
+
+    const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
+    try Io.Dir.cwd().createDirPath(io, prefix_bin);
+    const made_brew = try std.fs.path.join(a, &.{ prefix_bin, "brew" });
+    mox.cli.app.brew_prefixes_override = &.{prefix_bin};
+    defer mox.cli.app.brew_prefixes_override = null;
+    mox.cli.app.elevation_override = .root;
+    defer mox.cli.app.elevation_override = null;
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound, .once = true });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash", .match = .prefix, .code = 1, .makes_file = made_brew, .io = io });
+    try entries.append(a, .{ .argv = "brew --version", .match = .suffix, .stdout = "Homebrew 6.0.0\n" });
+    try entries.append(a, .{ .argv = "brew list --full-name --installed-on-request", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --cask --full-name", .match = .suffix, .stdout = "" });
+    try entries.append(a, .{ .argv = "brew list --formula --full-name", .match = .suffix, .stdout = "" });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: the installer exited 1\n") != null);
+    try std.testing.expect(r.rc != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "is not installed here any more") == null);
+    try std.testing.expect(!fake.called(brew_present));
+    for (fake.calls.items) |c| try std.testing.expect(std.mem.indexOf(u8, c, "brew install") == null);
+    try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
 }
 
 test "apply: a row gated off this machine keeps its id recorded, and one no row declares is dropped" {
@@ -5856,7 +5922,7 @@ test "status: with no record nothing is removed and no record is created" {
     try std.testing.expect(!seenDirExists(h));
 }
 
-test "status: an identity that cannot be read puts no record in effect and says so where the other notes go" {
+test "status: an identity that cannot be read, with a record file there, shows the backend broken on its record in every format" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5872,21 +5938,111 @@ test "status: an identity that cannot be read puts no record in effect and says 
     defer mox.cli.app.identity_override = null;
     useFake(try brewWith(a, "", "", &.{}));
     defer mox.cli.app.package_runner_override = null;
-    const why = "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written\n";
+    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
 
     const r = try h.run(&.{ "mox", "status" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.out, try std.fmt.allocPrint(a, "  note      {s}", .{why})));
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "  MISSING   brew fd\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try std.fmt.allocPrint(a, "  BROKEN    brew (record: {s})\n", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING") == null);
 
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ p.out, p.err });
     try expectPorcelain(p.out);
-    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing\tbrew\tfd\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, p.err, try std.fmt.allocPrint(a, "mox status: note: {s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}\n", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing") == null);
 
     try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
+}
+
+/// A record of brew's for this machine laid as `data` (a directory when
+/// null), and what each command says about it: why the record cannot be
+/// used, given its path.
+const BlockedRecord = struct {
+    data: ?[]const u8,
+    why: *const fn (a: std.mem.Allocator, record: []const u8) anyerror![]const u8,
+};
+
+fn newerWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) was written by a newer mox; upgrade mox", .{record});
+}
+
+fn unusableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) is unusable: its first line is not a record header; remove {s} to start the record afresh", .{ record, record });
+}
+
+fn unreadableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) could not be read: ", .{record});
+}
+
+/// apply, status and commit with brew's record blocked as `case` lays it:
+/// brew is broken on its record, nothing is installed or offered through
+/// it, apply exits 2, and the record is left byte for byte as it was.
+fn expectBlocked(case: BlockedRecord) !void {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+    try testutil.markState(h);
+    const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
+    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(record).?);
+    if (case.data) |data| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = record, .data = data });
+    } else try Io.Dir.cwd().createDirPath(io, record);
+    const why = try case.why(a, record);
+    // htop is untracked: a usable brew would offer it to commit.
+    const fake = try brewWith(a, "ripgrep\nhtop\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "mox apply: brew: record: {s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "; its packages were left alone\n") != null);
+    for (fake.calls.items) |c| try std.testing.expect(!std.mem.startsWith(u8, c, "env HOMEBREW_NO_ASK=1 brew install"));
+
+    const st = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ st.out, st.err });
+    try std.testing.expectEqual(@as(u8, 1), st.rc);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, try std.fmt.allocPrint(a, "  BROKEN    brew (record: {s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.out, "MISSING") == null);
+
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ p.out, p.err });
+    try expectPorcelain(p.out);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}", .{why})) != null);
+
+    const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ c.out, c.err });
+    try std.testing.expect(std.mem.indexOf(u8, c.out, try std.fmt.allocPrint(a, "  note       brew: record: {s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "; nothing to reconcile for it\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "untracked package:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c.out, "removed package:") == null);
+
+    if (case.data) |data| {
+        try std.testing.expectEqualStrings(data, try Io.Dir.cwd().readFileAlloc(io, record, a, .limited(1 << 16)));
+    } else {
+        var d = try Io.Dir.cwd().openDir(io, record, .{});
+        d.close(io);
+    }
+}
+
+test "apply, status and commit: a record written by a newer mox breaks its backend, saying to upgrade mox, and is left as it is" {
+    try expectBlocked(.{ .data = "mox-seen 2\nfd\n", .why = newerWhy });
+}
+
+test "apply, status and commit: an unusable record breaks its backend, saying to remove it, and is left as it is" {
+    try expectBlocked(.{ .data = "mox-seen 1\r\nfd\r\n", .why = unusableWhy });
+}
+
+test "apply, status and commit: a record that cannot be read breaks its backend, naming its path, and is left as it is" {
+    try expectBlocked(.{ .data = null, .why = unreadableWhy });
 }
 
 /// What commit asks about a removed package, before its choices.

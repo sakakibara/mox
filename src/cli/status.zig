@@ -775,8 +775,8 @@ fn preparePackages(
 /// The step that runs plugins and managers: only after the caller has put
 /// the notes on the record. The records of what this machine held are read
 /// and never written: status bootstraps nothing, so every record that is
-/// usable is in effect. What could not be used comes first among the
-/// report's notes, so every format says it where it says the rest.
+/// usable is in effect, and a backend whose record is there but cannot be
+/// used is one of the report's broken backends.
 fn reportPackages(
     ctx: *app.Ctx,
     prep: Prepared,
@@ -815,10 +815,7 @@ fn reportPackages(
             return .{ .broken = true };
         },
     };
-    if (loaded.notes.len == 0) return .{ .report = rep };
-    var with_notes = rep;
-    with_notes.notes = try std.mem.concat(ctx.alloc, []const u8, &.{ loaded.notes, rep.notes });
-    return .{ .report = with_notes };
+    return .{ .report = rep };
 }
 
 fn reportPackageError(ctx: *app.Ctx, diag: *mox.packages.manifest.Diag, e: anyerror) !void {

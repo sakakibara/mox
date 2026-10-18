@@ -169,10 +169,11 @@ pub const Read = union(enum) {
     absent,
     /// The ids recorded, in the order the file holds them.
     ids: []const []const u8,
-    /// A record mox cannot read: why. The next write replaces it.
+    /// A record mox cannot read: why. A write replaces it.
     unusable: []const u8,
-    /// A record whose header is not this mox's: the header line. It is
-    /// neither read nor written, so a newer mox's data is never lost.
+    /// A record under a later format's header (`mox-seen <N>`, N above 1):
+    /// the header line. It is neither read nor written, so a newer mox's
+    /// data is never lost.
     newer: []const u8,
 };
 
@@ -201,7 +202,10 @@ pub fn read(arena: std.mem.Allocator, io: Io, state_dir: []const u8, backend_nam
 fn parse(arena: std.mem.Allocator, bytes: []const u8) !Read {
     if (bytes.len == 0) return .{ .unusable = "it is empty" };
     const first = bytes[0 .. std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len];
-    if (!std.mem.eql(u8, first, header)) return .{ .newer = first };
+    if (!std.mem.eql(u8, first, header)) {
+        if (laterHeader(first)) return .{ .newer = first };
+        return .{ .unusable = "its first line is not a record header" };
+    }
     if (bytes[bytes.len - 1] != '\n') return .{ .unusable = "its last line is not newline-terminated" };
 
     if (first.len + 1 == bytes.len) return .{ .ids = &.{} };
@@ -217,6 +221,18 @@ fn parse(arena: std.mem.Allocator, bytes: []const u8) !Read {
         try out.append(arena, id);
     }
     return .{ .ids = try out.toOwnedSlice(arena) };
+}
+
+/// Whether `line` is `mox-seen <N>` with N an integer above 1: a later
+/// format's header, as opposed to a line no mox writes.
+fn laterHeader(line: []const u8) bool {
+    const prefix = "mox-seen ";
+    if (!std.mem.startsWith(u8, line, prefix)) return false;
+    const n = line[prefix.len..];
+    if (n.len == 0) return false;
+    for (n) |c| if (!std.ascii.isDigit(c)) return false;
+    const v = std.fmt.parseInt(u64, n, 10) catch return true;
+    return v > 1;
 }
 
 pub const Error = error{
@@ -297,17 +313,16 @@ pub const Machine = struct {
 
 /// The records a run puts in effect, and which it may write back.
 pub const Loaded = struct {
-    /// For `report.fromManifest`.
+    /// For `report.fromManifest`: the records in effect, and the backends
+    /// whose record is there but cannot be used.
     seen: report.Seen = .none,
-    /// What could not be used, each said once.
-    notes: []const []const u8 = &.{},
     /// One per backend that answers `present`.
     backends: []const State = &.{},
 
     pub const State = struct {
         backend: []const u8,
         /// The identity was read, or did not need to be, and the record is
-        /// neither a newer mox's nor unreadable.
+        /// neither blocked, a newer mox's, nor unreadable.
         writable: bool,
         /// A record file is there for this machine.
         exists: bool = false,
@@ -321,11 +336,17 @@ pub const Loaded = struct {
 
 /// Read the record of every backend in `backends` that answers `present`,
 /// and put in effect each that holds ids and is not in `exclude` (the
-/// backends this run bootstrapped). The identity is read only when the
-/// records directory holds a file for one of them: with none there, every
-/// record is absent whoever the machine is. A record that is unusable is
-/// writable, so the next write replaces it; one a newer mox wrote, or one
-/// that could not be read at all, is neither in effect nor writable.
+/// backends this run bootstrapped, whose record starts afresh). The
+/// identity is read only when the records directory holds a file for one of
+/// them: with none there, every record is absent whoever the machine is.
+///
+/// A record that is there but cannot be used blocks its backend: a record
+/// written by a newer mox, one that could not be read, one that is
+/// unusable, or, when the identity could not be read, any file for that
+/// backend at all. Falling back to no record would install again every
+/// package it says this machine lost, so the report calls that backend
+/// broken for the run instead, saying why and what fixes it. A backend in
+/// `exclude` is never blocked.
 pub fn load(
     arena: std.mem.Allocator,
     io: Io,
@@ -336,71 +357,98 @@ pub fn load(
 ) !Loaded {
     var states: std.ArrayList(Loaded.State) = .empty;
     var records: std.ArrayList(report.Seen.Record) = .empty;
-    var notes: std.ArrayList([]const u8) = .empty;
+    var blocked: std.ArrayList(report.Seen.Blocked) = .empty;
 
-    const any = try anyRecord(arena, io, state_dir, backends);
+    const filed = try recordsFiled(arena, io, state_dir, backends);
+    var any = false;
+    for (filed) |f| any = any or f;
     const owner: ?[owner_len]u8 = if (any) try machine.owner() else null;
-    if (try machine.failureNote()) |n| try notes.append(arena, n);
 
-    for (backends) |b| {
+    for (backends, filed) |b, has_file| {
         if (!b.canTellPresent()) continue;
-        if (!any) {
-            try states.append(arena, .{ .backend = b.name, .writable = true });
+        const excluded = contains(exclude, b.name);
+        if (!has_file) {
+            try states.append(arena, .{ .backend = b.name, .writable = !any or owner != null });
             continue;
         }
         const o = owner orelse {
             try states.append(arena, .{ .backend = b.name, .writable = false });
+            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
+                arena,
+                "this machine's identity could not be read ({s}), so which record under {s} is its own cannot be told",
+                .{ machine.got.?.failed, try std.fs.path.join(arena, &.{ state_dir, dir_name }) },
+            ) });
             continue;
         };
+        const p = try path(arena, state_dir, b.name, &o);
         const got = read(arena, io, state_dir, b.name, &o) catch |e| {
             if (e == error.OutOfMemory) return e;
-            try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: the record of the packages this machine held could not be read ({s}); it is neither used nor written", .{ b.name, @errorName(e) }));
             try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
+            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
+                arena,
+                "its record of the packages this machine held ({s}) could not be read: {s}",
+                .{ p, exec.errorText(e) },
+            ) });
             continue;
         };
         switch (got) {
             .absent => try states.append(arena, .{ .backend = b.name, .writable = true }),
             .ids => |ids| {
                 try states.append(arena, .{ .backend = b.name, .writable = true, .exists = true });
-                if (!contains(exclude, b.name)) try records.append(arena, .{ .backend = b.name, .ids = ids });
+                if (!excluded) try records.append(arena, .{ .backend = b.name, .ids = ids });
             },
             .unusable => |why| {
-                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: the record of the packages this machine held is unusable ({s}); it is not used, and apply replaces it", .{ b.name, why }));
-                try states.append(arena, .{ .backend = b.name, .writable = true, .exists = true });
+                try states.append(arena, .{ .backend = b.name, .writable = excluded, .exists = true });
+                if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
+                    arena,
+                    "its record of the packages this machine held ({s}) is unusable: {s}; remove {s} to start the record afresh",
+                    .{ p, why, p },
+                ) });
             },
             .newer => {
-                try notes.append(arena, try std.fmt.allocPrint(arena, "{s}: the record of the packages this machine held was written by a newer mox; upgrade mox", .{b.name}));
                 try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
+                if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
+                    arena,
+                    "its record of the packages this machine held ({s}) was written by a newer mox; upgrade mox",
+                    .{p},
+                ) });
             },
         }
     }
     return .{
-        .seen = .{ .records = try records.toOwnedSlice(arena) },
-        .notes = try notes.toOwnedSlice(arena),
+        .seen = .{ .records = try records.toOwnedSlice(arena), .blocked = try blocked.toOwnedSlice(arena) },
         .backends = try states.toOwnedSlice(arena),
     };
 }
 
-/// Whether the records directory holds a file named for one of `backends`
-/// that answers `present`, for any owner. A directory that cannot be listed
-/// is taken to hold one, so each record's own read says what is wrong.
-fn anyRecord(arena: std.mem.Allocator, io: Io, state_dir: []const u8, backends: []const backend.Backend) !bool {
+/// Per backend in `backends`, whether the records directory holds a file
+/// named for it, for any owner; always false for one that cannot answer
+/// `present`. A directory that cannot be listed is taken to hold one for
+/// each, so each record's own read says what is wrong.
+fn recordsFiled(arena: std.mem.Allocator, io: Io, state_dir: []const u8, backends: []const backend.Backend) ![]const bool {
+    const out = try arena.alloc(bool, backends.len);
+    @memset(out, false);
     const dir_path = try std.fs.path.join(arena, &.{ state_dir, dir_name });
     var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
-        error.FileNotFound => return false,
-        else => return true,
+        error.FileNotFound => return out,
+        else => return everyTeller(out, backends),
     };
     defer dir.close(io);
     var it = dir.iterate();
-    while (it.next(io) catch return true) |entry| {
+    while (it.next(io) catch return everyTeller(out, backends)) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".txt")) continue;
-        for (backends) |b| {
+        for (backends, out) |b, *f| {
             if (!b.canTellPresent()) continue;
             if (entry.name.len == b.name.len + 1 + owner_len + ".txt".len and
-                std.mem.startsWith(u8, entry.name, b.name) and entry.name[b.name.len] == '-') return true;
+                std.mem.startsWith(u8, entry.name, b.name) and entry.name[b.name.len] == '-') f.* = true;
         }
     }
-    return false;
+    return out;
+}
+
+fn everyTeller(out: []bool, backends: []const backend.Backend) []const bool {
+    for (backends, out) |b, *f| f.* = b.canTellPresent();
+    return out;
 }
 
 fn contains(names: []const []const u8, name: []const u8) bool {
@@ -497,7 +545,7 @@ test "replace: an empty set removes the record, and is no error when there is no
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try path(a, state, "apt", &owner), .{}));
 }
 
-test "read and replace: a record under another header is a newer mox's, never read and never written over" {
+test "read and replace: a record under a later format's header is a newer mox's, never read and never written over" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -509,7 +557,7 @@ test "read and replace: a record under another header is a newer mox's, never re
     const p = try path(a, state, "brew", &owner);
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(p).?);
 
-    for ([_][]const u8{ "mox-seen 2\nripgrep\n", "mox-seen 2", "mox-seen 1 \nfd\n" }) |text| {
+    for ([_][]const u8{ "mox-seen 2\nripgrep\n", "mox-seen 2", "mox-seen 10\nfd\n", "mox-seen 99999999999999999999999\n" }) |text| {
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text });
         const got = try read(a, io, state, "brew", &owner);
         try testing.expectEqualStrings(text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], got.newer);
@@ -519,7 +567,7 @@ test "read and replace: a record under another header is a newer mox's, never re
     }
 }
 
-test "read: a broken record is unusable, saying why, and the next replace writes over it" {
+test "read: a broken record, its first line included, is unusable, saying why, and the next replace writes over it" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -533,6 +581,13 @@ test "read: a broken record is unusable, saying why, and the next replace writes
 
     const cases = [_]struct { text: []const u8, why: []const u8 }{
         .{ .text = "", .why = "it is empty" },
+        .{ .text = "mox-seen 1\r\nfd\r\n", .why = "its first line is not a record header" },
+        .{ .text = "mox-seen 1 \nfd\n", .why = "its first line is not a record header" },
+        .{ .text = "mox-seen 0\nfd\n", .why = "its first line is not a record header" },
+        .{ .text = "mox-seen +2\nfd\n", .why = "its first line is not a record header" },
+        .{ .text = "mox-seen \nfd\n", .why = "its first line is not a record header" },
+        .{ .text = "my notes\nfd\n", .why = "its first line is not a record header" },
+        .{ .text = "\n", .why = "its first line is not a record header" },
         .{ .text = "mox-seen 1\nfd", .why = "its last line is not newline-terminated" },
         .{ .text = "mox-seen 1\nfd\n\nripgrep\n", .why = "line 3 is not a package id" },
         .{ .text = "mox-seen 1\nmy notes\n", .why = "line 2 is not a package id" },
@@ -715,7 +770,7 @@ test "load: with no record on disk the identity is never read, and every backend
 
     const got = try load(a, testing.io, state, &machine, &.{ brew.backend(), plug.backend() }, &.{});
     try testing.expect(machine.got == null);
-    try testing.expectEqual(@as(usize, 0), got.notes.len);
+    try testing.expectEqual(@as(usize, 0), got.seen.blocked.len);
     try testing.expectEqual(@as(usize, 0), got.seen.records.len);
     try testing.expectEqual(@as(usize, 1), got.backends.len);
     try testing.expect(got.stateOf("brew").?.writable);
@@ -750,7 +805,7 @@ test "load: this machine's record is in effect unless excluded, and another mach
     try testing.expect(excluded.stateOf("brew").?.writable);
 }
 
-test "load: a failed identity read puts nothing in effect, makes nothing writable, and is said once" {
+test "load: a failed identity read blocks each backend with a record file, of any owner, and leaves one with none unwritable and unblocked" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -765,14 +820,21 @@ test "load: a failed identity read puts nothing in effect, makes nothing writabl
     var machine = testMachine(a, .{ .failed = "ioreg exited 1" });
     const got = try load(a, io, state, &machine, &.{ brew.backend(), apt.backend() }, &.{});
     try testing.expectEqual(@as(usize, 0), got.seen.records.len);
-    try testing.expectEqual(@as(usize, 1), got.notes.len);
-    try testing.expect(std.mem.indexOf(u8, got.notes[0], "ioreg exited 1") != null);
+    try testing.expectEqual(@as(usize, 1), got.seen.blocked.len);
+    const why = got.seen.blockedOf("brew").?;
+    try testing.expect(std.mem.startsWith(u8, why, "this machine's identity could not be read (ioreg exited 1)"));
+    try testing.expect(got.seen.blockedOf("apt") == null);
     try testing.expect(!got.stateOf("brew").?.writable);
     try testing.expect(!got.stateOf("apt").?.writable);
-    try testing.expect(try machine.failureNote() == null);
+
+    // A backend this run bootstrapped is never blocked.
+    var again = testMachine(a, .{ .failed = "ioreg exited 1" });
+    const excluded = try load(a, io, state, &again, &.{ brew.backend(), apt.backend() }, &.{"brew"});
+    try testing.expectEqual(@as(usize, 0), excluded.seen.blocked.len);
+    try testing.expect(!excluded.stateOf("brew").?.writable);
 }
 
-test "load: an unusable record is said and writable, a newer one is said as a newer mox's and not writable, an unreadable one neither" {
+test "load: an unusable, a newer and an unreadable record each block their backend, naming the path, the cause and the fix" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -784,21 +846,37 @@ test "load: an unusable record is said and writable, a newer one is said as a ne
     var brew: test_backend.Fake = .{ .name = "brew" };
     var apt: test_backend.Fake = .{ .name = "apt" };
     var dnf: test_backend.Fake = .{ .name = "dnf" };
+    const brew_path = try path(a, state, "brew", &owner);
+    const apt_path = try path(a, state, "apt", &owner);
+    const dnf_path = try path(a, state, "dnf", &owner);
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(a, &.{ state, dir_name }));
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try path(a, state, "brew", &owner), .data = "mox-seen 1\nnot an id\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try path(a, state, "apt", &owner), .data = "mox-seen 2\nfd\n" });
-    try Io.Dir.cwd().createDirPath(io, try path(a, state, "dnf", &owner));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = brew_path, .data = "mox-seen 1\nnot an id\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = apt_path, .data = "mox-seen 2\nfd\n" });
+    try Io.Dir.cwd().createDirPath(io, dnf_path);
 
     var machine = testMachine(a, .{ .known = "machine-a" });
     const got = try load(a, io, state, &machine, &.{ brew.backend(), apt.backend(), dnf.backend() }, &.{});
     try testing.expectEqual(@as(usize, 0), got.seen.records.len);
-    try testing.expectEqual(@as(usize, 3), got.notes.len);
-    try testing.expect(std.mem.indexOf(u8, got.notes[0], "brew: ") != null and std.mem.indexOf(u8, got.notes[0], "unusable (line 2 is not a package id)") != null);
-    try testing.expect(std.mem.endsWith(u8, got.notes[1], "written by a newer mox; upgrade mox"));
-    try testing.expect(std.mem.indexOf(u8, got.notes[2], "dnf: ") != null and std.mem.indexOf(u8, got.notes[2], "could not be read") != null);
-    try testing.expect(got.stateOf("brew").?.writable);
-    try testing.expect(!got.stateOf("apt").?.writable);
-    try testing.expect(!got.stateOf("dnf").?.writable);
+    try testing.expectEqual(@as(usize, 3), got.seen.blocked.len);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) is unusable: line 2 is not a package id; remove {s} to start the record afresh", .{ brew_path, brew_path }),
+        got.seen.blockedOf("brew").?,
+    );
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) was written by a newer mox; upgrade mox", .{apt_path}),
+        got.seen.blockedOf("apt").?,
+    );
+    try testing.expect(std.mem.startsWith(u8, got.seen.blockedOf("dnf").?, try std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) could not be read: ", .{dnf_path})));
+    for ([_][]const u8{ "brew", "apt", "dnf" }) |n| try testing.expect(!got.stateOf(n).?.writable);
+
+    // Bootstrapped in this run, an unusable record is written over afresh;
+    // a newer or unreadable one is still never written.
+    var again = testMachine(a, .{ .known = "machine-a" });
+    const excluded = try load(a, io, state, &again, &.{ brew.backend(), apt.backend(), dnf.backend() }, &.{ "brew", "apt", "dnf" });
+    try testing.expectEqual(@as(usize, 0), excluded.seen.blocked.len);
+    try testing.expect(excluded.stateOf("brew").?.writable);
+    try testing.expect(!excluded.stateOf("apt").?.writable);
+    try testing.expect(!excluded.stateOf("dnf").?.writable);
 }
 
 test "next: what was held and is still declared, plus what is desired and installed" {

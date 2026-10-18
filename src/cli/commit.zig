@@ -1042,7 +1042,6 @@ fn reconcilePackages(
             return .{ .broken = true };
         },
     };
-    for (loaded.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
 
     const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, .reconcile, loaded.seen, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -1353,7 +1352,7 @@ fn forgetHeld(
     id: []const u8,
 ) !?[]const u8 {
     const state = loaded.stateOf(backend) orelse return "its manager keeps no record";
-    if (!state.writable) return "the record cannot be written; see the note above";
+    if (!state.writable) return "the record cannot be written";
     const owner = (try machine.owner()) orelse return "this machine's identity could not be read";
     const held = mox.packages.seen.read(ctx.alloc, ctx.io, state_dir, backend, &owner) catch |e| switch (e) {
         error.OutOfMemory => return e,
