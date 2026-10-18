@@ -289,10 +289,20 @@ pub const Scoop = struct {
         return foldId(arena, row.name);
     }
 
-    /// No row is present: `scoop export` lists every app scoop has, so one it
-    /// has is in `installedExplicit`'s answer already, and nothing is asked.
-    fn scoopPresentImpl(_: *anyopaque, _: std.mem.Allocator, _: []const Row) anyerror![]const []const u8 {
-        return &.{};
+    /// The rows whose app the export listed as a failed install: on the
+    /// machine, so missing, and `scoop install` repairs it. No other row is
+    /// present: `scoop export` lists every app scoop has, so a whole one is
+    /// in `installedExplicit`'s answer already. Nothing is asked; the export
+    /// that answer read is reused.
+    fn scoopPresentImpl(ctx: *anyopaque, arena: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Scoop = @ptrCast(@alignCast(ctx));
+        const apps = self.apps orelse return &.{};
+        var out: std.ArrayList([]const u8) = .empty;
+        for (rows) |row| {
+            const app = appOf(apps, row.name) orelse continue;
+            if (app.failed) try out.append(arena, try foldId(arena, row.name));
+        }
+        return out.toOwnedSlice(arena);
     }
 
     fn installedExplicitImpl(ctx: *anyopaque, arena: std.mem.Allocator) anyerror![]const []const u8 {
@@ -1430,17 +1440,28 @@ test "scoop: an unparseable export is an error, never an empty set" {
     try testing.expectError(Error.UnreadableExport, s.backend().installedExplicit(a));
 }
 
-test "scoop: no row is present, and nothing is asked" {
+test "scoop: present answers only the rows the export listed as failed installs, and asks nothing more" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{
+        .{ .argv = "scoop export", .stdout = scoop_export_states },
+    } };
     var s: Scoop = .{ .runner = fake.runner() };
 
-    const got = (try s.backend().present(a, &.{ scoopRow("ripgrep", &.{}), scoopRow("7zip", &.{}) })).?;
-    try testing.expectEqual(@as(usize, 0), got.len);
+    // Before any export is read, nothing is known, and nothing is asked.
+    const none = (try s.backend().present(a, &.{scoopRow("ripgrep", &.{})})).?;
+    try testing.expectEqual(@as(usize, 0), none.len);
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    _ = try s.backend().installedExplicit(a);
+    // ripgrep's install failed: on the machine, so present. bat is in no
+    // form there. The row's spelling is folded as an id is.
+    const got = (try s.backend().present(a, &.{ scoopRow("RipGrep", &.{}), scoopRow("bat", &.{}) })).?;
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("ripgrep", got[0]);
+    try testing.expectEqual(@as(usize, 1), fake.calls.items.len);
 }
 
 test "scoop: validate refuses a key meant for another manager" {
