@@ -57,6 +57,7 @@ const edit_mod = @import("edit.zig");
 const toml = @import("toml");
 const toml_statements = mox.data.toml_statements;
 const interp = mox.compose.interp;
+const lexical = mox.compose.context;
 
 const Io = std.Io;
 const Segment = mox.provenance.map.Segment;
@@ -175,8 +176,13 @@ const Route = union(enum) {
     /// default` clause, that `[d]` chooses instead of the fact.
     fact: struct {
         name: []const u8,
-        new_value: []const u8,
+        /// The edited value as the fact holds it, read back from its context;
+        /// null when the live text cannot be written there from a fact.
+        new_value: ?[]const u8,
         old_value: ?[]const u8,
+        /// The live text as the source default holds it: template text,
+        /// written as it is.
+        default_value: []const u8,
         default_edit: LineEdit,
         default_desc: []const u8,
     },
@@ -5386,6 +5392,8 @@ fn processGeneratedHunk(
                 .template = leaf.template,
                 .variable = leaf.variable,
                 .where = leaf.where,
+                .kind = lexical.kindFor(mox.source.format.resolve(leaf.live_path, false), leaf.live_path, leaf.template),
+                .before = "",
                 .leaf = .{ .into = leaf.into, .dir = std.fs.path.dirname(gen_file.live_path) orelse gen_file.live_path, .live_path = leaf.live_path },
             };
             switch (try planRowWrite(cc, gen_file, site, b_lines[hunk.b_start])) {
@@ -6736,33 +6744,38 @@ fn processHunk(
             try printHunkHeader(cc.stdout, cc.sty, try mox.source.path.liveKeyRelToHome(cc.arena, cc.m_state.home, file.live_path), "hunk", hunk_no, hunk_total, try routeLabel(cc.arena, route, file));
             try printMiniDiff(cc.sty, cc.stdout, hunk, shown_a, shown_b);
             try cc.stdout.print("  This value comes from machine.{s}.\n", .{r.name});
-            const legend_line = try legend(cc.arena, &fact_choices, 0, cc.sty);
-            switch (try prompt.ask(cc.ask_mode, &fact_choices, 0, legend_line, cc.input, cc.stdout)) {
-                .chosen => |i| switch (i) {
+            // Text a fact cannot produce here (a `$` the shell is meant to
+            // expand) can still be the source default.
+            const choices: []const prompt.Choice = if (r.new_value != null) &fact_choices else fact_choices[1..];
+            if (r.new_value == null) try cc.stdout.print("  As written, it can only be the source default.\n", .{});
+            const legend_line = try legend(cc.arena, choices, 0, cc.sty);
+            switch (try prompt.ask(cc.ask_mode, choices, 0, legend_line, cc.input, cc.stdout)) {
+                .chosen => |picked| switch (picked + @intFromBool(r.new_value == null)) {
                     0 => {
                         // [f]: the fact. Never touches repo src.
-                        const set: Footprint = .{ .path = cc.paths.facts_path, .kind = .{ .fact = .{ .name = r.name, .value = r.new_value } } };
+                        const new_value = r.new_value.?;
+                        const set: Footprint = .{ .path = cc.paths.facts_path, .kind = .{ .fact = .{ .name = r.name, .value = new_value } } };
                         if (try conflictOf(cc, ra, &.{set})) |reason| return hunkManual(cc, ra, file, fidx, hunk, reason);
-                        try ra.fact_edits.append(cc.arena, .{ .name = r.name, .new_value = r.new_value, .old_value = r.old_value });
+                        try ra.fact_edits.append(cc.arena, .{ .name = r.name, .new_value = new_value, .old_value = r.old_value });
                         try ra.fact_owners.append(cc.arena, fidx);
                         ra.affected[fidx] = true;
                         if (space.configs.len > 1) {
-                            const imp = try simulateFactImpact(cc, file, r.name, r.new_value, space.configs);
+                            const imp = try simulateFactImpact(cc, file, r.name, new_value, space.configs);
                             for (imp.affected) |l| try ra.allowed[fidx].put(l, {});
                         }
-                        try cc.stdout.print("  set fact machine.{s} = \"{s}\"\n", .{ r.name, r.new_value });
+                        try cc.stdout.print("  set fact machine.{s} = \"{s}\"\n", .{ r.name, new_value });
                     },
                     1 => {
                         // [d]: the source's default, via the ordinary LineEdit
                         // machinery (backup, apply, impact simulation).
                         const rewrite = [_]Footprint{
                             .{ .path = r.default_edit.path, .kind = .{ .splice = r.default_edit } },
-                            .{ .path = r.default_edit.path, .kind = .{ .fact = .{ .name = r.name, .value = r.new_value } } },
+                            .{ .path = r.default_edit.path, .kind = .{ .fact = .{ .name = r.name, .value = r.default_value } } },
                         };
                         if (try conflictOf(cc, ra, &rewrite)) |reason| return hunkManual(cc, ra, file, fidx, hunk, reason);
                         try ra.line_edits.append(cc.arena, r.default_edit);
                         try ra.line_owners.append(cc.arena, fidx);
-                        try ra.fact_defaults.append(cc.arena, .{ .name = r.name, .value = r.new_value, .path = r.default_edit.path, .owner = fidx });
+                        try ra.fact_defaults.append(cc.arena, .{ .name = r.name, .value = r.default_value, .path = r.default_edit.path, .owner = fidx });
                         ra.affected[fidx] = true;
                         if (space.configs.len > 1) {
                             const imp = try simulateImpact(cc, file, r.default_edit, space.configs);
@@ -7099,7 +7112,9 @@ fn routeHunk(cc: *const ClassCtx, lf: *LoopFile, hunk: Hunk) !Route {
             if (hunk.a_len != 1 or hunk.b_len != 1)
                 return .{ .manual = "came from a capture" };
             const start = (o.origin_line - 1) + (hunk.a_start - seg.out_start);
-            return interpolatedRoute(arena, io, file, start, old_lines[0], new_lines[0], cc.m_state);
+            const before = try textBefore(arena, a_lines, hunk.a_start);
+            const kind = lexical.kindFor(file.format, file.live_path, if (a_lines.len > 0) a_lines[0] else "");
+            return interpolatedRoute(arena, io, file, start, old_lines[0], new_lines[0], cc.m_state, kind, before);
         },
         .overlay => return .{ .manual = "came from a structural merge" },
     }
@@ -7120,6 +7135,9 @@ fn interpolatedRoute(
     old_line: []const u8,
     new_line: []const u8,
     m_state: *const mox.machine.state.MachineState,
+    /// The file's tracker, and the output before the line.
+    kind: lexical.Kind,
+    preceding: []const u8,
 ) !Route {
     const content = Io.Dir.cwd().readFileAlloc(io, file.source_base_abs, arena, .limited(max_file_bytes)) catch
         return .{ .manual = "came from a capture" };
@@ -7147,12 +7165,16 @@ fn interpolatedRoute(
 
     const cap = after[changed_idx];
     const fact = asMachineCapture(cap.name) orelse return .{ .manual = "came from a capture" };
+    // A fact's value is encoded for its context; a default is template text,
+    // spliced as written.
+    const at = lexical.contextAfter(kind, try std.mem.concat(arena, u8, &.{ preceding, new_line[0..cap.at] }));
+    const value = try lexical.encode.decode(arena, cap.value, at);
     // A name or value `persist` would refuse (a control character, or a name
     // that is not a valid TOML bare key) must never reach the write phase:
     // caught here, before any [f]/[d] choice is offered, so the hunk can only
     // ever become an ordinary manual one -- never a write that starts, then
     // throws with other sources already rewritten.
-    if (!mox.machine.interview.canPersist(fact, cap.value))
+    if (!mox.machine.interview.canPersist(fact, value orelse cap.value))
         return .{ .manual = "came from a capture; the new value cannot be saved as a fact" };
 
     var old_value: ?[]const u8 = null;
@@ -7175,8 +7197,9 @@ fn interpolatedRoute(
 
     return .{ .fact = .{
         .name = fact,
-        .new_value = cap.value,
+        .new_value = value,
         .old_value = old_value,
+        .default_value = cap.value,
         .default_edit = default_edit,
         .default_desc = default_desc,
     } };
@@ -7661,10 +7684,11 @@ fn candidateHelp(arena: std.mem.Allocator, c: candidates.Candidate) ![]const u8 
 /// One `<...>` capture matched against a composed line by literal-position
 /// splitting: `name` is the raw text between `<` and `>` (a ` | default "..."`
 /// clause, if any, still attached), `value` is the substring of the matched
-/// line it captured, and `open`/`close` are the byte indices of `<`/`>` in
-/// `template` -- shared by every line matched against the SAME template
-/// instance, so a caller can splice a replacement back into it.
-const RawCapture = struct { name: []const u8, value: []const u8, open: usize, close: usize };
+/// line it captured, `at` its offset in that line, and `open`/`close` are
+/// the byte indices of `<`/`>` in `template` -- shared by every line matched
+/// against the SAME template instance, so a caller can splice a replacement
+/// back into it.
+const RawCapture = struct { name: []const u8, value: []const u8, at: usize, open: usize, close: usize };
 
 /// Match `line` against `template`'s literal frame, returning every `<...>`
 /// capture's raw name, matched value, and template span, in template order --
@@ -7705,6 +7729,7 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
     }
 
     var values = try arena.alloc([]const u8, names.items.len);
+    var ats = try arena.alloc(usize, names.items.len);
     var pos: usize = 0;
     if (!std.mem.startsWith(u8, line, literals.items[0])) return null;
     pos += literals.items[0].len;
@@ -7712,6 +7737,7 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
     for (names.items, 0..) |_, ci| {
         const delim = literals.items[ci + 1];
         const is_last = ci == names.items.len - 1;
+        ats[ci] = pos;
         if (is_last) {
             if (delim.len == 0) {
                 values[ci] = line[pos..];
@@ -7732,7 +7758,7 @@ fn matchCaptures(arena: std.mem.Allocator, template: []const u8, line: []const u
 
     var caps = try arena.alloc(RawCapture, names.items.len);
     for (names.items, 0..) |name, ci| {
-        caps[ci] = .{ .name = name, .value = values[ci], .open = opens.items[ci], .close = closes.items[ci] };
+        caps[ci] = .{ .name = name, .value = values[ci], .at = ats[ci], .open = opens.items[ci], .close = closes.items[ci] };
     }
     return caps;
 }
@@ -8038,7 +8064,15 @@ fn loopRoute(cc: *const ClassCtx, lf: *LoopFile, seg: Segment, hunk: Hunk) !Rout
     }
     const fo = now[k].seg.origin.loop;
     const loop = fresh.sites[fo.site orelse return stale];
-    const site: RowSite = .{ .data_source = fo.data_source, .row = fo.row, .template = loop.template, .variable = loop.variable, .where = loop.where };
+    const site: RowSite = .{
+        .data_source = fo.data_source,
+        .row = fo.row,
+        .template = loop.template,
+        .variable = loop.variable,
+        .where = loop.where,
+        .kind = lexical.kindFor(lf.file.format, lf.file.live_path, if (fresh.lines.len > 0) fresh.lines[0] else ""),
+        .before = try textBefore(arena, fresh.lines, now[k].seg.out_start),
+    };
     const planned = switch (try planRowWrite(cc, lf.file, site, lf.b_lines[hunk.b_start])) {
         .no_match => return .{ .manual = "live line does not match loop template" },
         .manual => |reason| return .{ .manual = reason },
@@ -8096,13 +8130,14 @@ fn elsewhereRefusal(cc: *const ClassCtx, lf: *const LoopFile, fresh: LoopFile.Fr
         if (!in_planned) continue;
         // A rendering a secret line splits has no single position.
         if (count != 1) return unplaced;
-        const text = interp.expand(arena, loop.template, planned, ctx) catch |e| switch (e) {
+        const fresh_seg = rendering.?;
+        const before = try textBefore(arena, fresh.lines, fresh_seg.out_start);
+        const text = renderRow(arena, loop.template, planned, ctx, site.kind, before) catch |e| switch (e) {
             error.OutOfMemory => return e,
             // A rendering that fails to expand counts as disappearing.
             else => return differently,
         };
         const lines = try mox.diff.lines.splitLines(arena, try std.fmt.allocPrint(arena, "{s}\n", .{text}));
-        const fresh_seg = rendering.?;
         if (fresh_seg.out_len != lines.len) return unplaced;
         // Its position: the recorded rendering of this row through the same
         // template, in the same place in output order.
@@ -8143,10 +8178,31 @@ const RowSite = struct {
     template: []const u8,
     variable: []const u8,
     where: ?*const mox.dsl.ast.RowExpr,
+    /// The file's tracker, and the output before the row's line, which name
+    /// the context each capture of the line is written for.
+    kind: lexical.Kind,
+    before: []const u8,
     leaf: ?Leaf = null,
 
     const Leaf = struct { into: []const u8, dir: []const u8, live_path: []const u8 };
 };
+
+/// The output before line `n` of `lines`, as one text.
+fn textBefore(arena: std.mem.Allocator, lines: []const []const u8, n: usize) ![]const u8 {
+    if (n == 0) return "";
+    return std.mem.concat(arena, u8, &.{ try std.mem.join(arena, "\n", lines[0..n]), "\n" });
+}
+
+/// `template` rendered for `record` as compose writes it after `before` in a
+/// file `kind` tracks: each value from outside the repo encoded for its
+/// context.
+fn renderRow(arena: std.mem.Allocator, template: []const u8, record: *const mox.data.toml.Record, ctx: interp.Ctx, kind: lexical.Kind, before: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .fromOwnedSlice(try arena.dupe(u8, before));
+    var enc = lexical.Encoder.init(kind, &buf, true);
+    var ectx = ctx;
+    ectx.encoder = &enc;
+    return interp.expand(arena, template, record, ectx);
+}
 
 /// What routing a live line through a row decided: the line matches the
 /// template's literal frame in no way, the hunk is manual, or the field
@@ -8213,20 +8269,28 @@ fn rowField(inner: []const u8, variable: []const u8) ?struct { name: []const u8,
 }
 
 /// `template` as pieces to match a live line against, with every capture
-/// that is not row data expanded against `record`; null when a capture does
-/// not expand.
-fn templatePieces(arena: std.mem.Allocator, template: []const u8, variable: []const u8, record: *const mox.data.toml.Record, ctx: interp.Ctx) !?[]const Piece {
+/// that is not row data expanded against `record` as compose writes it after
+/// `before` in a file `kind` tracks; null when a capture does not expand.
+fn templatePieces(arena: std.mem.Allocator, template: []const u8, variable: []const u8, record: *const mox.data.toml.Record, ctx: interp.Ctx, kind: lexical.Kind, before: []const u8) !?[]const Piece {
     var pieces: std.ArrayList(Piece) = .empty;
     var literal: std.ArrayList(u8) = .empty;
+    // The line as rendered so far, after `before`: what each capture's
+    // context is read from.
+    var rendered: std.ArrayList(u8) = .empty;
+    try rendered.appendSlice(arena, before);
     var i: usize = 0;
     while (i < template.len) {
         if (template[i] == '<') {
             if (mox.compose.capture.closeIndex(template, i)) |close| {
                 const text = template[i .. close + 1];
-                const current = interp.expand(arena, text, record, ctx) catch |e| switch (e) {
+                var enc = lexical.Encoder.init(kind, &rendered, true);
+                var ectx = ctx;
+                ectx.encoder = &enc;
+                const current = interp.expand(arena, text, record, ectx) catch |e| switch (e) {
                     error.OutOfMemory => return e,
                     else => return null,
                 };
+                try rendered.appendSlice(arena, current);
                 if (rowField(template[i + 1 .. close], variable)) |f| {
                     if (literal.items.len > 0) try pieces.append(arena, .{ .text = try literal.toOwnedSlice(arena) });
                     try pieces.append(arena, .{ .text = text, .field = f.name, .expands = f.expands, .current = current });
@@ -8238,6 +8302,7 @@ fn templatePieces(arena: std.mem.Allocator, template: []const u8, variable: []co
             }
         }
         try literal.append(arena, template[i]);
+        try rendered.append(arena, template[i]);
         i += 1;
     }
     if (literal.items.len > 0) try pieces.append(arena, .{ .text = try literal.toOwnedSlice(arena) });
@@ -8449,7 +8514,7 @@ fn planRowWrite(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site: Ro
         else => return not_table,
     } orelse return not_table;
     const ctx = try rowCtx(arena, cc, file, site.variable, record);
-    const pieces = (try templatePieces(arena, site.template, site.variable, record, ctx)) orelse return .no_match;
+    const pieces = (try templatePieces(arena, site.template, site.variable, record, ctx, site.kind, site.before)) orelse return .no_match;
     const fields = try pieceFields(arena, pieces);
     const split = switch (try chooseSplit(arena, pieces, fields, live_line)) {
         .no_match => return .no_match,
@@ -8521,7 +8586,7 @@ fn rowRenderRefusal(cc: *const ClassCtx, file: mox.source.tree.ManagedFile, site
     const arena = cc.arena;
     const pctx = try rowCtx(arena, cc, file, site.variable, record);
     if (!try rowPasses(arena, cc, site.where, pctx.scope)) return "the edited row is filtered out";
-    const rendered = interp.expand(arena, site.template, record, pctx) catch |e| switch (e) {
+    const rendered = renderRow(arena, site.template, record, pctx, site.kind, site.before) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => return "the edited row does not render the edited line",
     };

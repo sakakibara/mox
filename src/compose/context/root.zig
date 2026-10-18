@@ -2,9 +2,8 @@
 //! that context reads it back. Each format has a tracker fed the literal
 //! text compose emits; before a capture it names the capture's context, and
 //! after the file it says whether the file could be followed to its end.
-//! A value is encoded for its context or refused; the file is then fed
-//! through a fresh tracker, and inserting each value must leave the
-//! tracker's state as it was.
+//! A value is encoded for its context or refused, and feeding the encoded
+//! value must leave the tracker's state as it was.
 
 const std = @import("std");
 
@@ -21,6 +20,13 @@ pub const Encoder = encoder.Encoder;
 const format_mod = @import("../../source/format.zig");
 pub const Encoding = types.Encoding;
 pub const Context = types.Context;
+
+/// The context after `prefix` in a file `kind` tracks.
+pub fn contextAfter(kind: Kind, prefix: []const u8) Context {
+    var t = Tracker.init(kind);
+    t.feed(prefix);
+    return t.context();
+}
 
 /// The tracker kinds.
 pub const Kind = enum { toml, yaml, ini, gitconfig, sh, fish, powershell, text };

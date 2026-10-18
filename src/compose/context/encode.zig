@@ -114,6 +114,297 @@ pub fn encode(arena: std.mem.Allocator, value: []const u8, ctx: Context) !Result
     };
 }
 
+/// The value `text`, as written in `ctx`, reads back as: the inverse of
+/// `encode` that also accepts any other spelling the context allows (a TOML
+/// `\u00e9`, a fish `\x`). Null when `text` cannot stand whole in `ctx`: it
+/// would end the string, expand, or holds an escape the context rejects.
+pub fn decode(arena: std.mem.Allocator, text: []const u8, ctx: Context) !?[]const u8 {
+    if (ctx.refuse != null) return null;
+    const value: ?[]const u8 = switch (ctx.enc) {
+        .raw, .lines, .yaml_typed, .raw_line, .toml_literal, .toml_ml_literal, .toml_bare, .toml_bare_key, .yaml_plain, .ini_quoted, .ini_unquoted, .ini_section, .gitconfig_unquoted, .sh_sq, .sh_word, .sh_heredoc_quoted, .fish_word, .ps_here_sq => text,
+        .toml_basic, .toml_ml_basic => try unescapeToml(arena, text, ctx.enc == .toml_ml_basic),
+        .yaml_dq => try unescapeYamlDq(arena, text),
+        .yaml_sq => try undoubled(arena, text, &.{"'"}),
+        .yaml_block => try unindented(arena, text, ctx.indent),
+        .gitconfig_quoted => try unescapeGitconfig(arena, text),
+        .gitconfig_subsection => try unescapeShell(arena, text, "\\\"", "\"", false),
+        .sh_dq => try unescapeShell(arena, text, "\\\"$`", "\"$`", true),
+        .sh_heredoc => try unescapeShell(arena, text, "\\$`", "$`", true),
+        .fish_dq => try unescapeShell(arena, text, "\\\"$", "\"$", true),
+        .fish_sq => try unescapeShell(arena, text, "\\'", "'", false),
+        .ps_dq => try unescapePs(arena, text, &ps_double_quotes),
+        .ps_sq => try undoubled(arena, text, &ps_single_quotes),
+        .ps_here_dq => try unescapePs(arena, text, &.{}),
+    };
+    const v = value orelse return null;
+    // What `encode` refuses here cannot have been written by it, nor can a
+    // value whose writing would differ in what it stops at.
+    return switch (try encode(arena, v, ctx)) {
+        .bytes => v,
+        .refused => null,
+    };
+}
+
+fn unescapeToml(arena: std.mem.Allocator, text: []const u8, multi_line: bool) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '"' and (!multi_line or std.mem.startsWith(u8, text[i..], "\"\"\""))) return null;
+        if (c == '\n' and !multi_line) return null;
+        if (c != '\\') {
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= text.len) return null;
+        const e = text[i + 1];
+        i += 2;
+        switch (e) {
+            '"' => try out.append(arena, '"'),
+            '\\' => try out.append(arena, '\\'),
+            'n' => try out.append(arena, '\n'),
+            'r' => try out.append(arena, '\r'),
+            't' => try out.append(arena, '\t'),
+            'b' => try out.append(arena, 0x08),
+            'f' => try out.append(arena, 0x0c),
+            'e' => try out.append(arena, 0x1b),
+            'u', 'U' => {
+                const n: usize = if (e == 'u') 4 else 8;
+                if (!try appendCodepoint(arena, &out, text, i, n)) return null;
+                i += n;
+            },
+            ' ', '\t', '\n', '\r' => {
+                // A multi-line string's line-ending backslash trims the
+                // whitespace up to the next non-blank byte.
+                if (!multi_line) return null;
+                var j = i - 1;
+                while (j < text.len and (text[j] == ' ' or text[j] == '\t')) j += 1;
+                if (j >= text.len or (text[j] != '\n' and text[j] != '\r')) return null;
+                while (j < text.len and std.mem.indexOfScalar(u8, " \t\r\n", text[j]) != null) j += 1;
+                i = j;
+            },
+            else => return null,
+        }
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// Append the code point spelled by the `n` hex digits at `text[at..]`.
+fn appendCodepoint(arena: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8, at: usize, n: usize) !bool {
+    if (at + n > text.len) return false;
+    const cp = std.fmt.parseInt(u21, text[at .. at + n], 16) catch return false;
+    var b: [4]u8 = undefined;
+    const len = std.unicode.utf8Encode(cp, &b) catch return false;
+    try out.appendSlice(arena, b[0..len]);
+    return true;
+}
+
+fn unescapeYamlDq(arena: std.mem.Allocator, text: []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '"' or c == '\n' or c == '\r') return null;
+        if (c != '\\') {
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= text.len) return null;
+        const e = text[i + 1];
+        i += 2;
+        const single: ?[]const u8 = switch (e) {
+            '0' => "\x00",
+            'a' => "\x07",
+            'b' => "\x08",
+            't', '\t' => "\t",
+            'n' => "\n",
+            'v' => "\x0b",
+            'f' => "\x0c",
+            'r' => "\r",
+            'e' => "\x1b",
+            ' ' => " ",
+            '"' => "\"",
+            '/' => "/",
+            '\\' => "\\",
+            'N' => "\u{85}",
+            '_' => "\u{a0}",
+            'L' => "\u{2028}",
+            'P' => "\u{2029}",
+            else => null,
+        };
+        if (single) |s| {
+            try out.appendSlice(arena, s);
+            continue;
+        }
+        const n: usize = switch (e) {
+            'x' => 2,
+            'u' => 4,
+            'U' => 8,
+            else => return null,
+        };
+        if (!try appendCodepoint(arena, &out, text, i, n)) return null;
+        i += n;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// `text` with each doubled quote of `quotes` read as one; null on a quote
+/// that is not doubled, which would end the string.
+fn undoubled(arena: std.mem.Allocator, text: []const u8, quotes: []const []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    outer: while (i < text.len) {
+        for (quotes) |q| if (std.mem.startsWith(u8, text[i..], q)) {
+            // PowerShell takes any two of its single quotes as one.
+            const next = text[i + q.len ..];
+            for (quotes) |q2| if (std.mem.startsWith(u8, next, q2)) {
+                try out.appendSlice(arena, q);
+                i += q.len + q2.len;
+                continue :outer;
+            };
+            return null;
+        };
+        try out.append(arena, text[i]);
+        i += 1;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// `text` with the `n` spaces after each line break removed; null when a
+/// non-empty continuation line is indented less.
+fn unindented(arena: std.mem.Allocator, text: []const u8, n: u32) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) {
+            try out.append(arena, '\n');
+            if (line.len < n or !allIn(line[0..n], isSpace)) {
+                if (std.mem.trim(u8, line, " ").len != 0) return null;
+                continue;
+            }
+            try out.appendSlice(arena, line[n..]);
+        } else try out.appendSlice(arena, line);
+        first = false;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ';
+}
+
+fn unescapeGitconfig(arena: std.mem.Allocator, text: []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '"' or c == '\n') return null;
+        if (c != '\\') {
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= text.len) return null;
+        try out.append(arena, switch (text[i + 1]) {
+            '"' => '"',
+            '\\' => '\\',
+            'n' => '\n',
+            't' => '\t',
+            'b' => 0x08,
+            else => return null,
+        });
+        i += 2;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// A shell-style string: a backslash before one of `escapes` reads as that
+/// byte, before a newline (when `continues`) as nothing, and before any other
+/// byte as itself; a bare byte of `bare` would end the string or expand.
+fn unescapeShell(arena: std.mem.Allocator, text: []const u8, escapes: []const u8, bare: []const u8, continues: bool) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (std.mem.indexOfScalar(u8, bare, c) != null) return null;
+        if (c != '\\') {
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= text.len) return null;
+        const e = text[i + 1];
+        i += 2;
+        if (std.mem.indexOfScalar(u8, escapes, e) != null) {
+            try out.append(arena, e);
+        } else if (e == '\n' and continues) {} else {
+            try out.append(arena, '\\');
+            try out.append(arena, e);
+        }
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// A PowerShell expandable string: a backtick escapes the next character
+/// (`n`, `t` and the other letters PowerShell names stand for controls), a
+/// doubled quote of `quotes` reads as one, and a bare `$` would expand.
+fn unescapePs(arena: std.mem.Allocator, text: []const u8, quotes: []const []const u8) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    outer: while (i < text.len) {
+        if (text[i] == '$') return null;
+        if (text[i] == '`') {
+            if (i + 1 >= text.len) return null;
+            const e = text[i + 1];
+            const ctl: ?u8 = switch (e) {
+                '0' => 0,
+                'a' => 0x07,
+                'b' => 0x08,
+                'e' => 0x1b,
+                'f' => 0x0c,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'v' => 0x0b,
+                else => null,
+            };
+            if (ctl) |b| {
+                try out.append(arena, b);
+                i += 2;
+                continue;
+            }
+            if (e == 'u' and i + 2 < text.len and text[i + 2] == '{') {
+                const close = std.mem.indexOfScalarPos(u8, text, i + 3, '}') orelse return null;
+                const hex = text[i + 3 .. close];
+                if (hex.len == 0 or hex.len > 6 or !try appendCodepoint(arena, &out, text, i + 3, hex.len)) return null;
+                i = close + 1;
+                continue;
+            }
+            // The escaped character, which may be a multi-byte quote.
+            const len = std.unicode.utf8ByteSequenceLength(e) catch return null;
+            if (i + 1 + len > text.len) return null;
+            try out.appendSlice(arena, text[i + 1 .. i + 1 + len]);
+            i += 1 + len;
+            continue;
+        }
+        for (quotes) |q| if (std.mem.startsWith(u8, text[i..], q)) {
+            const next = text[i + q.len ..];
+            for (quotes) |q2| if (std.mem.startsWith(u8, next, q2)) {
+                try out.appendSlice(arena, q);
+                i += q.len + q2.len;
+                continue :outer;
+            };
+            return null;
+        };
+        try out.append(arena, text[i]);
+        i += 1;
+    }
+    return try out.toOwnedSlice(arena);
+}
+
 /// The context as compose's message names it.
 pub fn name(enc: Encoding) []const u8 {
     return switch (enc) {
@@ -451,4 +742,41 @@ test "encode: a comment refuses a newline" {
     const a = arena_state.allocator();
     try testing.expect((try encode(a, "a\nb", .{ .enc = .raw_line })) == .refused);
     try testing.expectEqualStrings("ab", bytesOf(try encode(a, "ab", .{ .enc = .raw_line })));
+}
+
+test "decode: every encoding reads back the value it wrote" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const values = [_][]const u8{ "plain", "C:\\temp \"x\" $HOME `id` it's", "tab\there\x01", "a\u{2028}b\u{85}c", "caf\u{e9} \u{201C}q\u{201D} \u{2019}s", "l1\nl2" };
+    inline for (@typeInfo(Encoding).@"enum".fields) |f| {
+        const ctx: Context = .{ .enc = @enumFromInt(f.value), .indent = 2, .terminator = "EOF" };
+        for (values) |v| switch (try encode(a, v, ctx)) {
+            .bytes => |b| {
+                const back = (try decode(a, b, ctx)) orelse return error.TestUnexpectedResult;
+                testing.expectEqualStrings(v, back) catch |e| {
+                    std.debug.print("encoding {s}\n", .{f.name});
+                    return e;
+                };
+            },
+            .refused => {},
+        };
+    }
+}
+
+test "decode: other spellings a context allows read back; text that would end the string or expand does not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("caf\u{e9}", (try decode(a, "caf\\u00e9", .{ .enc = .toml_basic })).?);
+    try testing.expectEqualStrings("a\\qb", (try decode(a, "a\\qb", .{ .enc = .sh_dq })).?);
+    try testing.expectEqualStrings("x\ny", (try decode(a, "x`ny", .{ .enc = .ps_dq })).?);
+    try testing.expectEqualStrings("a\"b", (try decode(a, "a\"\"b", .{ .enc = .ps_dq })).?);
+    try testing.expect((try decode(a, "a\"b", .{ .enc = .toml_basic })) == null);
+    try testing.expect((try decode(a, "a\\qb", .{ .enc = .toml_basic })) == null);
+    try testing.expect((try decode(a, "a$b", .{ .enc = .sh_dq })) == null);
+    try testing.expect((try decode(a, "it's", .{ .enc = .yaml_sq })) == null);
+    try testing.expect((try decode(a, "a$b", .{ .enc = .ps_dq })) == null);
+    try testing.expect((try decode(a, "a b", .{ .enc = .sh_word })) == null);
+    try testing.expect((try decode(a, "x", .{ .enc = .sh_dq, .refuse = "write `${NAME}`" })) == null);
 }

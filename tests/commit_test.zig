@@ -2886,6 +2886,80 @@ test "commit: an interpolated machine-fact edit rewrites the source default when
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
 }
 
+test "commit: an edited fact value that compose escaped for its context is saved as the value it reads as" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport GREETING=\"<machine.greeting>\"\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "greeting = \"say \\\"hi\\\"\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "export GREETING=\"say \\\"hi\\\"\"") != null);
+    try editLive(io, a, live, "export GREETING=\"say \\\"hi\\\"\"", "export GREETING=\"say \\\"bye\\\" \\$5\"");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "greeting = \"say \\\"bye\\\" $5\"") != null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: an edited value no fact can produce in its context is offered only as the source default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport P=\"<machine.tooldir | default \"/opt\">\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export P=\"/opt\"", "export P=\"$HOME/bin\"");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "d\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "As written, it can only be the source default.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[f]") == null);
+    const src = try read(io, a, try h.srcOf(".zshrc"));
+    try std.testing.expectEqualStrings("export A=1\nexport P=\"<machine.tooldir | default \"$HOME/bin\">\"\n", src);
+    try std.testing.expect(!exists(io, try h.homePath(".config/mox/facts.toml")));
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a loop row whose line also holds an escaped outside value routes to its data row" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "# mox: for entry in \"data/abbrs.toml\"\nabbr <entry.key>=\"<env.MOX_T_PFX> <entry.expansion>\"\n# mox: end\n");
+    try writeRepo(io, &tmp, "repo/data/abbrs.toml", "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status\"\n");
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_T_PFX", .value = "a\"b" }} });
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "abbr gs=\"a\\\"b git status\"") != null);
+    try editLive(io, a, live, "git status", "git status -sb");
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "commit", "--yes" })).rc);
+    const data = try read(io, a, try std.fs.path.join(a, &.{ h.repo, "data", "abbrs.toml" }));
+    try std.testing.expectEqualStrings(
+        "[[abbrs]]\nkey = \"ll\"\nexpansion = \"ls -l\"\n\n[[abbrs]]\nkey = \"gs\"\nexpansion = \"git status -sb\"\n",
+        data,
+    );
+}
+
 test "commit: a multi-capture interpolated line with an ambiguous change falls back to manual" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
