@@ -6133,7 +6133,36 @@ test "commit: r keeps the record's entry while another row still declares the pa
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "another row still declares it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "warning") == null);
+    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: r whose record write fails keeps the row's removal and warns, saying what follows" {
+    if (builtin.os.tag == .windows or std.c.geteuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    useFake(try brewWith(a, "", "", &.{}));
+    // A records directory nothing can be created in: the atomic write's
+    // temporary file cannot be made.
+    const dir = try a.dupeZ(u8, try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name }));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(dir, 0o555));
+    defer _ = std.c.chmod(dir, 0o755);
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "r\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but mox could not update its list of what this machine held: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "; until an apply rewrites that list, a row declaring it again reads as removed\n") != null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }
 
@@ -6325,6 +6354,62 @@ test "commit --yes: a removed package is skipped, nothing is written, and the ru
     try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 0, 0, 0, 2 })) != null);
     try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
     try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: with no terminal and no --yes, a removed package is reported, nothing is written, and the run exits 1" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "commit" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  removed    brew fd\n  removed    brew ripgrep\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "removed package:") == null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: R answers for its own backend only, so the next backend's removed package is still asked about" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+    const arch = "backend = \"pacman\"\n\n[[packages]]\nname = \"jq\"\n";
+    try writeManifest(io, h, a, "arch.toml", arch);
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    try writeSeen(h, "pacman", testutil.test_identity, &.{"jq"});
+
+    // brew and pacman both usable, each holding nothing.
+    const base = try brewWith(a, "", "", &.{});
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "pacman --version", .stdout = "Pacman v7.0.0\n" });
+    try entries.append(a, .{ .argv = "pacman -Qeq", .stdout = "" });
+    try entries.append(a, .{ .argv = "pacman -Qq", .stdout = "" });
+    try entries.appendSlice(a, base.entries);
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "R\ns\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try removedQuestion(a, "pacman", "jq", "data/packages/arch.toml")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 1, 0, 0, 0, 1 })) != null);
+    try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings(arch, try readManifest(io, h, a, "arch.toml"));
+    try std.testing.expectEqualStrings("jq", try readSeen(h, "pacman", testutil.test_identity));
 }
 
 test "commit --dry-run: each removed package is listed, nothing is written, and the run exits 1" {

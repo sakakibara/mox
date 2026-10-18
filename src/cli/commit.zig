@@ -1298,11 +1298,15 @@ fn reconcilePackages(
                     res.removed_rows += 1;
                     try ctx.out.print("  removed from {s}\n", .{gone.row.label});
                     // A row declaring the package again later reads missing,
-                    // not removed, unless another row still declares it now.
-                    const why = (try stillDeclared(ctx, context, registry.find(b.backend), gone.id)) orelse
-                        (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) orelse continue;
+                    // not removed. While another row still declares it, the
+                    // record keeps it: that row is still withheld here.
+                    const why = switch (try stillDeclared(ctx, context, registry.find(b.backend).?, gone.id)) {
+                        .declared => continue,
+                        .failed => |reason| reason,
+                        .free => (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) orelse continue,
+                    };
                     try ctx.out.flush();
-                    try ctx.err.print("mox commit: warning: {s} {s}: its row is removed, but the record of what this machine held still has it: {s}\n", .{ b.backend, gone.row.name, why });
+                    try ctx.err.print("mox commit: warning: {s} {s}: its row was removed, but mox could not update its list of what this machine held: {s}; until an apply rewrites that list, a row declaring it again reads as removed\n", .{ b.backend, gone.row.name, why });
                     try ctx.err.flush();
                 },
                 2 => {
@@ -1323,22 +1327,27 @@ fn reconcilePackages(
     return res;
 }
 
-/// Null when no `[[packages]]` row left in the manifest declares `id` for
-/// `backend`, under any gate, so the record may forget it; otherwise why it
-/// stays.
-fn stillDeclared(ctx: *app.Ctx, context: app.Context, backend: ?mox.packages.backend.Backend, id: []const u8) !?[]const u8 {
-    const b = backend orelse return "its manager is not known here";
+/// Whether a `[[packages]]` row left in the manifest declares `id` for
+/// `backend`, under any gate; when none does, the record may forget it.
+const Declared = union(enum) {
+    declared,
+    free,
+    /// The manifest could not be read back to tell: why.
+    failed: []const u8,
+};
+
+fn stillDeclared(ctx: *app.Ctx, context: app.Context, b: mox.packages.backend.Backend, id: []const u8) !Declared {
     var diag: mox.packages.manifest.Diag = .{};
     const m = mox.packages.manifest.load(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return try std.fmt.allocPrint(ctx.alloc, "the manifest could not be read back ({s})", .{diag.capture() orelse @errorName(e)}),
+        else => return .{ .failed = try std.fmt.allocPrint(ctx.alloc, "the manifest could not be read back ({s})", .{diag.capture() orelse @errorName(e)}) },
     };
     const ids = mox.packages.drift.idsOf(ctx.alloc, b, m.packages) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return try std.fmt.allocPrint(ctx.alloc, "the manifest's rows could not be named ({s})", .{@errorName(e)}),
+        else => return .{ .failed = try std.fmt.allocPrint(ctx.alloc, "the manifest's rows could not be named ({s})", .{@errorName(e)}) },
     };
-    for (ids) |declared| if (std.mem.eql(u8, declared, id)) return "another row still declares it";
-    return null;
+    for (ids) |declared| if (std.mem.eql(u8, declared, id)) return .declared;
+    return .free;
 }
 
 /// Take `id` out of this machine's record for `backend`. Null when it is
