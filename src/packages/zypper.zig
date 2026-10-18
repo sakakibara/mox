@@ -678,7 +678,7 @@ test "installedExplicit: the ledger narrowed to what rpm reports present" {
     try testing.expectEqualStrings("ripgrep", got[0]);
 }
 
-test "installedExplicit: a package removed behind mox's back is reported missing again" {
+test "installedExplicit: a ledger entry rpm no longer holds drops out of the explicit set" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
