@@ -235,10 +235,10 @@ pub fn append(arena: std.mem.Allocator, io: Io, link_path: []const u8, header: [
 /// filesystem may refuse the lock anywhere; the append then runs as it would
 /// with no lock at all, where the per-writer staging path still keeps the two
 /// rewrites out of one inode and leaves at most a dropped row.
-pub const DirLock = struct {
+const DirLock = struct {
     file: ?Io.File,
 
-    pub fn acquire(io: Io, dir_path: []const u8) DirLock {
+    fn acquire(io: Io, dir_path: []const u8) DirLock {
         if (builtin.os.tag == .windows) return .{ .file = null };
         Io.Dir.cwd().createDirPath(io, dir_path) catch {};
         const f = Io.Dir.cwd().openFile(io, dir_path, .{}) catch return .{ .file = null };
@@ -249,7 +249,7 @@ pub const DirLock = struct {
         return .{ .file = f };
     }
 
-    pub fn release(self: DirLock, io: Io) void {
+    fn release(self: DirLock, io: Io) void {
         const f = self.file orelse return;
         f.unlock(io);
         f.close(io);
