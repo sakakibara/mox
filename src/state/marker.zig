@@ -119,15 +119,33 @@ fn ledgerForm(arena: std.mem.Allocator, io: Io, path: []const u8) !bool {
     return true;
 }
 
-/// `seen/` holds only regular `*.txt` files, whatever they say, and OS
-/// files: a record mox cannot read is still one it replaces.
+/// `seen/` holds only regular `*.txt` files, whatever they say, the
+/// temporary file a write of one that was killed mid-way leaves
+/// (`<name>.txt.mox-tmp.<pid>.<n>`), and OS files: a record mox cannot read
+/// is still one it replaces.
 fn seenOnly(arena: std.mem.Allocator, io: Io, dir: []const u8) !bool {
     const entries = dirent.sortedPath(arena, io, dir, .{ .iterate = true, .follow_symlinks = false }) catch return false;
     for (entries) |e| {
         if (isOsFile(e)) continue;
-        if (e.kind != .file or e.name.len <= ".txt".len or !std.mem.endsWith(u8, e.name, ".txt")) return false;
+        if (e.kind != .file) return false;
+        const name = recordOfTemp(e.name) orelse e.name;
+        if (name.len <= ".txt".len or !std.mem.endsWith(u8, name, ".txt")) return false;
     }
     return true;
+}
+
+/// The name `name` is the atomic write's temporary file for
+/// (`apply_write.writeAtomic`), or null when it is not one.
+fn recordOfTemp(name: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOf(u8, name, ".mox-tmp.") orelse return null;
+    var parts = std.mem.splitScalar(u8, name[at + ".mox-tmp.".len ..], '.');
+    var n: usize = 0;
+    while (parts.next()) |part| : (n += 1) {
+        if (part.len == 0) return null;
+        for (part) |c| if (!std.ascii.isDigit(c)) return null;
+    }
+    if (n != 2) return null;
+    return name[0..at];
 }
 
 /// `commit-recovery/` holds, beside OS files, only directories named by
@@ -445,6 +463,7 @@ test "accept: mox-path, zypper.txt, seen/, commit-recovery/ and a check hook's s
             .{ .path = "seen/brew-0123456789abcdef.txt", .data = "mox-seen 1\nripgrep\n" },
             .{ .path = "seen/apt-fedcba9876543210.txt", .data = "mox-seen 2\nanything at all\n" },
             .{ .path = "seen/.DS_Store", .data = "" },
+            .{ .path = "seen/brew-0123456789abcdef.txt.mox-tmp.4242.0", .data = "mox-seen 1\nrip" },
         },
         &.{.{ .path = "commit-recovery" }},
         &.{
@@ -476,6 +495,10 @@ test "accept: mox-path, zypper.txt, seen/, commit-recovery/ and a check hook's s
         &.{.{ .path = "seen", .data = "" }},
         &.{.{ .path = "seen/notes", .data = "x\n" }},
         &.{.{ .path = "seen/.txt", .data = "" }},
+        &.{.{ .path = "seen/brew-0123456789abcdef.txt.mox-tmp.4242", .data = "" }},
+        &.{.{ .path = "seen/brew-0123456789abcdef.txt.mox-tmp.x.0", .data = "" }},
+        &.{.{ .path = "seen/notes.mox-tmp.4242.0", .data = "" }},
+        &.{.{ .path = "seen/.txt.mox-tmp.4242.0", .data = "" }},
         &.{.{ .path = "seen/brew-0123456789abcdef.txt" }},
         &.{.{ .path = "seen/sub/brew-0123456789abcdef.txt", .data = "" }},
         &.{.{ .path = "commit-recovery", .data = "" }},
