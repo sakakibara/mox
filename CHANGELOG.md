@@ -4,7 +4,7 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.1] - 2026-10-19
 
 ### Fixed
 - `mox commit` routes an edited capture in a TOML, YAML or INI file to its
@@ -2012,6 +2012,7 @@ Nothing about a machine is recorded outside it.
   contradictory or mistyped whole-file gate.
 - Single-writer lock on mutating commands.
 
+[0.13.1]: https://github.com/sakakibara/mox/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/sakakibara/mox/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/sakakibara/mox/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/sakakibara/mox/compare/v0.12.2...v0.12.3
