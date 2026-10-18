@@ -317,20 +317,24 @@ fn composeToml(
     // ordering.
     if (layers.len == 1) {
         if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // Multi-layer merge seeds from the head-processed base text, so no
     // consumed directive line reaches the parser.
-    var merged: toml.Value = toml.parse(arena, hd.body, .{}) catch |e| return layerFailed(arena, e, .toml, hd.body, layerDisplay(arena, file, file.source_base_abs), hd.body_removed, diag);
+    const base = try expandLayer(arena, io, file, file.source_base_abs, hd.body, hd.body_removed, machine_state_opt, secrets, diag);
+    var secret = base.secret;
+    var merged: toml.Value = toml.parse(arena, base.text, .{}) catch |e| return layerFailed(arena, e, .toml, base, diag);
     for (layers[1..]) |path| {
-        const next = try parseFile(arena, io, file, path, diag);
+        const layer = try readLayer(arena, io, file, path, machine_state_opt, secrets, diag);
+        secret = secret or layer.secret;
+        const next = toml.parse(arena, layer.text, .{}) catch |e| return layerFailed(arena, e, .toml, layer, diag);
         merged = try toml_merge.mergeTables(arena, merged, next);
     }
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     try toml.encode(&aw.writer, merged, .{});
-    return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
+    return mergedOutput(arena, file, aw.written(), secret, prov);
 }
 
 /// Compose a JSON-family managed file. Mirrors `composeToml`: a single
@@ -395,26 +399,27 @@ fn composeYaml(
 
     if (layers.len == 1) {
         if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // A directive-only base leaves no YAML document to parse, so the first
     // overlay seeds the merge.
-    const blank = std.mem.trim(u8, hd.body, " \t\r\n").len == 0;
-    var merged: yaml.Value = if (blank)
-        try parseYamlFile(arena, io, file, layers[1], diag)
-    else
-        yaml.parse(arena, hd.body, .{}) catch |e| return layerFailed(arena, e, .yaml, hd.body, layerDisplay(arena, file, file.source_base_abs), hd.body_removed, diag);
-    for (layers[if (blank) 2 else 1..]) |path| {
-        const next = try parseYamlFile(arena, io, file, path, diag);
-        merged = try yaml_merge.deepMerge(arena, merged, next);
+    const base = try expandLayer(arena, io, file, file.source_base_abs, hd.body, hd.body_removed, machine_state_opt, secrets, diag);
+    var secret = base.secret;
+    const blank = std.mem.trim(u8, base.text, " \t\r\n").len == 0;
+    var merged: ?yaml.Value = if (blank) null else yaml.parse(arena, base.text, .{}) catch |e| return layerFailed(arena, e, .yaml, base, diag);
+    for (layers[1..]) |path| {
+        const layer = try readLayer(arena, io, file, path, machine_state_opt, secrets, diag);
+        secret = secret or layer.secret;
+        const next = yaml.parse(arena, layer.text, .{}) catch |e| return layerFailed(arena, e, .yaml, layer, diag);
+        merged = if (merged) |m| try yaml_merge.deepMerge(arena, m, next) else next;
     }
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     // yaml.emit already terminates the document with a trailing newline,
     // matching the toml/json composers' single-newline output convention.
-    try yaml.emit(&aw.writer, merged, .{});
-    return interpolate(arena, io, file, true, aw.written(), &.{}, machine_state_opt, secrets, prov, diag);
+    try yaml.emit(&aw.writer, merged.?, .{});
+    return mergedOutput(arena, file, aw.written(), secret, prov);
 }
 
 /// Compose a gitconfig or INI managed file via raw-line section-merge.
@@ -439,17 +444,20 @@ fn composeSectionMerge(
 
     if (layers.len == 1) {
         if (containsMoxDirective(hd.body)) return try catB.composeTrackedContent(arena, io, file, bindings, machine_state_opt, secrets, prov, diag, hd.text, hd.text_removed, !hd.partial);
-        return interpolate(arena, io, file, false, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
+        return interpolate(arena, io, file, hd.body, hd.body_removed, machine_state_opt, secrets, prov, diag);
     }
 
     // Raw-line merge preserves comments, so the head-processed seed matters
     // here (the parse-then-emit formats would drop directive comments anyway).
-    var merged: []u8 = @constCast(hd.body);
+    const base = try expandLayer(arena, io, file, file.source_base_abs, hd.body, hd.body_removed, machine_state_opt, secrets, diag);
+    var secret = base.secret;
+    var merged: []u8 = @constCast(base.text);
     for (layers[1..]) |path| {
-        const overlay = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-        merged = try ini_merge.merge(arena, merged, overlay, dialect);
+        const layer = try readLayer(arena, io, file, path, machine_state_opt, secrets, diag);
+        secret = secret or layer.secret;
+        merged = try ini_merge.merge(arena, merged, layer.text, dialect);
     }
-    return interpolate(arena, io, file, true, merged, &.{}, machine_state_opt, secrets, prov, diag);
+    return mergedOutput(arena, file, merged, secret, prov);
 }
 
 /// Heuristic: does `content` contain a `# mox: ...` line? Cheap substring
@@ -574,15 +582,15 @@ pub fn wholeFileGateAxisExpr(arena: std.mem.Allocator, io: Io, file: ManagedFile
 }
 
 /// Run the `<machine.X>` / `<data.X>` / `<secret:URI>` interpolation pass over a
-/// Cat A composed output and record the file's whole-file provenance segment.
-/// No machine state means no interp: the bytes pass through unchanged, still
-/// attributed a whole-file segment. A resolved inline secret makes the segment
-/// `.secret` so its cleartext stays out of the content cache and snapshots.
+/// single-layer Cat A source and record the file's whole-file provenance
+/// segment. No machine state means no interp: the bytes pass through
+/// unchanged, still attributed a whole-file segment. A resolved inline secret
+/// makes its lines `.secret` so their cleartext stays out of the content
+/// cache and snapshots.
 fn interpolate(
     arena: std.mem.Allocator,
     io: Io,
     file: ManagedFile,
-    merged: bool,
     bytes: []const u8,
     base_removed: []const u32,
     machine_state_opt: ?*const machine.state.MachineState,
@@ -591,7 +599,7 @@ fn interpolate(
     diag: ?*interp.Diag,
 ) !?[]u8 {
     if (machine_state_opt == null) {
-        try recordWhole(arena, prov, bytes, file, merged, base_removed);
+        try recordWhole(arena, prov, bytes, file, false, base_removed);
         return @constCast(bytes);
     }
     const ctx: interp.Ctx = .{
@@ -623,9 +631,9 @@ fn interpolate(
     try interp.finishEncoder(arena, &enc, out.items, file.live_path, diag);
     const result = try out.toOwnedSlice(arena);
     if (secret_seen) {
-        try recordPerLineSecret(arena, prov, result, file, merged, line_secret.items, base_removed);
+        try recordPerLineSecret(arena, prov, result, file, false, line_secret.items, base_removed);
     } else {
-        try recordWhole(arena, prov, result, file, merged, base_removed);
+        try recordWhole(arena, prov, result, file, false, base_removed);
     }
     return result;
 }
@@ -797,17 +805,94 @@ const LayerRef = struct {
     }
 };
 
-fn parseFile(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const u8, diag: ?*interp.Diag) !toml.Value {
+/// A layer of a TOML, YAML or INI merge with each capture expanded, every
+/// value written for its context: the merge reads the values, and the
+/// emitter writes each in a style that holds it.
+const Layer = struct {
+    text: []const u8,
+    display: []const u8,
+    /// The layer's own line of each line of `text`, 1-based; empty when they
+    /// are the same.
+    lines: []const u32 = &.{},
+    /// The head pass's removed lines, for the base layer.
+    removed: []const u32 = &.{},
+    secret: bool = false,
+};
+
+fn readLayer(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const u8, machine_state_opt: ?*const machine.state.MachineState, secrets: ?catB.SecretCtx, diag: ?*interp.Diag) !Layer {
     const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    return toml.parse(arena, content, .{}) catch |e| layerFailed(arena, e, .toml, content, layerDisplay(arena, file, path), &.{}, diag);
+    return expandLayer(arena, io, file, path, content, &.{}, machine_state_opt, secrets, diag);
+}
+
+fn expandLayer(
+    arena: std.mem.Allocator,
+    io: Io,
+    file: ManagedFile,
+    path: []const u8,
+    text: []const u8,
+    removed: []const u32,
+    machine_state_opt: ?*const machine.state.MachineState,
+    secrets: ?catB.SecretCtx,
+    diag: ?*interp.Diag,
+) !Layer {
+    const display = layerDisplay(arena, file, path);
+    if (machine_state_opt == null) return .{ .text = text, .display = display, .removed = removed };
+    const ctx: interp.Ctx = .{
+        .io = io,
+        .machine = machine_state_opt,
+        .repo_dir = file.repo_dir,
+        .private_dir = file.private_dir,
+        .secrets = if (secrets) |sc| .{ .env = sc.env, .cache = sc.cache } else null,
+        .diag = diag,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    var enc = context.Encoder.init(context.kindFor(file.format, path, text), &out, secrets == null);
+    var ectx = ctx;
+    ectx.encoder = &enc;
+    var lines: std.ArrayList(u32) = .empty;
+    var secret = false;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var n: u32 = 0;
+    while (it.next()) |line| {
+        n += 1;
+        if (n > 1) try out.append(arena, '\n');
+        const exp = try interp.expandTracked(arena, line, null, ectx);
+        secret = secret or exp.secret;
+        try lines.appendNTimes(arena, n, std.mem.count(u8, exp.bytes, "\n") + 1);
+        try out.appendSlice(arena, exp.bytes);
+    }
+    const source_lines = try sourceLinesFor(arena, lines.items, removed);
+    try interp.finishEncoderAt(arena, &enc, out.items, display, source_lines, diag);
+    return .{ .text = out.items, .display = display, .lines = lines.items, .removed = removed, .secret = secret };
+}
+
+/// Each expanded line's line in the source file, through the head pass's
+/// removed lines.
+fn sourceLinesFor(arena: std.mem.Allocator, lines: []const u32, removed: []const u32) ![]const u32 {
+    const out = try arena.alloc(u32, lines.len);
+    for (lines, out) |l, *o| o.* = source.head.sourceLine(removed, l);
+    return out;
 }
 
 /// A merge layer that would not parse: reported like a layer check, with
-/// its location, so a capture the merge reads before it expands is named.
-fn layerFailed(arena: std.mem.Allocator, err: anyerror, format: source.format.Format, text: []const u8, display: []const u8, removed: []const u32, diag: ?*interp.Diag) anyerror {
+/// its location; in fixed text when a secret resolved into it.
+fn layerFailed(arena: std.mem.Allocator, err: anyerror, format: source.format.Format, layer: Layer, diag: ?*interp.Diag) anyerror {
     if (err == error.OutOfMemory) return err;
-    try validate.checkLayer(arena, format, text, display, "", removed, diag);
+    try validate.checkExpandedLayer(arena, format, layer.text, layer.display, layer.lines, layer.removed, layer.secret, diag);
     return err;
+}
+
+/// Record a merged output's provenance. A merge rewrites every line, so one
+/// that resolved a secret is `.secret` whole.
+fn mergedOutput(arena: std.mem.Allocator, file: ManagedFile, bytes: []const u8, secret: bool, prov: ?*std.ArrayList(Segment)) !?[]u8 {
+    if (secret) {
+        const all = try arena.alloc(bool, prov_mod.map.lineCount(bytes));
+        @memset(all, true);
+        try recordPerLineSecret(arena, prov, bytes, file, true, all, &.{});
+    } else {
+        try recordWhole(arena, prov, bytes, file, true, &.{});
+    }
+    return @constCast(bytes);
 }
 
 /// The home-relative key of the target `file` composes.
@@ -819,11 +904,6 @@ pub fn targetKey(file: ManagedFile) []const u8 {
 fn parseJsonFile(arena: std.mem.Allocator, io: Io, path: []const u8, dialect: json.Dialect) !json.Value {
     const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
     return json.parse(arena, try json_interp.escapeCaptureQuotes(arena, content), .{ .dialect = dialect });
-}
-
-fn parseYamlFile(arena: std.mem.Allocator, io: Io, file: ManagedFile, path: []const u8, diag: ?*interp.Diag) !yaml.Value {
-    const content = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_layer_bytes));
-    return yaml.parse(arena, content, .{}) catch |e| layerFailed(arena, e, .yaml, content, layerDisplay(arena, file, path), &.{}, diag);
 }
 
 test "lessSpecificFirst is a total order: equal tuples tiebreak on path" {

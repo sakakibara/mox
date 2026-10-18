@@ -890,10 +890,13 @@ names: in the JSON family its captures expand as Captures in a JSON
 generator describes, and a file that does not parse is that file's
 `ERROR` -- it is not written, and its generator's other files are.
 
-A layer of a merge is read before captures expand, so a bare capture in a
-merged TOML or YAML layer is reported at its line and column with a hint to
-put it inside a string. `mox commit` reports a layer or live file that does
-not parse the same way.
+Each layer of a TOML, YAML or INI merge has its captures expanded, each
+value written for its context, before the merge reads it: the merge works
+on the resolved values, and a merged TOML or YAML file is written with each
+value in a style that holds it. A layer that does not parse once its
+captures are written is reported at its own line and column; when a secret
+was written into it, the reason is fixed text. `mox commit` reports a layer
+or live file that does not parse the same way.
 
 A failure is that file's `ERROR` in `apply`, `status`, `diff` and `export`,
 and nothing of it reaches the live tree:

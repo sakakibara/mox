@@ -7082,7 +7082,7 @@ test "validation: a stripped head keeps the line a base error names the line the
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "src/app.toml:4:"));
 }
 
-test "validation: capture-bearing and region-bearing TOML layers are checked on their output, which names its layers" {
+test "validation: capture-bearing and region-bearing TOML layers are checked once their captures are written" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7095,17 +7095,16 @@ test "validation: capture-bearing and region-bearing TOML layers are checked on 
     try put(io, &tmp, "repo/src/ok.toml", "port = <data.u.port>\nlabel = \"<machine.os | default \"x\">\"\n");
     // Alternate regions repeat a key; one of them composes.
     try put(io, &tmp, "repo/src/regions.toml", "# mox: when os=zzz\nk = 1\n# mox: end\n# mox: when not os=zzz\nk = 2\n# mox: end\n");
-    // A bare capture whose value is no TOML value: the output is refused.
-    try put(io, &tmp, "repo/src/bad.toml", "a = 1\n");
     // A quoted capture of an authored data value holding a quote: the data
-    // is template text, spliced as written, so the output does not parse.
+    // is template text, spliced as written, so the layer does not parse.
+    try put(io, &tmp, "repo/src/bad.toml", "a = 1\n");
     try put(io, &tmp, "repo/src/bad.toml.d/os=" ++ host_os ++ ".toml", "b = \"<data.u.name>\"\n");
     const c = try cliSetup(a, io, &tmp);
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, try c.homePath("ok.toml")), "port = 8080") != null);
     try std.testing.expectEqualStrings("k = 2\n", try read(io, a, try c.homePath("regions.toml")));
-    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/bad.toml"), "composed output line 2 from src/bad.toml and src/bad.toml.d/os=" ++ host_os ++ ".toml: "));
+    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/bad.toml"), "src/bad.toml.d/os=" ++ host_os ++ ".toml:1:"));
 }
 
 const host_os = switch (builtin.os.tag) {
@@ -7636,7 +7635,7 @@ test "validation: a secret in a bare TOML value is refused naming its reason, an
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/e.json"), "duplicate key \"a\\n\\\"b\""));
 }
 
-test "validation: a bare capture in a merged TOML or YAML layer names its layer, line and column" {
+test "apply: each layer of a merge has its captures written before the merge reads it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7645,16 +7644,37 @@ test "validation: a bare capture in a merged TOML or YAML layer names its layer,
     const a = arena.allocator();
 
     try put(io, &tmp, "repo/data/u.toml", "port = 8080\n");
-    try put(io, &tmp, "repo/src/app.toml", "a = 1\n");
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\nd = \"<env.MOX_T_UNSET | default \"z\">\"\n");
     try put(io, &tmp, "repo/src/app.toml.d/os=" ++ host_os ++ ".toml", "b = 2\nport = <data.u.port>\n");
-    try put(io, &tmp, "repo/src/c.yaml", "a: 1\nb: [<data.u.port>\n");
+    try put(io, &tmp, "repo/src/c.yaml", "a: \"<env.MOX_T_BOOL>\"\nb: 1\n");
+    try put(io, &tmp, "repo/src/c.yaml.d/os=" ++ host_os ++ ".yaml", "b: 2\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os, .extra_env = &.{.{ .name = "MOX_T_BOOL", .value = "true" }} });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("a = 1\nd = \"z\"\nb = 2\nport = 8080\n", try read(io, a, try c.homePath("app.toml")));
+    try std.testing.expectEqualStrings("a: \"true\"\nb: 2\n", try read(io, a, try c.homePath("c.yaml")));
+}
+
+test "validation: a merged layer that does not parse once its captures are written names its own line, and holds back a secret" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\n");
+    try put(io, &tmp, "repo/src/app.toml.d/os=" ++ host_os ++ ".toml", "t = \"\"\"<secret:env:MOX_TEST_TOKEN>\"\"\"\nb = = 2\n");
+    try put(io, &tmp, "repo/src/c.yaml", "a: \"<env.MOX_T_LINES>\"\nb: [1\n");
     try put(io, &tmp, "repo/src/c.yaml.d/os=" ++ host_os ++ ".yaml", "c: 1\n");
-    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os });
+    const c = try testutil.setup(a, io, &tmp, .{ .os = host_os, .extra_env = &.{
+        .{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t\nvalue" },
+        .{ .name = "MOX_T_LINES", .value = "x" },
+    } });
     const r = try c.run(&.{ "mox", "apply" });
     try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "src/app.toml.d/os=" ++ host_os ++ ".toml:2:"));
-    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/app.toml"), "a capture in a merged layer must sit inside a string"));
-    try std.testing.expect(lineHasBoth(r.err, try tilde(a, "ERROR   ~/c.yaml"), "src/c.yaml:3:1: unterminated flow sequence"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "src/c.yaml: an unclosed flow collection, so mox cannot tell where its captures sit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "s3cr3t") == null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "TomlParseError") == null);
 }
 

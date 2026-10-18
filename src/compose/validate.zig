@@ -25,8 +25,6 @@ const empty_hint = "an empty file is not JSON: write {}";
 const data_capture_hint = "quote it: a quoted single data capture emits its typed value";
 const capture_hint = "quote it";
 const bom_hint = "strip the byte order mark at the start of the file";
-const merged_capture_hint = "layers merge before captures expand, so a capture in a merged layer must sit inside a string";
-
 /// One parse failure: 1-based line and column in the checked text, the
 /// parser's message, and a hint by cause.
 const Failure = struct {
@@ -54,10 +52,28 @@ pub fn checkLayer(
     removed: []const u32,
     diag: ?*interp.Diag,
 ) Error!void {
-    var f = (try firstFailure(arena, format, text, display, key)) orelse return;
+    const f = (try firstFailure(arena, format, text, display, key)) orelse return;
     const line = source.head.sourceLine(removed, f.line);
-    if (f.hint == null and !format.isJson() and interp.containsCapture(lineAt(text, lineOffset(text, f.line)))) f.hint = merged_capture_hint;
     return report(arena, diag, try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, line, f.col }), try reason(arena, format, f, false), f.hint);
+}
+
+/// `checkLayer` for a merge layer whose captures were expanded: `lines` maps
+/// each line of `text` to the layer's own (empty when they are the same),
+/// and when a secret resolved into it the report is fixed text.
+pub fn checkExpandedLayer(
+    arena: std.mem.Allocator,
+    format: Format,
+    text: []const u8,
+    display: []const u8,
+    lines: []const u32,
+    removed: []const u32,
+    has_secret: bool,
+    diag: ?*interp.Diag,
+) Error!void {
+    const f = (try firstFailure(arena, format, text, display, "")) orelse return;
+    const own = if (f.line >= 1 and f.line <= lines.len) lines[f.line - 1] else f.line;
+    const line = source.head.sourceLine(removed, own);
+    return report(arena, diag, try std.fmt.allocPrint(arena, "{s}:{d}:{d}", .{ display, line, f.col }), try reason(arena, format, f, has_secret), shownHint(f, has_secret));
 }
 
 /// Why a live file `display` names does not parse in `format`, as
@@ -339,14 +355,6 @@ fn lineOffset(text: []const u8, line: u32) usize {
         if (c == '\n') n += 1;
     }
     return text.len;
-}
-
-/// The line of `text` holding byte `offset`.
-fn lineAt(text: []const u8, offset: usize) []const u8 {
-    const at = @min(offset, text.len);
-    const start = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |i| i + 1 else 0;
-    const end = std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len;
-    return text[start..end];
 }
 
 fn jsonFailure(arena: std.mem.Allocator, format: Format, text: []const u8, display: []const u8, key: []const u8) !?Failure {

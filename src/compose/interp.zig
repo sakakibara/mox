@@ -34,9 +34,16 @@ pub const InterpError = error{
 /// `diag` naming the capture, its line, its context and the remedy, when a
 /// value was refused or the file could not be followed.
 pub fn finishEncoder(arena: std.mem.Allocator, enc: *context.Encoder, out: []const u8, path: []const u8, diag: ?*Diag) InterpError!void {
+    return finishEncoderAt(arena, enc, out, path, &.{}, diag);
+}
+
+/// `finishEncoder` for output whose lines are not the source's: `lines`
+/// names the source line of each line of `out`.
+pub fn finishEncoderAt(arena: std.mem.Allocator, enc: *context.Encoder, out: []const u8, path: []const u8, lines: []const u32, diag: ?*Diag) InterpError!void {
     const unfollowed = enc.finish();
     if (enc.refused) |r| {
-        const line = std.mem.count(u8, out[0..@min(r.offset, out.len)], "\n") + 1;
+        const out_line = std.mem.count(u8, out[0..@min(r.offset, out.len)], "\n") + 1;
+        const line = if (out_line <= lines.len) lines[out_line - 1] else out_line;
         if (diag) |d| d.set(try std.fmt.allocPrint(arena, "{s}:{d}: the value of {s} cannot be written in {s}{s}{s}; {s}", .{
             path, line, r.capture, r.refusal.where, if (r.refusal.reason.len > 0) ": " else "", r.refusal.reason, r.refusal.remedy,
         }));

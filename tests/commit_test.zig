@@ -711,8 +711,8 @@ test "commit: a layered toml key named by a capture is never written under its r
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
     const live = try h.liveOf("s.toml");
-    try editLive(io, a, live, "\"darwin\" = \"a\"", "\"darwin\" = \"b\"");
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "\"darwin\" = \"b\"") != null);
+    try editLive(io, a, live, "darwin = \"a\"", "darwin = \"b\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "darwin = \"b\"") != null);
     try editLive(io, a, live, "m = \"darwin\"", "m = \"linux\"");
     try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "m = \"linux\"") != null);
 
@@ -815,8 +815,8 @@ test "commit: an edit under a toml key named by a capture is refused as interpol
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
 
     const live = try h.liveOf("s.toml");
-    try editLive(io, a, live, "\"darwin\" = \"a\"", "\"darwin\" = \"b\"");
-    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "\"darwin\" = \"b\"") != null);
+    try editLive(io, a, live, "darwin = \"a\"", "darwin = \"b\"");
+    try std.testing.expect(std.mem.indexOf(u8, try read(io, a, live), "darwin = \"b\"") != null);
 
     const res = try h.run(&.{ "mox", "commit", "--yes" });
     try std.testing.expectEqual(@as(u8, 1), res.rc);
