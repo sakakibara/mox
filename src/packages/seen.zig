@@ -184,9 +184,8 @@ pub fn path(arena: std.mem.Allocator, state_dir: []const u8, backend_name: []con
 }
 
 /// The record of `backend_name` for `owner`. An error is a record that is
-/// there but could not be read at all; the caller leaves that backend's
-/// record out of effect rather than treating it as absent, which would
-/// forget every uninstall it holds.
+/// there but could not be read at all; `load` blocks that backend rather
+/// than treating it as absent, which would forget every uninstall it holds.
 pub fn read(arena: std.mem.Allocator, io: Io, state_dir: []const u8, backend_name: []const u8, owner: []const u8) !Read {
     const p = try path(arena, state_dir, backend_name, owner);
     const bytes = Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(max_record_bytes)) catch |e| switch (e) {

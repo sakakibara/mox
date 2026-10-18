@@ -938,21 +938,21 @@ fn printPackages(
 /// formula of the same name). `name` is what the manifest row spells, present
 /// for all but an untracked package. A removed package is declared and was
 /// seen installed on this machine, and is not installed here any more. An
-/// astray package is installed, but held by its
-/// manager under a binding that moved off it; `why` says how, and `fix` what
-/// repairs it, which mox leaves to the user because it can need an
-/// uninstall. An unchecked package is installed, but could not be judged for
-/// that; `why` says why. A backend that could judge none of its installed
-/// packages is `{backend, state: "unchecked", why}`. A manager that is there
-/// but broken is `{backend, state: "broken", exit, probe, [why]}`, `exit`
-/// being the exit code or null for a call that never reached one (killed at
-/// its bound, ended for want of a terminal, answered in a shape that is not
-/// an answer); `why` carries the reason in words for exactly those, so a
-/// genuine exit of 255 can never read as one of them. A manifest that would
-/// not load or validate is `{"state":"refused"}`, carrying no `backend`
-/// because nothing was reached: without it the empty array is byte-identical
-/// to a machine whose every package is accounted for, and the reason is on
-/// stderr.
+/// astray package is installed, but held by its manager under a binding that
+/// moved off it; `why` says how, and `fix` what repairs it, which mox leaves
+/// to the user because it can need an uninstall. An unchecked package is
+/// installed, but could not be judged for that; `why` says why. A backend
+/// that could judge none of its installed packages is `{backend, state:
+/// "unchecked", why}`. A manager that is there but broken, or whose record of
+/// what this machine held cannot be used (`probe` "record"), is `{backend,
+/// state: "broken", exit, probe, [why]}`, `exit` being the exit code or null
+/// for a call that never reached one (killed at its bound, ended for want of
+/// a terminal, answered in a shape that is not an answer); `why` carries the
+/// reason in words for exactly those, so a genuine exit of 255 can never read
+/// as one of them. A manifest that would not load or validate is
+/// `{"state":"refused"}`, carrying no `backend` because nothing was reached:
+/// without it the empty array is byte-identical to a machine whose every
+/// package is accounted for, and the reason is on stderr.
 /// `kind` is a stable tag (`whole_file`, `owned_key`, `symlink_target`,
 /// `generated_set`, `vanished`); `key` appears only for `owned_key` (its owned
 /// key path, or null for a secret whole-scope record). The schema is locked by
@@ -1107,19 +1107,20 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
 /// A package record is `package_missing` / `package_removed` /
-/// `package_untracked` \t backend \t id, `package_astray` \t backend \t id \t why \t fix, `package_unchecked`
-/// \t backend \t id \t why -- the id being `-` for a backend that could judge
-/// none of its installed packages -- or `package_broken` \t backend \t exit
-/// code \t probe \t why -- the exit code being `-` for a call that never
-/// reached one (killed at its bound, ended for want of a terminal, answered
-/// in a shape that is not an answer), which is the only thing that tells
-/// those apart from a genuine exit of 255;
-/// `probe` is what was asked and `why` the reason in words, empty where the
-/// code says it. A manifest that would not
-/// load or validate is the single field `package_refused`, with no backend
-/// because nothing was reached: without it the absence of package records is
-/// byte-identical to a machine whose every package is accounted for, and the
-/// reason is on stderr.
+/// `package_untracked` \t backend \t id, `package_astray` \t backend \t id
+/// \t why \t fix, `package_unchecked` \t backend \t id \t why -- the id
+/// being `-` for a backend that could judge none of its installed packages
+/// -- or `package_broken` \t backend \t exit code \t probe \t why -- the
+/// exit code being `-` for a call that never reached one (killed at its
+/// bound, ended for want of a terminal, answered in a shape that is not an
+/// answer), which is the only thing that tells those apart from a genuine
+/// exit of 255; `probe` is what was asked (`record` for a record of what
+/// this machine held that cannot be used) and `why` the reason in words,
+/// empty where the code says it. A manifest that would not load or validate
+/// is the single field `package_refused`, with no backend because nothing
+/// was reached: without it the absence of package records is byte-identical
+/// to a machine whose every package is accounted for, and the reason is on
+/// stderr.
 fn emitPorcelain(
     out: *std.Io.Writer,
     units: []const mox.apply.drift.Unit,

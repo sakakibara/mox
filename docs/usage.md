@@ -126,7 +126,8 @@ every configuration its sources express, and if any configuration you did not
 choose to change composes differently, the edit is rolled back.
 
 When the repo declares packages, the same run then offers each untracked one
-`[y/b/s]` -- see [Packages](#packages).
+`[y/b/s]`, then each removed one (declared, held here before, and now gone)
+`[r/k/i/s]`; see [Packages](#packages).
 
 ## When apply meets an edited live file
 

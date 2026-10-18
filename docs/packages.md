@@ -708,12 +708,30 @@ answers.
 
 The record is in effect, and a package can be REMOVED, only when it exists
 and can be read, the machine's identity could be read, the backend can be
-asked whether a package is on the machine, and, for apply, the manager was
-not bootstrapped in that run. Otherwise a declared package that is not
-installed is MISSING. A record a newer mox wrote is neither read nor
-replaced, and is noted as such; one that cannot be parsed is noted and
-replaced by the next apply; an identity that cannot be read is noted, and no
-record is used or written.
+asked whether a package is on the machine, and, for apply, the manager's
+installer did not run in that run. With no record, a declared package that
+is not installed is MISSING.
+
+A record that is there but cannot be used never counts as none, since that
+would install again every package it says this machine lost. Instead the
+backend is BROKEN for the run, on its record: nothing is asked of it or
+installed through it, apply exits 2, status shows it in every format, and
+commit has nothing to reconcile for it. The message names the cause and
+the fix:
+
+- a record whose first line is `mox-seen <N>`, N above 1, was written by a
+  newer mox and is neither read nor replaced: upgrade mox;
+- a record that cannot be read names its path and the error;
+- a record with any other first line, or a broken line after it, is
+  unusable: remove the file it names to start the record afresh;
+- when the machine's identity cannot be read, which record is this
+  machine's cannot be told, so any record file for that backend, of any
+  owner, blocks it, saying why the identity could not be read.
+
+With no record file for a backend, an identity that cannot be read only
+leaves its record unwritten, which a note says. The identity is read only
+when a record file exists for a backend that can be asked, or a record is
+to be written.
 
 A declared package off the manager's explicit list but in the record is
 asked about once more: is it on the machine in any form? One that is -- a
@@ -729,7 +747,7 @@ What each manager is asked:
 | apt | `dpkg-query -W`; present in any state but not installed or reduced to its configuration files, so a manual package left unconfigured stays MISSING and apply configures it |
 | pacman | `pacman -Qq` |
 | dnf, zypper | `rpm -qa` |
-| scoop | Not asked: `scoop export` lists every app directory, so a recorded app its list does not hold is taken as not on the machine |
+| scoop | Not asked: `scoop export` lists every app directory, so a recorded app it lists as a failed install is on the machine (MISSING, and apply repairs it), and one it does not list is not |
 | winget | `winget list --id <id> --exact`, once per package |
 | plugin | Never asked, and never REMOVED (see [What a manager cannot be asked](#what-a-manager-cannot-be-asked)) |
 

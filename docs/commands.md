@@ -36,9 +36,10 @@ lines and absolute paths; `zypper.txt` empty or holding distinct package
 ids, one per line; `seen/` holding only regular `*.txt` files, the record
 of what each machine was seen holding; `commit-recovery/` holding only
 run-id directories of commit's recovery copies (`repo/` and `private/`
-trees, `facts`, and `other/` files named by a number); a check hook's `check-<16 hex>` directory
-holding at most one regular file and its `.out` file; and the files a file
-browser leaves (`.DS_Store`, `Thumbs.db`, `desktop.ini`). mox creates the
+trees, `facts`, and `other/` files named by a number); a check hook's
+`check-<16 hex>` directory holding at most one regular file and its `.out`
+file; and the files a file browser leaves (`.DS_Store`, `Thumbs.db`,
+`desktop.ini`). mox creates the
 state directory, with the marker, when it first writes; a command that only
 reads an absent one finds an empty state and creates nothing. Any other
 directory is refused, exit 2, before anything in it is read or changed, with
@@ -317,8 +318,9 @@ per-script concern (below), not this pass's to fail wholesale.
 
 A repo carrying a `data/packages/` manifest also installs what that
 manifest declares and the machine lacks, apart from a package the machine
-has lost (below), after the pre stage and its re-capture; the machine is re-read again after any install or bootstrap,
-so a package installed here is a tool the post scripts see. A manager the
+has lost (below), after the pre stage and its re-capture; the machine is
+re-read again after any install or bootstrap, so a package installed here
+is a tool the post scripts see. A manager the
 manifest declares a `[[bootstrap]]` row for is installed first when absent,
 from its verified installer, and used by this same run; if that bootstrap
 fails, its rows are not attempted. Homebrew's installer on macOS needs a
@@ -346,9 +348,16 @@ its row, keep it off this machine, or have the next apply install it. What
 each machine held is recorded per backend under the state directory
 (`seen/`) after each real apply that ran its package step: the desired
 packages verified installed, plus what it held before and some row still
-declares under any gate. A manager bootstrapped in the run starts that
-record afresh, and a machine whose identity cannot be read neither uses
-nor writes one, which a note says.
+declares under any gate. A manager whose installer ran in the run, whether
+or not it then failed, starts that record afresh, and one whose bootstrap
+failed has its record left unwritten. A record that is there but cannot be
+used -- written by a newer mox, unreadable, unusable, or any record file
+for that manager when this machine's identity cannot be read -- makes that
+manager `BROKEN` for the run, naming the cause and the fix, and nothing is
+installed through it (exit 2); falling back to no record would install
+again what the record says this machine lost. With no record file, an
+identity that cannot be read only leaves the record unwritten, which a
+note says.
 An `UNCHECKED` one is named on stderr and counted (`, N unchecked`) but
 changes nothing about the exit code: what apply installs is known all the
 same. Each backend that installed anything is asked again afterwards, and a
@@ -813,11 +822,12 @@ any more`:
 last key, comments between its keys included; comments above the header
 and after the last key stay. It then drops the package from this
 machine's record of what it held, unless another row still declares it,
-so a row added back later is installed rather than reported removed. `k`
-sets the row's own `when` to `not machine="<m>"`, or wraps the one it has
-as `(<W>) and not machine="<m>"`, where `<m>` is this machine's `machine`
-value. `i` drops the package from the record, so the next
-apply installs it like any missing package. Before `r` or `k` writes, the
+so a row added back later is installed rather than reported removed; a
+record it cannot update leaves the removal standing and is warned about.
+`k` sets the row's own `when` to `not machine="<m>"`, or wraps the one it
+has as `(<W>) and not machine="<m>"`, where `<m>` is this machine's
+`machine` value. `i` drops the package from the record, so the next apply
+installs it like any missing package. Before `r` or `k` writes, the
 file is re-read, the row found by its content, and the edited file loaded
 back and checked to differ only by that change; a row commit cannot find
 exactly once, rows written inline (`packages = [{ ... }]`), and a `when`
@@ -972,32 +982,30 @@ declared package `REMOVED` (this machine was seen holding it through that
 backend, and the manager now holds it in no form), each installed package
 `UNTRACKED` (declared nowhere and not blacklisted), each declared package
 that is installed but `ASTRAY`, and each manager that is installed but
-cannot answer `BROKEN`. A removed package is drift that apply leaves for a
-decision rather than reinstalling; status only reads the record of what
-this machine held, and never writes it. An astray package is one its manager holds under
-a binding that has moved off it, so what the manager does to it next acts
-on another package: a brew formula installed through a tap alias that now
-names another formula, which `brew upgrade` and `brew reinstall` then
-replace with that formula, or fail on when its tap is not trusted. The row
-says why and what repairs it, which mox never does because it uninstalls.
-An installed package that could not be judged for that is `UNCHECKED`, and
-so is a backend that could judge none of them, counted as well: an answer
-that could not be had is not an answer of none. A declared row of a backend
-this machine can use whose `when` excludes this machine is `GATED` there,
-printed with the
-gate that excluded it: it is not drift and counts toward nothing, but a row
-that appeared in no output at all could not be told from a row the manifest
-never carried, which is what a `when` written under the wrong table header
-produces. A backend this machine cannot use contributes no rows at all, gated
-ones included. A manifest
-mox would not read
-at all is one `ERROR` row naming where the refusal is, since an empty section
-would read as a clean machine. The file table and the packages section each close with a
-one-line summary: what needs attention by label, then what does not;
-`--drift` prints only the actionable half and the machine formats print
-neither. A
-path-scoped `mox status <file>` names files and reports no packages, as a
-path-scoped apply or commit reaches none.
+cannot answer, or whose record of what this machine held cannot be used,
+`BROKEN`. A removed package is drift that apply leaves for a decision
+rather than reinstalling; status only reads the record of what this
+machine held, and never writes it. An astray package is one its manager
+holds under a binding that has moved off it, so what the manager does to
+it next acts on another package: a brew formula installed through a tap
+alias that now names another formula, which `brew upgrade` and `brew
+reinstall` then replace with that formula, or fail on when its tap is not
+trusted. The row says why and what repairs it, which mox never does
+because it uninstalls. An installed package that could not be judged for
+that is `UNCHECKED`, and so is a backend that could judge none of them,
+counted as well: an answer that could not be had is not an answer of none.
+A declared row of a backend this machine can use whose `when` excludes this
+machine is `GATED` there, printed with the gate that excluded it: it is not
+drift and counts toward nothing, but a row that appeared in no output at all
+could not be told from a row the manifest never carried, which is what a
+`when` written under the wrong table header produces. A backend this machine
+cannot use contributes no rows at all, gated ones included. A manifest mox
+would not read at all is one `ERROR` row naming where the refusal is, since
+an empty section would read as a clean machine. The file table and the
+packages section each close with a one-line summary: what needs attention by
+label, then what does not; `--drift` prints only the actionable half and the
+machine formats print neither. A path-scoped `mox status <file>` names files
+and reports no packages, as a path-scoped apply or commit reaches none.
 A repo without that directory is not using the package subsystem, so no
 section prints and no package manager is queried. A repo with plugins under
 `scripts/backends/` has them executed here (their `available`, `list`, `id`
@@ -1478,8 +1486,8 @@ a missing upstream reported in mox's terms, the arriving commit count
 printed -- which `mox git -- pull --rebase` does not give you.
 
 Exit 0 clean, 1 drift, or an astray or removed package left for a
-decision, 2 a refusal or failure, the same contract `apply` uses. Sending work the other
-way is `publish`.
+decision, 2 a refusal or failure, the same contract `apply` uses. Sending
+work the other way is `publish`.
 
 <!-- generated: flags update -->
 | Flag | Description |
