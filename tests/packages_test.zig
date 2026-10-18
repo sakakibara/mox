@@ -2667,8 +2667,8 @@ fn expectPorcelain(out: []const u8) !void {
         var n: usize = 1;
         while (fields.next()) |_| n += 1;
         const known = for ([_][]const u8{
-            "whole_file",      "owned_key",         "symlink_target", "generated_set",   "vanished",
-            "package_missing", "package_untracked", "package_broken", "package_refused",
+            "whole_file",      "owned_key",       "symlink_target",    "generated_set",  "vanished",
+            "package_missing", "package_removed", "package_untracked", "package_broken", "package_refused",
         }) |k| {
             if (std.mem.eql(u8, k, kind)) break true;
         } else false;
@@ -3308,6 +3308,10 @@ fn runWith(h: Harness, argv: []const []const u8, out: *Io.Writer, err: *Io.Write
     const saved_cwd = mox.cli.app.cwd_override;
     mox.cli.app.cwd_override = h.home;
     defer mox.cli.app.cwd_override = saved_cwd;
+
+    const saved_identity = mox.cli.app.identity_override;
+    if (saved_identity == null) mox.cli.app.identity_override = .{ .known = testutil.test_identity };
+    defer mox.cli.app.identity_override = saved_identity;
 
     return mox.cli.app.run(h.a, h.io, argv, &mox.cli.app.command_table, out, err);
 }
@@ -5725,4 +5729,162 @@ test "apply --dry-run: a removed package is named and counted, the run exits 1, 
     try std.testing.expect(std.mem.indexOf(u8, r2.err, try removedLine(a, "brew", "fd")) != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.out, "Packages: 1 would be installed, 0 failed, 1 removed\n") != null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+/// The raw bytes of `h`'s record for `backend` under `identity`.
+fn seenBytes(h: Harness, backend: []const u8, identity: []const u8) ![]const u8 {
+    const name = try std.fmt.allocPrint(h.a, "{s}-{s}.txt", .{ backend, &mox.packages.seen.ownerOf(identity) });
+    return Io.Dir.cwd().readFileAlloc(h.io, try std.fs.path.join(h.a, &.{ h.state, mox.packages.seen.dir_name, name }), h.a, .limited(1 << 16));
+}
+
+test "status: a recorded package that left the machine is REMOVED after the MISSING ones in every format, counted, and the record is left as it was" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+    );
+    // bat is installed and not recorded: an apply would add it. Status
+    // writes nothing, so the record keeps only fd.
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    const before = try seenBytes(h, "brew", testutil.test_identity);
+    const fake = try brewWith(a, "bat\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(fake.called(brew_present));
+    const missing_at = std.mem.indexOf(u8, r.out, "  MISSING   brew ripgrep\n") orelse return error.TestUnexpectedResult;
+    const removed_at = std.mem.indexOf(u8, r.out, "  REMOVED   brew fd\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(missing_at < removed_at);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "MISSING   brew fd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  Packages: 1 missing, 1 removed.\n") != null);
+
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ p.out, p.err });
+    try expectPorcelain(p.out);
+    try std.testing.expectEqual(@as(u8, 1), p.rc);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing\tbrew\tripgrep\npackage_removed\tbrew\tfd\n") != null);
+
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ j.out, j.err });
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"ripgrep\",\"name\":\"ripgrep\"}," ++
+        "{\"backend\":\"brew\",\"state\":\"removed\",\"id\":\"fd\",\"name\":\"fd\"}") != null);
+
+    try std.testing.expect(!fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
+    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "status --drift: a removed package alone is drift and fails the run" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+    );
+    try writeSeen(h, "brew", testutil.test_identity, &.{ "bat", "fd" });
+    useFake(try brewWith(a, "bat\n", "", &.{}));
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status", "--drift" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "\npackages:\n  REMOVED   brew fd\n  Packages: 1 removed.\n") != null);
+    try std.testing.expectEqualStrings("bat fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "status: with no record nothing is removed and no record is created" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml",
+        \\backend = "brew"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+    );
+    const fake = try brewWith(a, "bat\n", "", &.{});
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  MISSING   brew fd\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "REMOVED") == null);
+    try std.testing.expect(!fake.called(brew_present));
+    try std.testing.expect(!seenDirExists(h));
+}
+
+test "status: an identity that cannot be read puts no record in effect and says so where the other notes go" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    const before = try seenBytes(h, "brew", testutil.test_identity);
+    mox.cli.app.identity_override = .{ .failed = "/usr/sbin/ioreg exited 1" };
+    defer mox.cli.app.identity_override = null;
+    useFake(try brewWith(a, "", "", &.{}));
+    defer mox.cli.app.package_runner_override = null;
+    const why = "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written\n";
+
+    const r = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.out, try std.fmt.allocPrint(a, "  note      {s}", .{why})));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  MISSING   brew fd\n") != null);
+
+    const p = try h.run(&.{ "mox", "status", "--porcelain" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ p.out, p.err });
+    try expectPorcelain(p.out);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing\tbrew\tfd\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.err, try std.fmt.allocPrint(a, "mox status: note: {s}", .{why})) != null);
+
+    try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli");
 const state_cli = @import("state.zig");
 const State = mox.state.Draft;
@@ -110,6 +111,7 @@ fn printPackageSummary(w: *std.Io.Writer, pkgs: Packages, actionable_only: bool)
     }
     const counts = [_]struct { n: usize, word: []const u8 }{
         .{ .n = pkgs.report.missingCount(), .word = "missing" },
+        .{ .n = pkgs.report.removedCount(), .word = "removed" },
         .{ .n = pkgs.report.untrackedCount(), .word = "untracked" },
         .{ .n = pkgs.report.astrayCount(), .word = "astray" },
         .{ .n = pkgs.report.uncheckedCount(), .word = "unchecked" },
@@ -334,7 +336,7 @@ const Spec = struct {
     color: cli.Opt(style.ColorFlag, .{ .default = "auto", .value_name = "color", .help = "auto|always|never" }),
     drift: cli.Flag(.{ .help = "show only the drift set (suppress the clean/gated table)" }),
     json: cli.Flag(.{ .help = "emit the drift set as JSON (implies --drift)" }),
-    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, id (- for every installed package of the backend), why for an installed package that could not be judged for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
+    porcelain: cli.Flag(.{ .help = "emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing, package_removed or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, id (- for every installed package of the backend), why for an installed package that could not be judged for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift)" }),
     paths: cli.Rest(.{ .help = "limit to these files (default: all)", .complete = .{ .dynamic = "managed-file" } }),
 };
 
@@ -697,7 +699,7 @@ const Packages = struct {
     /// Every package the report counts against the exit code, and every
     /// manager that is there but broken.
     fn problems(self: Packages) usize {
-        return self.report.missingCount() + self.report.untrackedCount() + self.report.astrayCount() + self.report.uncheckedCount() + self.report.broken.len + @intFromBool(self.broken);
+        return self.report.missingCount() + self.report.removedCount() + self.report.untrackedCount() + self.report.astrayCount() + self.report.uncheckedCount() + self.report.broken.len + @intFromBool(self.broken);
     }
 };
 
@@ -715,6 +717,10 @@ const Prepared = struct {
     broken: bool = false,
     /// A diagnostic set by a failure the report step may still hit.
     diag: mox.packages.manifest.Diag = .{},
+    /// What the report step reads this machine's identity through, when it
+    /// has a record to read.
+    pkg_backends: ?*app.PackageBackends = null,
+    env: ?*const std.process.Environ.Map = null,
 };
 
 fn preparePackages(
@@ -761,11 +767,16 @@ fn preparePackages(
         },
     };
     prep.notes = pkg_backends.notes;
+    prep.pkg_backends = pkg_backends;
+    prep.env = env;
     return prep;
 }
 
 /// The step that runs plugins and managers: only after the caller has put
-/// the notes on the record.
+/// the notes on the record. The records of what this machine held are read
+/// and never written: status bootstraps nothing, so every record that is
+/// usable is in effect. What could not be used comes first among the
+/// report's notes, so every format says it where it says the rest.
 fn reportPackages(
     ctx: *app.Ctx,
     prep: Prepared,
@@ -774,6 +785,20 @@ fn reportPackages(
     if (prep.broken) return .{ .broken = true };
     if (!prep.manifest.inUse()) return .{};
     var diag = prep.diag;
+    var machine: mox.packages.seen.Machine = .{
+        .arena = ctx.alloc,
+        .io = ctx.io,
+        .runner = prep.pkg_backends.?.runner(),
+        .env = prep.env,
+        .fixed = if (builtin.is_test) app.identity_override else null,
+    };
+    const loaded = mox.packages.seen.load(ctx.alloc, ctx.io, ctx.context.?.paths.state_dir, &machine, prep.registry.backends, &.{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            try ctx.err.print("mox status: packages: the records of what this machine held could not be read: {s}\n", .{mox.packages.exec.errorText(e)});
+            return .{ .broken = true };
+        },
+    };
     const rep = mox.packages.report.fromManifest(
         ctx.alloc,
         prep.manifest,
@@ -781,7 +806,7 @@ fn reportPackages(
         bindings,
         &.{},
         .judge,
-        .none,
+        loaded.seen,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -790,7 +815,10 @@ fn reportPackages(
             return .{ .broken = true };
         },
     };
-    return .{ .report = rep };
+    if (loaded.notes.len == 0) return .{ .report = rep };
+    var with_notes = rep;
+    with_notes.notes = try std.mem.concat(ctx.alloc, []const u8, &.{ loaded.notes, rep.notes });
+    return .{ .report = with_notes };
 }
 
 fn reportPackageError(ctx: *app.Ctx, diag: *mox.packages.manifest.Diag, e: anyerror) !void {
@@ -874,6 +902,9 @@ fn printPackages(
             for (b.drift.missing) |m| {
                 try ctx.out.print("  {s:<9} {s} {s}\n", .{ "MISSING", b.backend, m.row.name });
             }
+            for (b.drift.removed) |m| {
+                try ctx.out.print("  {s:<9} {s} {s}\n", .{ "REMOVED", b.backend, m.row.name });
+            }
             for (b.drift.untracked) |id| {
                 try ctx.out.print("  {s:<9} {s} {s}\n", .{ "UNTRACKED", b.backend, id });
             }
@@ -904,11 +935,13 @@ fn printPackages(
 
 /// Emit the drift set as JSON: `{"files":[...],"packages":[...]}`. A file is
 /// `{path, kind, [key], first_contact}`; a package is `{backend, state, id,
-/// [name], [why], [fix]}`, `state` being `missing`, `untracked`, `astray` or
-/// `unchecked` and `id` the identity its backend compares by (a brew cask
-/// carries its `cask:` prefix, so it can never be confused with the formula
-/// of the same name). `name` is what the manifest row spells, present for all
-/// but an untracked package. An astray package is installed, but held by its
+/// [name], [why], [fix]}`, `state` being `missing`, `removed`, `untracked`,
+/// `astray` or `unchecked` and `id` the identity its backend compares by (a
+/// brew cask carries its `cask:` prefix, so it can never be confused with the
+/// formula of the same name). `name` is what the manifest row spells, present
+/// for all but an untracked package. A removed package is declared and was
+/// seen installed on this machine, and is not installed here any more. An
+/// astray package is installed, but held by its
 /// manager under a binding that moved off it; `why` says how, and `fix` what
 /// repairs it, which mox leaves to the user because it can need an
 /// uninstall. An unchecked package is installed, but could not be judged for
@@ -1004,6 +1037,17 @@ fn emitJsonPackages(out: *std.Io.Writer, pkgs: Packages) !void {
             try writeJsonString(out, m.row.name);
             try out.writeByte('}');
         }
+        for (b.drift.removed) |m| {
+            if (!first) try out.writeByte(',');
+            first = false;
+            try out.writeAll("{\"backend\":");
+            try writeJsonString(out, b.backend);
+            try out.writeAll(",\"state\":\"removed\",\"id\":");
+            try writeJsonString(out, m.id);
+            try out.writeAll(",\"name\":");
+            try writeJsonString(out, m.row.name);
+            try out.writeByte('}');
+        }
         for (b.drift.untracked) |id| {
             if (!first) try out.writeByte(',');
             first = false;
@@ -1065,8 +1109,8 @@ fn writeJsonString(out: *std.Io.Writer, s: []const u8) !void {
 /// `\` -> `\\`, tab -> `\t`, newline -> `\n`, CR -> `\r`. `kind` and the flag
 /// are fixed tokens with no such bytes. Newline-terminated; a dependency-free
 /// shell splits on tab and, if it needs exact bytes, unescapes those four.
-/// A package record is `package_missing` / `package_untracked` \t backend \t
-/// id, `package_astray` \t backend \t id \t why \t fix, `package_unchecked`
+/// A package record is `package_missing` / `package_removed` /
+/// `package_untracked` \t backend \t id, `package_astray` \t backend \t id \t why \t fix, `package_unchecked`
 /// \t backend \t id \t why -- the id being `-` for a backend that could judge
 /// none of its installed packages -- or `package_broken` \t backend \t exit
 /// code \t probe \t why -- the exit code being `-` for a call that never
@@ -1118,6 +1162,13 @@ fn emitPorcelain(
         }
         for (b.drift.missing) |m| {
             try out.writeAll("package_missing\t");
+            try writePorcelainField(out, b.backend);
+            try out.writeByte('\t');
+            try writePorcelainField(out, m.id);
+            try out.writeByte('\n');
+        }
+        for (b.drift.removed) |m| {
+            try out.writeAll("package_removed\t");
             try writePorcelainField(out, b.backend);
             try out.writeByte('\t');
             try writePorcelainField(out, m.id);
@@ -1293,7 +1344,7 @@ pub const command = app.command(Spec, .{
     .name = "status",
     .usage = "mox status [--flags] [<paths...>]",
     .summary = "Show managed files with their state",
-    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift): the drift set alone, so an ERROR or STALE row, which the exit code still signals, is not in them. A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING or has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
+    .details = "Labels clean, OUTDATED, DRIFT, MISSING, STALE, GATED, ERROR. Exit 1 if any file is OUTDATED, DRIFT, MISSING, STALE, or ERROR. --drift shows only the drift set; --json / --porcelain serialize it for tooling (both imply --drift): the drift set alone, so an ERROR or STALE row, which the exit code still signals, is not in them. A repo with a data/packages/ manifest also gets a packages section listing what each backend is MISSING, each declared package this machine held through it and no longer does (REMOVED), what it has UNTRACKED, each installed package it holds ASTRAY under a binding that moved off it (with the command that repairs it, which mox never runs because it can uninstall) or UNCHECKED when that could not be judged, each manager that is BROKEN, and one ERROR row for a pass that produced nothing at all, counted in the exit code; a row of a backend this machine can use whose when excludes this machine is a GATED row there, named with its gate and counted in nothing, while a backend this machine cannot use contributes no rows at all, gated ones included; --json emits {files, packages} and --porcelain adds package_missing / package_removed / package_untracked / package_astray / package_unchecked / package_broken records. A pass that produced nothing is a record of its own in both -- {\"state\":\"refused\"} and package_refused -- so a refusal is never read as a clean machine. The file table and the packages section each close with a one-line summary: what needs attention by label, then what does not; --drift prints only the actionable half and the machine formats print neither.",
     .group = .general,
     .needs_context = true,
 }, run);
@@ -1436,6 +1487,56 @@ test "emitPorcelain / emitJson: packages ride the same records, keyed by state" 
             "{\"backend\":\"brew\",\"state\":\"untracked\",\"id\":\"htop\"}]}\n",
         jw.written(),
     );
+}
+
+test "emitPorcelain / emitJson / printPackageSummary: a removed package follows the missing ones and is a problem" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+
+    const row: mox.packages.manifest.Row = .{
+        .name = "ripgrep",
+        .backend = "brew",
+        .when = null,
+        .fields = &.{},
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+    var lost = row;
+    lost.name = "ghostty";
+    const missing = [_]mox.packages.drift.Missing{.{ .row = row, .id = "ripgrep" }};
+    const removed = [_]mox.packages.drift.Missing{.{ .row = lost, .id = "cask:ghostty" }};
+    const untracked = [_][]const u8{"htop"};
+    const backends = [_]mox.packages.report.BackendDrift{.{
+        .backend = "brew",
+        .drift = .{ .missing = &missing, .removed = &removed, .untracked = &untracked },
+    }};
+    const pkgs: Packages = .{ .report = .{ .in_use = true, .backends = &backends } };
+    try testing.expectEqual(@as(usize, 3), pkgs.problems());
+
+    var pw: std.Io.Writer.Allocating = .init(al);
+    try emitPorcelain(&pw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "package_missing\tbrew\tripgrep\n" ++
+            "package_removed\tbrew\tcask:ghostty\n" ++
+            "package_untracked\tbrew\thtop\n",
+        pw.written(),
+    );
+
+    var jw: std.Io.Writer.Allocating = .init(al);
+    try emitJson(&jw.writer, &.{}, pkgs);
+    try testing.expectEqualStrings(
+        "{\"files\":[],\"packages\":[" ++
+            "{\"backend\":\"brew\",\"state\":\"missing\",\"id\":\"ripgrep\",\"name\":\"ripgrep\"}," ++
+            "{\"backend\":\"brew\",\"state\":\"removed\",\"id\":\"cask:ghostty\",\"name\":\"ghostty\"}," ++
+            "{\"backend\":\"brew\",\"state\":\"untracked\",\"id\":\"htop\"}]}\n",
+        jw.written(),
+    );
+
+    var sw: std.Io.Writer.Allocating = .init(al);
+    try printPackageSummary(&sw.writer, pkgs, false);
+    try testing.expectEqualStrings("  Packages: 1 missing, 1 removed, 1 untracked.\n", sw.written());
 }
 
 test "emitPorcelain / emitJson: an astray package carries its reason and its repair" {

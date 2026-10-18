@@ -932,10 +932,14 @@ other side never surface. Exits 1 if any file is `OUTDATED`, `DRIFT`,
 `MISSING`, `STALE`, or `ERROR`.
 
 A repo carrying a `data/packages/` manifest also gets a `packages:`
-section: per backend, each declared package still `MISSING`, each installed
-package `UNTRACKED` (declared nowhere and not blacklisted), each declared
-package that is installed but `ASTRAY`, and each manager that is installed
-but cannot answer `BROKEN`. An astray package is one its manager holds under
+section: per backend, each declared package still `MISSING`, then each
+declared package `REMOVED` (this machine was seen holding it through that
+backend, and the manager now holds it in no form), each installed package
+`UNTRACKED` (declared nowhere and not blacklisted), each declared package
+that is installed but `ASTRAY`, and each manager that is installed but
+cannot answer `BROKEN`. A removed package is drift that apply leaves for a
+decision rather than reinstalling; status only reads the record of what
+this machine held, and never writes it. An astray package is one its manager holds under
 a binding that has moved off it, so what the manager does to it next acts
 on another package: a brew formula installed through a tap alias that now
 names another formula, which `brew upgrade` and `brew reinstall` then
@@ -999,7 +1003,8 @@ ended for want of a terminal, or answered in a shape that is not an answer
 read as one of them; a manifest that would not load is `{state: "refused"}`,
 alone and leading the package set, since it is the whole pass rather than
 one backend; a package is `{backend, state, id, name?, why?, fix?}`, where
-`state` is `missing`, `untracked`, `astray` or `unchecked` and `id` is the
+`state` is `missing`, `removed`, `untracked`, `astray` or `unchecked` (a
+backend's removed packages follow its missing ones) and `id` is the
 identity its backend compares by -- a brew cask carries its `cask:` prefix,
 so it can never be read as the formula of the same name. `name` is what the
 manifest row spells, and is present for all but an untracked package; `why`
@@ -1011,8 +1016,9 @@ state: "unchecked", why}`.
 `--porcelain` emits stable tab-separated lines, one record per line, with
 the record kind as the first field. File records are `kind`, `key`,
 `first_contact` (0/1), `path`, one per drifted unit as under `--json`.
-Package records are `package_missing` or
-`package_untracked`, then `backend`, then `id`; an astray package is
+Package records are `package_missing`, `package_removed` or
+`package_untracked`, then `backend`, then `id`, a backend's removed
+packages following its missing ones; an astray package is
 `package_astray`, then `backend`, then `id`, then why, then the fix; one
 that could not be judged for that is `package_unchecked`, then `backend`,
 then `id`, then why, the `id` being `-` for a backend that could judge none
@@ -1035,7 +1041,7 @@ break the framing; unescape those four to recover exact bytes. Both imply
 | `--color <color>` | auto|always|never |
 | `--drift` | show only the drift set (suppress the clean/gated table) |
 | `--json` | emit the drift set as JSON (implies --drift) |
-| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, id (- for every installed package of the backend), why for an installed package that could not be judged for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
+| `--porcelain` | emit the drift set as stable tab-separated lines: kind, key, first_contact (0/1), path for a file; package_missing, package_removed or package_untracked, backend, id for a package; package_astray, backend, id, why, fix for an installed package its manager holds under a binding that moved off it; package_unchecked, backend, id (- for every installed package of the backend), why for an installed package that could not be judged for that; package_broken, backend, exit code (- where the call never reached one), probe, why for a manager that cannot answer; package_refused alone for a manifest that would not load (implies --drift) |
 <!-- /generated -->
 
 ## export
