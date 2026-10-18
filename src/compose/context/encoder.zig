@@ -34,10 +34,7 @@ pub const Encoder = struct {
     /// current expansion produced so far, which will follow `buf`.
     fn catchUp(e: *Encoder, line: []const u8) void {
         const base = e.buf.items.len;
-        if (e.fed < base) {
-            e.tracker.feed(e.buf.items[e.fed..base]);
-            e.fed = base;
-        }
+        e.feedTo(base);
         const upto = base + line.len;
         if (e.fed < upto) {
             e.tracker.feed(line[e.fed - base ..]);
@@ -73,9 +70,36 @@ pub const Encoder = struct {
         return bytes;
     }
 
+    /// Check the `# mox: secret` directive's value, the bytes `buf` gained
+    /// from `start`: whole lines that begin and end where a line starts
+    /// outside every string, heredoc and block.
+    pub fn wholeLines(e: *Encoder, capture: []const u8, start: usize) void {
+        e.feedTo(start);
+        e.captures += 1;
+        const begins = e.tracker.atLineTop() and (start == 0 or e.buf.items[start - 1] == '\n');
+        e.feedTo(e.buf.items.len);
+        if (e.lenient) return;
+        const where = encode_mod.name(.lines);
+        if (!begins)
+            e.noteAt(capture, start, .{ .where = where, .reason = "it does not start a line outside every string, heredoc and block", .remedy = "move the directive out of it" })
+        else if (!e.tracker.atLineTop())
+            e.noteAt(capture, start, .{ .where = where, .reason = "its lines leave the file inside a string, heredoc or block", .remedy = "make the value whole lines of the file's own syntax" });
+    }
+
+    fn feedTo(e: *Encoder, end: usize) void {
+        if (e.fed < end) {
+            e.tracker.feed(e.buf.items[e.fed..end]);
+            e.fed = end;
+        }
+    }
+
     fn note(e: *Encoder, capture: []const u8, line: []const u8, r: encode_mod.Refusal) void {
+        e.noteAt(capture, e.buf.items.len + line.len, r);
+    }
+
+    fn noteAt(e: *Encoder, capture: []const u8, offset: usize, r: encode_mod.Refusal) void {
         if (e.refused != null) return;
-        e.refused = .{ .capture = capture, .offset = e.buf.items.len + line.len, .refusal = r };
+        e.refused = .{ .capture = capture, .offset = offset, .refusal = r };
     }
 
     /// Feed the rest of the output, and say why the file cannot be written:

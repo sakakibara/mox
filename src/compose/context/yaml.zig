@@ -131,6 +131,12 @@ pub const Tracker = struct {
     }
 
     /// Why the text could not be followed to its end, or null.
+    /// At column 0 of a line outside every quoted scalar, block scalar and
+    /// flow collection.
+    pub fn atLineTop(t: *const Tracker) bool {
+        return t.mode == .structural and t.flow == 0 and t.line_start and t.col == 0;
+    }
+
     pub fn finish(t: *const Tracker) ?[]const u8 {
         return switch (t.mode) {
             .dq, .dq_esc => "an unclosed double-quoted scalar",

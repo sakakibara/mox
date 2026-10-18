@@ -68,7 +68,7 @@ pub fn kindFor(format: ?format_mod.Format, path: []const u8, head: []const u8) K
 /// `after` the state once its encoded bytes are fed; a value may move a
 /// tracker from a token's start into its interior), and `finish(*const T) ?[]const u8`, why the file could
 /// not be followed to its end at top level (an unclosed quote, heredoc,
-/// `$(`, string or block), or null.
+/// `$(`, string or block), or null; and `atLineTop(*const T) bool`.
 pub const Tracker = union(Kind) {
     toml: toml.Tracker,
     yaml: yaml.Tracker,
@@ -120,6 +120,16 @@ pub const Tracker = union(Kind) {
             inline else => |*x| x.finish(),
         };
     }
+
+    /// Whether the next byte starts a line outside every string, heredoc,
+    /// block and bracket: where the `# mox: secret` directive's whole lines
+    /// may begin and must end.
+    pub fn atLineTop(t: *const Tracker) bool {
+        return switch (t.*) {
+            .text => true,
+            inline else => |*x| x.atLineTop(),
+        };
+    }
 };
 
 test "kindFor: a structured format, a shell by name, extension, shebang or compdef, PowerShell, else text" {
@@ -143,4 +153,41 @@ test {
     _ = ini;
     _ = shell;
     _ = powershell;
+}
+
+test "atLineTop: a line start outside every string, heredoc, block and bracket, for every kind" {
+    const cases = [_]struct { kind: Kind, prefix: []const u8, top: bool }{
+        .{ .kind = .toml, .prefix = "", .top = true },
+        .{ .kind = .toml, .prefix = "a = 1\n[t]\n", .top = true },
+        .{ .kind = .toml, .prefix = "a = 1", .top = false },
+        .{ .kind = .toml, .prefix = "a = \"\"\"\n", .top = false },
+        .{ .kind = .toml, .prefix = "a = [\n", .top = false },
+        .{ .kind = .yaml, .prefix = "a: 1\n", .top = true },
+        .{ .kind = .yaml, .prefix = "a: |\n  x\n", .top = false },
+        .{ .kind = .yaml, .prefix = "a: \"x\n", .top = false },
+        .{ .kind = .yaml, .prefix = "a: [1,\n", .top = false },
+        .{ .kind = .ini, .prefix = "[s]\na=1\n", .top = true },
+        .{ .kind = .ini, .prefix = "a=1", .top = false },
+        .{ .kind = .gitconfig, .prefix = "[s]\n\ta = 1\n", .top = true },
+        .{ .kind = .sh, .prefix = "echo a\n# c\n", .top = true },
+        .{ .kind = .sh, .prefix = "echo a \\\n", .top = false },
+        .{ .kind = .sh, .prefix = "cat <<EOF\n", .top = false },
+        .{ .kind = .sh, .prefix = "x=\"\n", .top = false },
+        .{ .kind = .sh, .prefix = "x=$(\n", .top = false },
+        .{ .kind = .fish, .prefix = "echo a\n", .top = true },
+        .{ .kind = .fish, .prefix = "echo 'a\n", .top = false },
+        .{ .kind = .powershell, .prefix = "$a = 1\n", .top = true },
+        .{ .kind = .powershell, .prefix = "$a = @\"\n", .top = false },
+        .{ .kind = .powershell, .prefix = "Get-X `\n", .top = false },
+        .{ .kind = .powershell, .prefix = "<# c\n", .top = false },
+        .{ .kind = .text, .prefix = "anything \"\n", .top = true },
+    };
+    for (cases) |c| {
+        var t = Tracker.init(c.kind);
+        t.feed(c.prefix);
+        std.testing.expectEqual(c.top, t.atLineTop()) catch |e| {
+            std.debug.print("{s} after {f}\n", .{ @tagName(c.kind), std.zig.fmtString(c.prefix) });
+            return e;
+        };
+    }
 }

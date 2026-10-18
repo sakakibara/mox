@@ -109,6 +109,12 @@ pub const Tracker = struct {
         };
     }
 
+    /// At the start of a line outside every table header, string, array and
+    /// inline table.
+    pub fn atLineTop(t: *const Tracker) bool {
+        return !t.broken and t.mode == .key_start and t.depth == 0;
+    }
+
     pub fn finish(t: *const Tracker) ?[]const u8 {
         if (t.broken) return unclosed_string;
         switch (t.mode) {

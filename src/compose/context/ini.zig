@@ -256,6 +256,11 @@ pub const Tracker = struct {
         return if (s == .value_start) .value else s;
     }
 
+    /// At column 0 of a line, outside every quote.
+    pub fn atLineTop(t: *const Tracker) bool {
+        return t.broken == null and t.state == .line_start and t.indent == 0;
+    }
+
     pub fn finish(t: *const Tracker) ?[]const u8 {
         if (t.broken) |why| return why;
         return switch (t.state) {

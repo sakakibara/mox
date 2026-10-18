@@ -7128,6 +7128,43 @@ test "validation: an include fragment is never parsed alone" {
     try std.testing.expectEqualStrings("[user]\n\tname = me\n\tsigningkey = ABC\n", try read(io, a, try c.homePath(".gitconfig")));
 }
 
+test "validation: a secret directive's lines are written only where a line starts outside every string, heredoc and block" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/.zshrc", "cat <<EOF > ~/.k\n# mox: secret \"env:MOX_TEST_TOKEN\"\nEOF\n");
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\n# mox: secret \"env:MOX_TEST_LINES\"\nb = 2\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{
+        .{ .name = "MOX_TEST_TOKEN", .value = "s3cr3t $value" },
+        .{ .name = "MOX_TEST_LINES", .value = "token = \"s3cr3t" },
+    } });
+    const r = try c.run(&.{ "mox", "apply" });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ".zshrc:2: the value of # mox: secret \"env:MOX_TEST_TOKEN\" cannot be written in the file: it does not start a line outside every string, heredoc and block; move the directive out of it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "app.toml:2: the value of # mox: secret \"env:MOX_TEST_LINES\" cannot be written in the file: its lines leave the file inside a string, heredoc or block") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "s3cr3t") == null);
+    try std.testing.expect(!exists(io, try c.homePath(".zshrc")));
+    try std.testing.expect(!exists(io, try c.homePath("app.toml")));
+}
+
+test "apply: a secret directive's whole lines at the top level of a TOML file are written as they are" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try put(io, &tmp, "repo/src/app.toml", "a = 1\n# mox: secret \"env:MOX_TEST_LINES\"\nb = 2\n");
+    const c = try testutil.setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_TEST_LINES", .value = "token = \"s3\\\"cr3t\"\n[t]\nk = 1" }} });
+    try std.testing.expectEqual(@as(u8, 0), (try c.run(&.{ "mox", "apply" })).rc);
+    try std.testing.expectEqualStrings("a = 1\ntoken = \"s3\\\"cr3t\"\n[t]\nk = 1\nb = 2\n", try read(io, a, try c.homePath("app.toml")));
+}
+
 test "validation: a secret in a bare TOML value is refused before it is written, and never quoted" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

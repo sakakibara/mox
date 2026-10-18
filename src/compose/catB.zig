@@ -1326,6 +1326,7 @@ fn emitDirective(
                 try out.append(arena, '>');
                 try out.append(arena, '\n');
             }
+            if (ctx.encoder) |enc| enc.wholeLines(try std.fmt.allocPrint(arena, "# mox: secret \"{s}\"", .{s.uri}), start);
             try em.markSince(start, .secret);
         },
     }

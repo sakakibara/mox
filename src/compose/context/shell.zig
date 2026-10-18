@@ -194,6 +194,15 @@ pub const Tracker = struct {
         return true;
     }
 
+    /// At the start of a command line outside every quote, heredoc,
+    /// substitution and comment, with no heredoc body pending and no line
+    /// continued.
+    pub fn atLineTop(t: *const Tracker) bool {
+        return t.broken == null and t.depth == 1 and !t.escape and !t.comment and
+            t.pend == .none and t.dol == .none and t.n_heredoc == 0 and !t.body and
+            t.delim == .none and t.cmd_pos and t.at_word_start;
+    }
+
     pub fn finish(t: *const Tracker) ?[]const u8 {
         if (t.broken) |why| return why;
         if (t.delim != .none) return "a heredoc operator without its terminator";

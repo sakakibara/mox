@@ -120,6 +120,13 @@ pub const Tracker = struct {
         return true;
     }
 
+    /// At the start of a line outside every string, here-string,
+    /// subexpression and comment, with no line continued.
+    pub fn atLineTop(t: *const Tracker) bool {
+        return t.len == 0 and t.pend == .none and t.cmd == .start and !t.word and
+            t.bad == null and !t.overflow and t.ulen == 0;
+    }
+
     pub fn finish(t: *const Tracker) ?[]const u8 {
         var c = t.*;
         c.settleQuote();
