@@ -459,7 +459,7 @@ test "macIdentity: IOPlatformUUID from ioreg, run by absolute path" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var fake: exec.Fake = .{ .arena = a, .entries = &.{.{ .argv = ioreg_line, .stdout = 
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{.{ .argv = ioreg_line, .stdout =
         \\+-o J316sAP  <class IOPlatformExpertDevice, id 0x100000213, registered, matched, active, busy 0 (0 ms), retain 39>
         \\  {
         \\    "IOPlatformSerialNumber" = "XYZ123"
