@@ -6252,7 +6252,7 @@ test "commit: a restore that fails saves the pre-run bytes, records nothing, and
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{
+        "mox commit: 0 package change(s) already written\n", .{
         target,
         target,
         copy,
@@ -6295,7 +6295,7 @@ test "commit: a restore that fails with no room for a recovery copy prints the p
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes could not be saved; they follow in full:\n{s}" ++
         "mox commit: {s}: its pre-run bytes could not be saved; they follow in full:\nnote quokkatoken\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ target, target, gated, try h.srcOf(".myenv") }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ target, target, gated, try h.srcOf(".myenv") }), res.err);
     try std.testing.expectEqualStrings("", try read(io, a, recovery));
 }
 
@@ -6339,7 +6339,7 @@ test "commit: a write that fails after earlier writes restores every path, recor
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ benv, try h.srcOf(".aenv") }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ benv, try h.srcOf(".aenv") }), res.err);
 }
 
 test "commit: a write that fails and a restore that fails save the pre-run bytes, record nothing, and exit 2" {
@@ -6374,10 +6374,10 @@ test "commit: a write that fails and a restore that fails save the pre-run bytes
         "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ benv, aenv, aenv, copy }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ benv, aenv, aenv, copy }), res.err);
 }
 
-test "commit: a write that fails reports the package rows already recorded, which stay" {
+test "commit: a write that fails reports the package changes already written, which stay" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6417,7 +6417,7 @@ test "commit: a write that fails reports the package rows already recorded, whic
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
-        "mox commit: 1 package row(s) already recorded\n", .{ benv, try h.srcOf(".aenv") }), res.err);
+        "mox commit: 1 package change(s) already written\n", .{ benv, try h.srcOf(".aenv") }), res.err);
 }
 
 test "commit: a narrowing whose fragment write fails restores the base, removes the region directory, and exits 2" {
@@ -6454,7 +6454,7 @@ test "commit: a narrowing whose fragment write fails restores the base, removes 
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ fragment, try h.srcOf(".zshrc") }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ fragment, try h.srcOf(".zshrc") }), res.err);
 }
 
 test "commit: a first write that fails and changes nothing says only that nothing was recorded" {
@@ -6481,7 +6481,7 @@ test "commit: a first write that fails and changes nothing says only that nothin
     try std.testing.expectEqualStrings(&aenv_before, &(try appliedContent(h, ".aenv")).?);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{aenv}), res.err);
+        "mox commit: 0 package change(s) already written\n", .{aenv}), res.err);
 }
 
 test "commit: a facts write that fails restores the routed source, leaves the facts, records nothing, and exits 2" {
@@ -6518,7 +6518,7 @@ test "commit: a facts write that fails restores the routed source, leaves the fa
     try std.testing.expectEqualStrings(try tilde(a, try std.fmt.allocPrint(a, "mox commit: could not write ~/.config/mox/facts.toml (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{try h.srcOf(".zshrc")})), res.err);
+        "mox commit: 0 package change(s) already written\n", .{try h.srcOf(".zshrc")})), res.err);
 }
 
 test "commit: a path the journal cannot read stops the run before any write" {
@@ -6548,7 +6548,7 @@ test "commit: a path the journal cannot read stops the run before any write" {
     try std.testing.expectEqualStrings(&applied_before, &(try appliedContent(h, ".zshrc")).?);
     const fragment = try std.fs.path.join(a, &.{ try Io.Dir.cwd().realPathFileAlloc(io, src_dir, a), ".zshrc.d", "os", "darwin" });
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not read {s} (NotDir)\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{fragment}), res.err);
+        "mox commit: 0 package change(s) already written\n", .{fragment}), res.err);
 }
 
 /// `name` as commit shows a live path under the home: `~`-relative.
@@ -6748,7 +6748,7 @@ test "commit --dry-run: a simulation write whose restore fails saves the pre-run
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ frag, frag, copy }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ frag, frag, copy }), res.err);
 }
 
 test "commit: a simulated placement into a new overlay leaves no empty directory behind" {
@@ -6812,7 +6812,7 @@ test "commit: a coupled update whose simulation cannot be reverted saves the pre
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ target, target, copy }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ target, target, copy }), res.err);
 }
 
 test "commit: a file differing from its record only in the final newline is manual and exits 1" {
@@ -7130,7 +7130,7 @@ test "commit: a created directory a restore cannot remove is a restore failure, 
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ fragment, fragment }), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ fragment, fragment }), res.err);
 }
 
 /// `rc_name` includes `<rc_name>.d/extra.toml`, a hard link to the partial
@@ -7233,7 +7233,7 @@ test "commit: a simulation write that fails before its placement stops the run, 
     try std.testing.expectEqualStrings("y = 1\nz = 1\n", try read(io, a, r.base));
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{r.base}), r.res.err);
+        "mox commit: 0 package change(s) already written\n", .{r.base}), r.res.err);
 }
 
 test "commit: a simulation write that fails with its placement stops the run, restored, and exits 2" {
@@ -7251,7 +7251,7 @@ test "commit: a simulation write that fails with its placement stops the run, re
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below was restored to its pre-run bytes\n" ++
         "mox commit: {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ r.base, r.base }), r.res.err);
+        "mox commit: 0 package change(s) already written\n", .{ r.base, r.base }), r.res.err);
 }
 
 test "commit: a check write for a line edit that fails stops the run, restored, and exits 2" {
@@ -7281,7 +7281,7 @@ test "commit: a check write for a line edit that fails stops the run, restored, 
     try std.testing.expect(std.mem.indexOf(u8, res.out, "committed") == null);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "mox commit: could not write {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{src}), res.err);
+        "mox commit: 0 package change(s) already written\n", .{src}), res.err);
 }
 
 test "commit --dry-run: a coupled update undone because its origin fails at plan time is reported as --yes reports it" {
@@ -7671,7 +7671,7 @@ test "commit: a restore that fails saves every path the run still has edited, no
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ try shownLive(a, ".zaliases"), y_path, x_path, x_copy, y_path, y_copy });
+        "mox commit: 0 package change(s) already written\n", .{ try shownLive(a, ".zaliases"), y_path, x_path, x_copy, y_path, y_copy });
     try std.testing.expectEqualStrings(want, res.err);
 }
 
@@ -7729,7 +7729,7 @@ test "commit: a restore that fails names a path the run created and still restor
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
         "mox commit: {s} did not exist before this commit; delete it to restore it\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{
+        "mox commit: 0 package change(s) already written\n", .{
         try shownLive(a, ".zaliases"),
         y_path,
         try h.srcOf(".abbrs"),
@@ -7788,7 +7788,7 @@ test "commit: a restore that fails still reverts by name the facts due that roun
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: ~/.config/mox/facts.toml: its pre-run bytes are saved in {s}\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ try shownLive(a, ".pfile"), p_path, facts_copy, p_path, p_copy })), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ try shownLive(a, ".pfile"), p_path, facts_copy, p_path, p_copy })), res.err);
 }
 
 test "commit: a coupling rename into a data row field a loop template reads through a default is dropped" {
@@ -8652,7 +8652,7 @@ test "commit: a restore that fails for a data source outside the repo copies it 
         "mox commit: could not restore {s} (AccessDenied)\n" ++
         "mox commit: nothing was recorded; each path below still holds this run's edits\n" ++
         "mox commit: {s}: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{
+        "mox commit: 0 package change(s) already written\n", .{
         try shownLive(a, ".abbrs"),
         try std.fs.path.join(a, &.{ h.repo, "src", "..", "..", "ext", "abbrs.toml" }),
         real,
@@ -9319,7 +9319,7 @@ test "commit: with MOX_REPO spelled through a symlink under home, a fragment the
         "mox commit: ~/dots/src/.xfile: its pre-run bytes are saved in {s}\n" ++
         "mox commit: ~/dots/src/.xfile.d/os/{s} did not exist before this commit; delete it to restore it\n" ++
         "mox commit: ~/dots/src/.zfile: its pre-run bytes are saved in {s}\n" ++
-        "mox commit: 0 package row(s) already recorded\n", .{ try shownLive(a, ".zfile"), x_copy, m_state.os, z_copy })), res.err);
+        "mox commit: 0 package change(s) already written\n", .{ try shownLive(a, ".zfile"), x_copy, m_state.os, z_copy })), res.err);
 }
 
 test "commit: a coupling target failed by a restored data source it wrote is named by its own line, and its update as not committed" {

@@ -7930,6 +7930,7 @@ test "apply: every mention of a delete, rename or overwrite primitive sits where
         .{ "src/cli/commit.zig", "acceptedHolder", 2 },
         .{ "src/cli/commit.zig", "commitOpened", 3 },
         .{ "src/cli/commit.zig", "couplingCandidates", 12 },
+        .{ "src/cli/commit.zig", "forgetHeld", 1 },
         .{ "src/cli/commit.zig", "replaceTokens", 2 },
         .{ "src/cli/commit.zig", "restore", 3 },
         .{ "src/cli/commit.zig", "rowPathFault", 4 },

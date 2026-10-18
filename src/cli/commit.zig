@@ -12,7 +12,7 @@
 //! an interactive prompt. Two routed edits that overlap and differ are
 //! never both written: the later is manual.
 //!
-//! Prompts come first; package rows are the only writes made at a prompt.
+//! Prompts come first; package answers are the only writes made at a prompt.
 //! Every other edit is planned in memory from a journal of the pre-run bytes
 //! of every path it writes, checked by parsing the planned bytes back, then
 //! written. Each unit -- a managed file, a generator leaf, a symlink -- is
@@ -918,11 +918,22 @@ fn fileSpace(
     return .{ .ax = ax, .configs = configs };
 }
 
-/// What one commit did to the package manifest.
+/// What one commit did to the package manifest and to the record of what
+/// this machine held.
 const PackageReconcile = struct {
     added: usize = 0,
     blacklisted: usize = 0,
     skipped: usize = 0,
+    /// Removed packages whose row was deleted from the manifest.
+    removed_rows: usize = 0,
+    /// Removed packages whose row was gated off this machine.
+    kept_off: usize = 0,
+    /// Removed packages taken out of the record, so the next apply installs
+    /// them.
+    reinstall: usize = 0,
+    /// Removed packages left for a later decision, or whose answer could not
+    /// be carried out.
+    still_removed: usize = 0,
     /// The manifest could not be read or checked: an error, counted as
     /// pending so the run cannot exit clean past it.
     broken: bool = false,
@@ -931,22 +942,34 @@ const PackageReconcile = struct {
     strict_abort: bool = false,
 
     fn touched(self: PackageReconcile) bool {
-        return self.added > 0 or self.blacklisted > 0;
+        return self.changes() > 0;
     }
 
     fn pending(self: PackageReconcile) bool {
-        return self.skipped > 0 or self.broken;
+        return self.skipped > 0 or self.still_removed > 0 or self.broken;
+    }
+
+    /// What was written at the package prompts, each the moment it was
+    /// chosen: a manifest edit or a record update.
+    fn changes(self: PackageReconcile) usize {
+        return self.added + self.blacklisted + self.removed_rows + self.kept_off + self.reinstall;
     }
 };
+
+/// What `?` says `q` does at a package prompt: each answer is written as it
+/// is given, so quitting keeps the ones already written.
+const package_quit_help = "end now; answers given so far are kept";
 
 /// Offer every untracked package: record it in the manifest, blacklist it so
 /// it is never offered again, or skip it for now. This is the package analog
 /// of routing a live edit back to its source -- reality is the truth, and the
-/// manifest is what gets updated to match.
+/// manifest is what gets updated to match. Then offer every removed package,
+/// one this machine held and lost: remove its row, gate the row off this
+/// machine, have the next apply install it again, or skip it for now.
 ///
-/// Never uninstalls: the three answers all leave the machine exactly as it
-/// is, and only the manifest changes. A path-scoped commit names files, so it
-/// skips this entirely.
+/// Never changes the machine: every answer leaves it exactly as it is, and
+/// only the manifest and the record of what this machine held change. A
+/// path-scoped commit names files, so it skips this entirely.
 fn reconcilePackages(
     ctx: *app.Ctx,
     context: app.Context,
@@ -1003,7 +1026,25 @@ fn reconcilePackages(
     };
     for (pkg_backends.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
 
-    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, .reconcile, .none, &diag) catch |e| switch (e) {
+    // Commit bootstraps nothing, so every usable record is in effect, as for
+    // status.
+    var machine: mox.packages.seen.Machine = .{
+        .arena = ctx.alloc,
+        .io = ctx.io,
+        .runner = pkg_backends.runner(),
+        .env = env,
+        .fixed = if (builtin.is_test) app.identity_override else null,
+    };
+    const loaded = mox.packages.seen.load(ctx.alloc, ctx.io, context.paths.state_dir, &machine, registry.backends, &.{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
+            try ctx.err.print("mox commit: packages: the records of what this machine held could not be read: {s}\n", .{mox.packages.exec.errorText(e)});
+            return .{ .broken = true };
+        },
+    };
+    for (loaded.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
+
+    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, .reconcile, loaded.seen, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             if (diag.capture()) |cap| {
@@ -1070,7 +1111,7 @@ fn reconcilePackages(
 
             try ctx.out.print("\nuntracked package: {s} {s}\n", .{ b.backend, id });
             const question = try prompt.renderChoices(ctx.alloc, &choices);
-            const outcome = try prompt.ask(ask_mode, &choices, 2, question, input, ctx.out);
+            const outcome = try prompt.askWith(ask_mode, &choices, 2, question, input, ctx.out, package_quit_help);
             const chosen = switch (outcome) {
                 .chosen => |i| i,
                 .report_only => {
@@ -1180,7 +1221,157 @@ fn reconcilePackages(
             }
         }
     }
+
+    const removed_choices = [_]prompt.Choice{
+        .{ .key = "r", .label = "remove", .help = "delete its row from the manifest, for every machine" },
+        .{ .key = "k", .label = "keep off", .help = "gate its row so this machine skips it" },
+        .{ .key = "i", .label = "install", .help = "the next apply installs it again" },
+        .{ .key = "s", .label = "skip", .help = "decide later (default)" },
+        .{ .key = "R", .label = "remove all", .help = "r for this and every remaining removed package of this backend" },
+        .{ .key = "K", .label = "keep off all", .help = "k likewise" },
+        .{ .key = "I", .label = "install all", .help = "i likewise" },
+    };
+    const this_machine = mox.machine.bindings.firstLabel(m_state.hostname);
+
+    for (rep.backends) |b| {
+        // An answer in capitals, given for this backend's remaining ones.
+        var all: ?usize = null;
+        for (b.drift.removed) |gone| {
+            if (report_only) {
+                try ctx.out.print("  removed    {s} {s}\n", .{ b.backend, gone.row.name });
+                res.still_removed += 1;
+                continue;
+            }
+
+            try ctx.out.print(
+                "\nremoved package: {s} {s} ({s}): installed here before, not any more\n",
+                .{ b.backend, gone.row.name, gone.row.label },
+            );
+            const chosen = all orelse blk: {
+                const question = try prompt.renderChoices(ctx.alloc, &removed_choices);
+                const outcome = try prompt.askWith(ask_mode, &removed_choices, 3, question, input, ctx.out, package_quit_help);
+                switch (outcome) {
+                    .chosen => |i| {
+                        if (i < 4) break :blk i;
+                        all = i - 4;
+                        break :blk i - 4;
+                    },
+                    .report_only => {
+                        res.still_removed += 1;
+                        continue;
+                    },
+                    .abort => {
+                        res.aborted = true;
+                        res.still_removed += 1;
+                        return res;
+                    },
+                    .abort_strict => {
+                        res.aborted = true;
+                        res.strict_abort = true;
+                        res.still_removed += 1;
+                        return res;
+                    },
+                }
+            };
+            switch (chosen) {
+                0, 1 => {
+                    const edit = if (chosen == 0)
+                        try mox.packages.write.removeRow(ctx.alloc, ctx.io, gone.row)
+                    else
+                        try mox.packages.write.setWhen(ctx.alloc, ctx.io, gone.row, this_machine);
+                    switch (edit) {
+                        .left => |why| {
+                            // In program order on the terminal: the reason
+                            // before the summary that counts it as removed.
+                            try ctx.out.flush();
+                            try ctx.err.print("mox commit: {s} {s}: {s} was left as it is: {s}\n", .{ b.backend, gone.row.name, gone.row.label, why });
+                            try ctx.err.flush();
+                            res.still_removed += 1;
+                            continue;
+                        },
+                        .written => {},
+                    }
+                    if (chosen == 1) {
+                        res.kept_off += 1;
+                        try ctx.out.print("  kept off this machine in {s}\n", .{gone.row.label});
+                        continue;
+                    }
+                    res.removed_rows += 1;
+                    try ctx.out.print("  removed from {s}\n", .{gone.row.label});
+                    // A row declaring the package again later reads missing,
+                    // not removed, unless another row still declares it now.
+                    const why = (try stillDeclared(ctx, context, registry.find(b.backend), gone.id)) orelse
+                        (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) orelse continue;
+                    try ctx.out.flush();
+                    try ctx.err.print("mox commit: warning: {s} {s}: its row is removed, but the record of what this machine held still has it: {s}\n", .{ b.backend, gone.row.name, why });
+                    try ctx.err.flush();
+                },
+                2 => {
+                    if (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) |why| {
+                        try ctx.out.flush();
+                        try ctx.err.print("mox commit: {s} {s}: the record of what this machine held could not be updated: {s}\n", .{ b.backend, gone.row.name, why });
+                        try ctx.err.flush();
+                        res.still_removed += 1;
+                        continue;
+                    }
+                    res.reinstall += 1;
+                    try ctx.out.writeAll("  set to install on the next apply\n");
+                },
+                else => res.still_removed += 1,
+            }
+        }
+    }
     return res;
+}
+
+/// Null when no `[[packages]]` row left in the manifest declares `id` for
+/// `backend`, under any gate, so the record may forget it; otherwise why it
+/// stays.
+fn stillDeclared(ctx: *app.Ctx, context: app.Context, backend: ?mox.packages.backend.Backend, id: []const u8) !?[]const u8 {
+    const b = backend orelse return "its manager is not known here";
+    var diag: mox.packages.manifest.Diag = .{};
+    const m = mox.packages.manifest.load(ctx.alloc, ctx.io, context.paths.repo_dir, context.paths.private_dir, &diag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return try std.fmt.allocPrint(ctx.alloc, "the manifest could not be read back ({s})", .{diag.capture() orelse @errorName(e)}),
+    };
+    const ids = mox.packages.drift.idsOf(ctx.alloc, b, m.packages) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return try std.fmt.allocPrint(ctx.alloc, "the manifest's rows could not be named ({s})", .{@errorName(e)}),
+    };
+    for (ids) |declared| if (std.mem.eql(u8, declared, id)) return "another row still declares it";
+    return null;
+}
+
+/// Take `id` out of this machine's record for `backend`. Null when it is
+/// out; otherwise why it could not be taken out.
+fn forgetHeld(
+    ctx: *app.Ctx,
+    state_dir: []const u8,
+    machine: *mox.packages.seen.Machine,
+    loaded: mox.packages.seen.Loaded,
+    backend: []const u8,
+    id: []const u8,
+) !?[]const u8 {
+    const state = loaded.stateOf(backend) orelse return "its manager keeps no record";
+    if (!state.writable) return "the record cannot be written; see the note above";
+    const owner = (try machine.owner()) orelse return "this machine's identity could not be read";
+    const held = mox.packages.seen.read(ctx.alloc, ctx.io, state_dir, backend, &owner) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return @errorName(e),
+    };
+    const ids = switch (held) {
+        .ids => |ids| ids,
+        .absent => return null,
+        .unusable => |why| return try std.fmt.allocPrint(ctx.alloc, "the record is unusable ({s})", .{why}),
+        .newer => return "the record was written by a newer mox; upgrade mox",
+    };
+    var kept: std.ArrayList([]const u8) = .empty;
+    for (ids) |held_id| if (!std.mem.eql(u8, held_id, id)) try kept.append(ctx.alloc, held_id);
+    mox.packages.seen.replace(ctx.alloc, ctx.io, state_dir, backend, &owner, kept.items) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return @errorName(e),
+    };
+    return null;
 }
 
 fn run(ctx: *app.Ctx, a: cli.Args(Spec)) anyerror!u8 {
@@ -1199,15 +1390,15 @@ pub fn commitImpl(
     color: style.ColorFlag,
     paths: []const []const u8,
 ) anyerror!u8 {
-    var package_rows: usize = 0;
-    return commitRun(ctx, dry_run, yes, abort_on_prompt, color, paths, &package_rows) catch |e| {
+    var package_changes: usize = 0;
+    return commitRun(ctx, dry_run, yes, abort_on_prompt, color, paths, &package_changes) catch |e| {
         switch (e) {
             // A simulation's transient write failed or could not be
             // reverted; its report is already printed.
             error.SimulationNotRestored, error.SimulationWriteFailed => {},
             else => try ctx.err.print("mox: error: {s}\n", .{@errorName(e)}),
         }
-        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{package_rows});
+        try ctx.err.print("mox commit: {d} package change(s) already written\n", .{package_changes});
         try ctx.err.flush();
         return 2;
     };
@@ -1225,8 +1416,8 @@ fn releaseStale(ctx: *app.Ctx, st: *State, paths: []const []const u8, home: []co
     }
 }
 
-/// `commitImpl`'s run; `package_rows` is set to the package rows recorded
-/// once they are.
+/// `commitImpl`'s run; `package_changes` is set to the package changes
+/// written once they are.
 fn commitRun(
     ctx: *app.Ctx,
     dry_run: bool,
@@ -1234,7 +1425,7 @@ fn commitRun(
     abort_on_prompt: bool,
     color: style.ColorFlag,
     paths: []const []const u8,
-    package_rows: *usize,
+    package_changes: *usize,
 ) anyerror!u8 {
     const context = ctx.context.?;
     const sty = style.Style{ .on = style.enabled(
@@ -1249,11 +1440,11 @@ fn commitRun(
     };
     defer lk.release();
     const st = (try state_cli.open(ctx, .{ .run_kind = .commit, .writes = !dry_run, .locked = true })) orelse return 2;
-    return state_cli.finish(ctx, st, .{}, commitOpened(ctx, st, sty, dry_run, yes, abort_on_prompt, paths, package_rows));
+    return state_cli.finish(ctx, st, .{}, commitOpened(ctx, st, sty, dry_run, yes, abort_on_prompt, paths, package_changes));
 }
 
 /// `commitRun` on the opened state.
-fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes: bool, abort_on_prompt: bool, paths: []const []const u8, package_rows: *usize) anyerror!u8 {
+fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes: bool, abort_on_prompt: bool, paths: []const []const u8, package_changes: *usize) anyerror!u8 {
     const context = ctx.context.?;
 
     // Routing a live edit back into a source that is itself mid-merge would
@@ -1438,24 +1629,24 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         try reconcilePackages(ctx, context, &axis_resolver, m_state, ask_mode, input, report_mode)
     else
         PackageReconcile{};
-    // A package row is appended the moment it is chosen, so an abort here
+    // A package answer is written the moment it is chosen, so an abort here
     // ends the run before the file pass and says exactly what was written.
     if (pkgs.strict_abort) {
         try ctx.err.print(
-            "mox commit: --abort-on-prompt: a package prompt was required; {d} row(s) already recorded, no file changes written\n",
-            .{pkgs.added + pkgs.blacklisted},
+            "mox commit: --abort-on-prompt: a package prompt was required; {d} package change(s) already written, no file changes written\n",
+            .{pkgs.changes()},
         );
         return 2;
     }
     if (pkgs.aborted) {
         try ctx.out.print(
-            "mox commit: aborted; {d} package row(s) already recorded, no file changes written\n",
-            .{pkgs.added + pkgs.blacklisted},
+            "mox commit: aborted; {d} package change(s) already written, no file changes written\n",
+            .{pkgs.changes()},
         );
         return 1;
     }
 
-    package_rows.* = pkgs.added + pkgs.blacklisted;
+    package_changes.* = pkgs.changes();
 
     var claims: Claims = .empty;
     var route_ids: PathIds = .init(ctx.alloc, ctx.io);
@@ -1832,7 +2023,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
 
     if (strict_abort) {
         try ctx.err.writeAll("mox commit: --abort-on-prompt: a prompt was required; nothing written\n");
-        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+        try ctx.err.print("mox commit: {d} package change(s) already written\n", .{pkgs.changes()});
         return 2;
     }
     if (aborted) {
@@ -1872,7 +2063,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
 
     if (strict_abort) {
         try ctx.err.writeAll("mox commit: --abort-on-prompt: a prompt was required; nothing written\n");
-        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+        try ctx.err.print("mox commit: {d} package change(s) already written\n", .{pkgs.changes()});
         return 2;
     }
     if (aborted) {
@@ -2014,7 +2205,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
     // Every written path, journaled before any write.
     var unreadable: []const u8 = "";
     journalPlanned(ctx.alloc, ctx.io, &journal, planned, synth_plans.items, if (fact_edits.items.len > 0) context.paths.facts_path else null, &unreadable) catch |e|
-        return stopUnreadable(ctx, display.of(ids.shown(unreadable), m_state.home), e, pkgs.added + pkgs.blacklisted);
+        return stopUnreadable(ctx, display.of(ids.shown(unreadable), m_state.home), e, pkgs.changes());
 
     // Plan: every prompt is done, so each written path's final bytes are
     // computed in memory from its journaled pre-run bytes, threading its
@@ -2039,7 +2230,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
             }
         }
         journal.record(ctx.alloc, ctx.io, path) catch |e|
-            return stopUnreadable(ctx, display.of(ids.shown(path), m_state.home), e, pkgs.added + pkgs.blacklisted);
+            return stopUnreadable(ctx, display.of(ids.shown(path), m_state.home), e, pkgs.changes());
     }
     // A file no update reaches, or only no-op ones (its renames dropped
     // before planning included), is no coupling target.
@@ -2301,7 +2492,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         try ctx.out.flush();
         try ctx.err.print("mox commit: could not write {f} ({s})\n", .{ display.of(ids.shown(writing), m_state.home), @errorName(e) });
         try restoreJournal(.of(ctx), &journal, &ids, m_state.home);
-        try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+        try ctx.err.print("mox commit: {d} package change(s) already written\n", .{pkgs.changes()});
         try ctx.err.flush();
         return 2;
     };
@@ -2385,7 +2576,7 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
         }
         if (failures.items.len > 0) {
             try saveRecovery(.of(ctx), &journal, &ids, &at_pre_run, failures.items, m_state.home);
-            try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{pkgs.added + pkgs.blacklisted});
+            try ctx.err.print("mox commit: {d} package change(s) already written\n", .{pkgs.changes()});
             try ctx.err.flush();
             return 2;
         }
@@ -2541,12 +2732,12 @@ fn commitOpened(ctx: *app.Ctx, st: *State, sty: style.Style, dry_run: bool, yes:
     // was printed where it happened.
     if (!pkgs.broken and (pkgs.touched() or pkgs.pending())) {
         try ctx.out.print(
-            "mox commit: packages: {d} recorded, {d} blacklisted, {d} still untracked\n",
-            .{ pkgs.added, pkgs.blacklisted, pkgs.skipped },
+            "mox commit: packages: {d} recorded, {d} blacklisted, {d} removed, {d} kept off this machine, {d} set to install, {d} still untracked, {d} still removed\n",
+            .{ pkgs.added, pkgs.blacklisted, pkgs.removed_rows, pkgs.kept_off, pkgs.reinstall, pkgs.skipped, pkgs.still_removed },
         );
     }
     // A manual hunk is work this run did not do, exactly like a skipped secret,
-    // an unexamined edit or an untracked package: without it here a
+    // an unexamined edit or an untracked or removed package: without it here a
     // wholly-manual file exits 0 while the same state under `--dry-run` exits
     // 1, and while `mox status` still reports the drift the commit left behind.
     return if (mismatch or pending or manual_count > 0 or skipped_secret > 0 or pkgs.pending()) 1 else 0;
@@ -3321,10 +3512,10 @@ fn writePlan(
 }
 
 /// Before any write: a path the journal cannot read stops the run.
-fn stopUnreadable(ctx: *app.Ctx, shown: display.Path, cause: anyerror, package_rows: usize) !u8 {
+fn stopUnreadable(ctx: *app.Ctx, shown: display.Path, cause: anyerror, package_changes: usize) !u8 {
     try ctx.out.flush();
     try ctx.err.print("mox commit: could not read {f} ({s})\n", .{ shown, @errorName(cause) });
-    try ctx.err.print("mox commit: {d} package row(s) already recorded\n", .{package_rows});
+    try ctx.err.print("mox commit: {d} package change(s) already written\n", .{package_changes});
     try ctx.err.flush();
     return 2;
 }
@@ -9425,7 +9616,7 @@ pub const command = app.command(Spec, .{
     .name = "commit",
     .usage = "mox commit [--flags] [<paths...>]",
     .summary = "Route live-file edits back into their sources",
-    .details = "Prompts [y/s] per hunk, [y/p/s] per key of a file merged from layers (accept the winning layer, pick another, skip), and [Y/n/d/D/q] to carry a changed token into other sources that hold it; --yes takes the defaults, --dry-run reports what --yes would do, making only temporary check writes it restores (exit 1 if edits remain), --abort-on-prompt exits 2 at the first prompt. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region). Every edit is planned and checked before anything is written; a file that fails verification is not committed and its sources are restored, failing with it every file whose edit shared a restored source, and nothing is recorded until all are settled. Exits 1 while anything is left undone. Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest; never uninstalls, and a path-scoped commit skips packages entirely.",
+    .details = "Prompts [y/s] per hunk, [y/p/s] per key of a file merged from layers (accept the winning layer, pick another, skip), and [Y/n/d/D/q] to carry a changed token into other sources that hold it; --yes takes the defaults, --dry-run reports what --yes would do, making only temporary check writes it restores (exit 1 if edits remain), --abort-on-prompt exits 2 at the first prompt. Private-origin edits go only to the private layer, never repo src. A shared edit that would change only some of the file's own configurations prompts to keep it universal or narrow it to an axis (synthesizing a region). Every edit is planned and checked before anything is written; a file that fails verification is not committed and its sources are restored, failing with it every file whose edit shared a restored source, and nothing is recorded until all are settled. Exits 1 while anything is left undone. Also offers every untracked package (add / blacklist / skip), recording it in the data/packages manifest, then every removed package this machine held and lost (remove its row / keep it off this machine / install it on the next apply / skip, R K I for all of a backend), writing each answer as it is given; never changes the machine, exits 1 while a package stays untracked or removed, and a path-scoped commit skips packages entirely.",
     .group = .general,
     .needs_context = true,
 }, run);

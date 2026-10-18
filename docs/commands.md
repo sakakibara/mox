@@ -774,7 +774,7 @@ before running commit again. Temporary writes commit makes to check a
 route, under `--dry-run` too, are restored the same way; one that fails
 for a key placement, a line or a row is reported `could not write <path>
 (<error>)` and stops the run, exit 2. Every exit 2 ends by saying how many
-package rows were already recorded.
+package changes were already written.
 
 ### Preview
 
@@ -791,15 +791,49 @@ bytes is left to `--yes`.
 A repo carrying a `data/packages/` manifest is reconciled before the file
 pass: each untracked package (installed, declared nowhere, not
 blacklisted) is offered `y` add, `b` blacklist, `s` skip -- add a row to
-the file that declares its backend, blacklist it, or skip; skip is the
-default, so `--yes` records nothing and exits 1 while anything stays
-untracked. A row is appended the moment it is chosen, so `q` here ends the
-run before the file pass and says how many rows were already recorded (rc
-1); `--abort-on-prompt` exits 2 at the first package prompt the same way.
-A backend plugin's `declare` verb runs here (see
-[packages.md](packages.md#the-protocol)). `--dry-run` lists the untracked
-packages and writes nothing; a path-scoped `mox commit <file>` skips
-packages entirely.
+the file that declares its backend, blacklist it, or skip. A backend
+plugin's `declare` verb runs here (see
+[packages.md](packages.md#the-protocol)).
+
+Then each removed package -- declared, held by this machine before, and
+now on it in no form (`REMOVED` in `mox status`) -- is offered as
+`removed package: <backend> <name> (<file>): installed here before, not
+any more`:
+
+| key | answer |
+| --- | --- |
+| `r` | remove: delete its row from the manifest, for every machine |
+| `k` | keep off: gate its row so this machine skips it |
+| `i` | install: the next apply installs it again |
+| `s` | skip: decide later |
+| `R`, `K`, `I` | `r`, `k` or `i` for this and every remaining removed package of the same backend |
+
+`r` deletes the row's lines, from its `[[packages]]` header through its
+last key, comments between its keys included; comments above the header
+and after the last key stay. It then drops the package from this
+machine's record of what it held, unless another row still declares it,
+so a row added back later is installed rather than reported removed. `k`
+sets the row's own `when` to `not machine="<m>"`, or wraps the one it has
+as `(<W>) and not machine="<m>"`, where `<m>` is this machine's `machine`
+value. `i` drops the package from the record, so the next
+apply installs it like any missing package. Before `r` or `k` writes, the
+file is re-read, the row found by its content, and the edited file loaded
+back and checked to differ only by that change; a row commit cannot find
+exactly once, rows written inline (`packages = [{ ... }]`), and a `when`
+written as a multi-line or literal string are left as they are, saying
+why, for a hand edit. The machine itself is never changed.
+
+Skip is the default at both prompts, so `--yes` changes nothing and exits
+1 while anything stays untracked or removed. Every answer is written the
+moment it is chosen, so `q` ends the run before the file pass and says
+how many package changes were already written (rc 1); `--abort-on-prompt`
+exits 2 at the first package prompt the same way. A run with package
+work ends with `packages: N recorded, N blacklisted, N removed, N kept
+off this machine, N set to install, N still untracked, N still removed`.
+`--dry-run` lists
+each untracked package (`  untracked  <backend> <id>`) and removed
+package (`  removed    <backend> <name>`) and writes nothing; a
+path-scoped `mox commit <file>` skips packages entirely.
 
 ### Exit codes
 
@@ -812,7 +846,7 @@ packages entirely.
   edited live copy; a generator that fails to re-expand; a special file at
   a recorded path; a head declaration (`own`, `disown`, `check`) that
   cannot be read on a recorded path whose live content changed; a skipped
-  secret; a package still untracked; a named stale path or orphaned
+  secret; a package still untracked or removed; a named stale path or orphaned
   generator file a reporting run (`--dry-run`, or no terminal without
   `--yes`) would release. The same holds in every mode.
 - **2**: an attributes file, the repo's or the private layer's, is not

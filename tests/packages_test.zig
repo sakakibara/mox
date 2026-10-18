@@ -2312,7 +2312,7 @@ test "commit --abort-on-prompt: an untracked package is a prompt, so rc 2 and th
     try std.testing.expectEqualStrings(original, after);
 }
 
-test "commit: q at a package prompt stops there, keeping the row already recorded and saying so" {
+test "commit: q at a package prompt stops there, keeping the row already written and saying so" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2330,7 +2330,7 @@ test "commit: q at a package prompt stops there, keeping the row already recorde
 
     const r = try h.runWithInput(&.{ "mox", "commit" }, "y\nq\n");
     try std.testing.expectEqual(@as(u8, 1), r.rc);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "aborted; 1 package row(s) already recorded, no file changes written") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "aborted; 1 package change(s) already written, no file changes written") != null);
 
     // The first answer was appended the moment it was given; the abort
     // reached the second before anything was written for it.
@@ -5887,4 +5887,364 @@ test "status: an identity that cannot be read puts no record in effect and says 
     try std.testing.expect(std.mem.indexOf(u8, p.err, try std.fmt.allocPrint(a, "mox status: note: {s}", .{why})) != null);
 
     try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
+}
+
+/// What commit asks about a removed package, before its choices.
+fn removedQuestion(a: std.mem.Allocator, backend: []const u8, name: []const u8, label: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "\nremoved package: {s} {s} ({s}): installed here before, not any more\n", .{ backend, name, label });
+}
+
+/// The summary line of a commit whose only work was packages.
+fn packageSummary(a: std.mem.Allocator, n: [7]usize) ![]const u8 {
+    return std.fmt.allocPrint(a, "mox commit: packages: {d} recorded, {d} blacklisted, {d} removed, {d} kept off this machine, {d} set to install, {d} still untracked, {d} still removed\n", .{ n[0], n[1], n[2], n[3], n[4], n[5], n[6] });
+}
+
+/// A manifest of fd, ripgrep and bat, with brew holding only bat and the
+/// record holding all three: fd and ripgrep are removed.
+const two_removed =
+    \\backend = "brew"
+    \\
+    \\[[packages]]
+    \\name = "fd"
+    \\
+    \\# search
+    \\[[packages]]
+    \\name = "ripgrep"
+    \\
+    \\[[packages]]
+    \\name = "bat"
+    \\
+;
+
+fn twoRemoved(a: std.mem.Allocator, io: Io, tmp: *std.testing.TmpDir, opts: testutil.SetupOpts) !Harness {
+    const h = try setup(a, io, tmp, opts);
+    try writeManifest(io, h, a, "darwin.toml", two_removed);
+    try writeSeen(h, "brew", testutil.test_identity, &.{ "bat", "fd", "ripgrep" });
+    useFake(try brewWith(a, "bat\n", "", &.{}));
+    return h;
+}
+
+test "commit: r removes a removed package's row and forgets it in the record; s leaves the next, and the run exits 1" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "r\ns\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try removedQuestion(a, "brew", "fd", "data/packages/darwin.toml")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try removedQuestion(a, "brew", "ripgrep", "data/packages/darwin.toml")) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  removed from data/packages/darwin.toml\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 1, 0, 0, 0, 1 })) != null);
+
+    try std.testing.expectEqualStrings(
+        \\backend = "brew"
+        \\
+        \\# search
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+        \\[[packages]]
+        \\name = "bat"
+        \\
+    , try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: r keeps the record's entry while another row still declares the package" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+    // The same package for another OS: under a gate that fails here, but
+    // still a row that declares it.
+    try writeManifest(io, h, a, "linux.toml", "backend = \"brew\"\nwhen = \"os=linux\"\n\n[[packages]]\nname = \"fd\"\n");
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    useFake(try brewWith(a, "", "", &.{}));
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "r\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "another row still declares it") != null);
+    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: k gates a removed package's row off this machine, by its machine name, and leaves the record" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_HOSTNAME", .value = "work-mac.local" }} });
+    defer mox.cli.app.package_runner_override = null;
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n\n[[packages]]\nname = \"bat\"\n");
+    try writeSeen(h, "brew", testutil.test_identity, &.{ "bat", "fd" });
+    useFake(try brewWith(a, "bat\n", "", &.{}));
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "k\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  kept off this machine in data/packages/darwin.toml\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 1, 0, 0, 0 })) != null);
+    try std.testing.expectEqualStrings(
+        "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\nwhen = \"not machine=\\\"work-mac\\\"\"\n\n[[packages]]\nname = \"bat\"\n",
+        try readManifest(io, h, a, "darwin.toml"),
+    );
+    try std.testing.expectEqualStrings("bat fd", try readSeen(h, "brew", testutil.test_identity));
+
+    // Off this machine, the row is gated here, neither removed nor missing.
+    useFake(try brewWith(a, "bat\n", "", &.{}));
+    const s = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ s.out, s.err });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "  GATED     brew fd (when not machine=\"work-mac\")\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "REMOVED") == null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "MISSING") == null);
+}
+
+test "commit: i forgets a removed package in the record, so the next apply installs it, and the manifest is untouched" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "i\ni\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.out, "  set to install on the next apply\n"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 0, 2, 0, 0 })) != null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat", try readSeen(h, "brew", testutil.test_identity));
+
+    useFake(try brewWith(a, "bat\n", "", &.{}));
+    const s = try h.run(&.{ "mox", "status" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ s.out, s.err });
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "  MISSING   brew fd\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.out, "REMOVED") == null);
+}
+
+test "commit: s is the default, writes nothing, and the run exits 1; ? explains every answer and that q keeps what was written" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const original = "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n";
+    try writeManifest(io, h, a, "darwin.toml", original);
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    // htop is installed and declared nowhere: untracked, offered first.
+    useFake(try brewWith(a, "htop\n", "", &.{}));
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "?\ns\n?\n\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.out, "  [q] quit -- end now; answers given so far are kept\n"));
+    for ([_][]const u8{
+        "  [r] remove -- delete its row from the manifest, for every machine\n",
+        "  [k] keep off -- gate its row so this machine skips it\n",
+        "  [i] install -- the next apply installs it again\n",
+        "  [s] skip -- decide later (default)\n",
+        "  [R] remove all -- r for this and every remaining removed package of this backend\n",
+        "  [K] keep off all -- k likewise\n",
+        "  [I] install all -- i likewise\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, r.out, line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 0, 0, 1, 1 })) != null);
+    try std.testing.expectEqualStrings(original, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: R removes every remaining removed package of the backend on one answer" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    // One line of input: a second prompt would read end of input and abort.
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "R\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, r.out, "  removed from data/packages/darwin.toml\n"));
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 2, 0, 0, 0, 0 })) != null);
+    // The comment above ripgrep's header stays, and so does the blank line
+    // after its last key: no two blank lines meet.
+    try std.testing.expectEqualStrings("backend = \"brew\"\n\n# search\n\n[[packages]]\nname = \"bat\"\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: K keeps every remaining removed package of the backend off this machine on one answer" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{ .extra_env = &.{.{ .name = "MOX_HOSTNAME", .value = "work-mac" }} });
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "K\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 2, 0, 0, 0 })) != null);
+    const after = try readManifest(io, h, a, "darwin.toml");
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, after, "when = \"not machine=\\\"work-mac\\\"\"\n"));
+    try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: I sets every remaining removed package of the backend to install on one answer" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "I\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 0, 2, 0, 0 })) != null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: q at a removed package's prompt ends the run, saying how many package changes were already written" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "r\nq\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "mox commit: aborted; 1 package change(s) already written, no file changes written\n") != null);
+    const after = try readManifest(io, h, a, "darwin.toml");
+    try std.testing.expect(std.mem.indexOf(u8, after, "name = \"fd\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "name = \"ripgrep\"") != null);
+    try std.testing.expectEqualStrings("bat ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit --yes: a removed package is skipped, nothing is written, and the run exits 1" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "commit", "--yes" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 0, 0, 0, 2 })) != null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit --dry-run: each removed package is listed, nothing is written, and the run exits 1" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "commit", "--dry-run" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "  removed    brew fd\n  removed    brew ripgrep\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "removed package:") == null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit --abort-on-prompt: a removed package is a prompt, so rc 2 and nothing is written" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "commit", "--abort-on-prompt" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: --abort-on-prompt: a package prompt was required; 0 package change(s) already written, no file changes written\n") != null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: a removed package whose rows are written inline is left for a hand edit, saying why, and stays removed" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const original = "backend = \"brew\"\npackages = [{ name = \"fd\" }]\n";
+    try writeManifest(io, h, a, "darwin.toml", original);
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    useFake(try brewWith(a, "", "", &.{}));
+
+    const r = try h.runWithInput(&.{ "mox", "commit" }, "r\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 1), r.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: brew fd: data/packages/darwin.toml was left as it is: its rows are written inline (packages = [...]), which mox does not edit; edit it by hand\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 0, 0, 0, 0, 1 })) != null);
+    try std.testing.expectEqualStrings(original, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "commit: a path-scoped commit offers no removed package" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try twoRemoved(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.runWithInput(&.{ "mox", "commit", try h.liveOf("nothing-here.conf") }, "r\n");
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expect(std.mem.indexOf(u8, r.out, "removed package:") == null);
+    try std.testing.expectEqualStrings(two_removed, try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("bat fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
 }
