@@ -1306,7 +1306,7 @@ fn reconcilePackages(
                         .free => (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) orelse continue,
                     };
                     try ctx.out.flush();
-                    try ctx.err.print("mox commit: warning: {s} {s}: its row was removed, but mox could not update its list of what this machine held: {s}; until an apply rewrites that list, a row declaring it again reads as removed\n", .{ b.backend, gone.row.name, why });
+                    try ctx.err.print("mox commit: warning: {s} {s}: its row was removed, but mox could not update its record of what this machine held: {s}; until an apply rewrites the record, a row declaring it again reads as removed\n", .{ b.backend, gone.row.name, why });
                     try ctx.err.flush();
                 },
                 2 => {

@@ -6161,8 +6161,8 @@ test "commit: r whose record write fails keeps the row's removal and warns, sayi
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but mox could not update its list of what this machine held: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "; until an apply rewrites that list, a row declaring it again reads as removed\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but mox could not update its record of what this machine held: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "; until an apply rewrites the record, a row declaring it again reads as removed\n") != null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }
 
