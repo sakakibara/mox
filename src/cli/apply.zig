@@ -949,7 +949,10 @@ fn applyPass(
 /// freshly installed `/home/linuxbrew/.linuxbrew/bin` reaches the probes and
 /// installs that follow only through it. Returns how many were installed and
 /// how many failed: a manager that will not install is a genuine failure,
-/// not a reason to press on quietly installing nothing.
+/// not a reason to press on quietly installing nothing. Also returns the
+/// names of the managers it bootstrapped: a record of what this machine held
+/// through a manager just installed afresh describes a manager that is gone,
+/// so it is not in effect for them.
 ///
 /// An installer is believed only as far as the manager it was supposed to
 /// leave behind: the probe is asked again afterwards, and one that still
@@ -970,12 +973,13 @@ fn bootstrapBackends(
     pkg_env: *std.process.Environ.Map,
     mox_path_dirs: *std.ArrayList([]const u8),
     keepalive: *mox.packages.admin.Keepalive,
-) !struct { bootstrapped: usize, ran: usize, failed: usize, failed_backends: []const []const u8 } {
+) !struct { bootstrapped: usize, ran: usize, failed: usize, failed_backends: []const []const u8, bootstrapped_backends: []const []const u8 } {
     const machine_os = mox.machine.state.osAxis(ctx.alloc, context.env);
     var bootstrapped: usize = 0;
     var ran: usize = 0;
     var failed: usize = 0;
     var failed_names: std.ArrayList([]const u8) = .empty;
+    var bootstrapped_names: std.ArrayList([]const u8) = .empty;
     for (m.bootstrap) |b| {
         if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
         const backend = registry.find(b.backend) orelse {
@@ -1111,8 +1115,9 @@ fn bootstrapBackends(
             continue;
         }
         bootstrapped += 1;
+        try bootstrapped_names.append(ctx.alloc, b.backend);
     }
-    return .{ .bootstrapped = bootstrapped, .ran = ran, .failed = failed, .failed_backends = failed_names.items };
+    return .{ .bootstrapped = bootstrapped, .ran = ran, .failed = failed, .failed_backends = failed_names.items, .bootstrapped_backends = bootstrapped_names.items };
 }
 
 /// `sudo -v` on the terminal, so an installer that only asks `sudo -n` finds
@@ -1330,6 +1335,7 @@ fn applyPackages(
         bindings,
         would_bootstrap.items,
         .judge,
+        .none,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,
@@ -1517,7 +1523,7 @@ fn restoreRegressed(
     counts: *PackageCounts,
 ) !void {
     var diag: mox.packages.manifest.Diag = .{};
-    const after = mox.packages.report.fromManifest(ctx.alloc, manifest, registry, bindings, &.{}, .reconcile, &diag) catch |e| switch (e) {
+    const after = mox.packages.report.fromManifest(ctx.alloc, manifest, registry, bindings, &.{}, .reconcile, .none, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             try ctx.err.print(

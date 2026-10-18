@@ -595,6 +595,11 @@ pub const Backend = struct {
         return self.vtable.bootstrap != null;
     }
 
+    /// Whether the adapter answers `present`, without asking it anything.
+    pub fn canTellPresent(self: Backend) bool {
+        return self.vtable.present != null;
+    }
+
     pub fn installerExit(self: Backend) ?u8 {
         const f = self.vtable.installerExit orelse return null;
         return f(self.ctx);

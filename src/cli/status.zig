@@ -781,6 +781,7 @@ fn reportPackages(
         bindings,
         &.{},
         .judge,
+        .none,
         &diag,
     ) catch |e| switch (e) {
         error.OutOfMemory => return e,

@@ -4,6 +4,9 @@
 //! comparison would miss is exercised without depending on a real adapter.
 //! Only `name` and `idOf` answer; every other operation is unreachable, so a
 //! test that strays into one fails instead of reading a default.
+//!
+//! `Fake` is the same with a usable manager behind it, whose installed set
+//! and `present` answer a test sets, and whose `present` calls are counted.
 
 const std = @import("std");
 
@@ -76,3 +79,60 @@ fn unreachedInstall(_: *anyopaque, _: std.mem.Allocator, _: []const Row) anyerro
 fn unreachedBootstrap(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?[]const u8 {
     return error.Unreached;
 }
+
+/// A usable manager that reports `installed` and answers `present` with
+/// `present_answer`, or has no `present` verb at all when `tells_present` is
+/// false. Installing is unreachable.
+pub const Fake = struct {
+    name: []const u8,
+    installed: []const []const u8 = &.{},
+    present_answer: anyerror![]const []const u8 = &.{},
+    tells_present: bool = true,
+    /// How many times `present` was asked, and the rows it was last asked
+    /// about.
+    present_calls: usize = 0,
+    present_asked: []const Row = &.{},
+
+    pub fn backend(self: *Fake) Backend {
+        return .{
+            .name = self.name,
+            .ctx = self,
+            .vtable = if (self.tells_present) &fake_vtable else &fake_vtable_without_present,
+        };
+    }
+
+    fn available(_: *anyopaque, _: std.mem.Allocator) anyerror!Backend.Availability {
+        return .present;
+    }
+
+    fn installedExplicit(ctx: *anyopaque, _: std.mem.Allocator) anyerror![]const []const u8 {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
+        return self.installed;
+    }
+
+    fn present(ctx: *anyopaque, _: std.mem.Allocator, rows: []const Row) anyerror![]const []const u8 {
+        const self: *Fake = @ptrCast(@alignCast(ctx));
+        self.present_calls += 1;
+        self.present_asked = rows;
+        return self.present_answer;
+    }
+};
+
+const fake_vtable: Backend.VTable = .{
+    .available = Fake.available,
+    .validate = validate,
+    .idOf = idOf,
+    .installedExplicit = Fake.installedExplicit,
+    .install = unreachedInstall,
+    .present = Fake.present,
+    .declare = declare,
+};
+
+const fake_vtable_without_present: Backend.VTable = .{
+    .available = Fake.available,
+    .validate = validate,
+    .idOf = idOf,
+    .installedExplicit = Fake.installedExplicit,
+    .install = unreachedInstall,
+    .declare = declare,
+};

@@ -3,6 +3,12 @@
 //! `commit` reconciles what it reports untracked. Building it once keeps
 //! those three from drifting apart in what they consider desired.
 //!
+//! What the machine was seen holding comes in from the caller as `Seen`:
+//! reading and writing the record is the caller's, since only it knows
+//! which backends it bootstrapped and whether the machine's identity could
+//! be read. The report only asks the manager whether a lost package is on
+//! the machine in any form, and classifies.
+//!
 //! A repo with no `data/packages/` is not using the subsystem, and
 //! `fromManifest` says so rather than reporting every installed package as
 //! untracked.
@@ -41,6 +47,43 @@ pub const BackendDrift = struct {
     /// judge alone is in `drift.unchecked`. Counted as drift: an astray row
     /// is, and an answer that could not be had is not an answer of none.
     unchecked: ?[]const u8 = null,
+    /// What the backend reported installed on purpose, for updating the
+    /// record. Empty for a backend assumed rather than asked.
+    explicit: []const []const u8 = &.{},
+    /// The ids of the rows desired here, distinct, for updating the record.
+    /// Empty for a backend assumed rather than asked.
+    desired_ids: []const []const u8 = &.{},
+    /// The ids of every `[[packages]]` row naming the backend, under any
+    /// gate, blacklist rows excluded: what the record may keep. A gate that
+    /// fails for a while must not forget an uninstall. Empty for a backend
+    /// assumed rather than asked.
+    declared_ids: []const []const u8 = &.{},
+};
+
+/// The records in effect for a report: per backend, the ids this machine was
+/// seen holding through it (`seen.zig`). A backend with no entry has no
+/// record in effect, and every desired row it has not installed is missing.
+/// The caller leaves out a backend it bootstrapped in this run, one whose
+/// record is absent, unusable or newer, and every backend when the machine's
+/// identity could not be read.
+pub const Seen = struct {
+    records: []const Record = &.{},
+
+    pub const Record = struct {
+        backend: []const u8,
+        ids: []const []const u8,
+    };
+
+    /// No record in effect for any backend.
+    pub const none: Seen = .{};
+
+    /// The ids recorded for `backend`, or null when it has no entry.
+    pub fn of(self: Seen, backend: []const u8) ?[]const []const u8 {
+        for (self.records) |rec| {
+            if (std.mem.eql(u8, rec.backend, backend)) return rec.ids;
+        }
+        return null;
+    }
 };
 
 /// A manager that is there but cannot answer its own version query. Treated
@@ -80,6 +123,12 @@ pub const Report = struct {
     pub fn missingCount(self: Report) usize {
         var n: usize = 0;
         for (self.backends) |b| n += b.drift.missing.len;
+        return n;
+    }
+
+    pub fn removedCount(self: Report) usize {
+        var n: usize = 0;
+        for (self.backends) |b| n += b.drift.removed.len;
         return n;
     }
 
@@ -147,8 +196,8 @@ fn noteBroken(
 }
 
 /// What a report is built for. `reconcile` needs only what is untracked, so
-/// it skips the checks that judge installed rows, and the manager calls they
-/// make.
+/// it skips judging installed rows for being held astray, and the manager
+/// calls that makes. Missing and removed are classified under both.
 pub const Purpose = enum { judge, reconcile };
 
 /// `gather` for a manifest already loaded, so a caller that reads it for its
@@ -163,6 +212,15 @@ pub const Purpose = enum { judge, reconcile };
 /// contradict what apply is about to do. A manager that is there but cannot
 /// answer its probe is reported broken: its rows cannot be judged, and a
 /// machine in that state is not a clean one.
+///
+/// A usable backend's record is in effect when `seen` has an entry for it
+/// and it answers `present`; an assumed backend's never is, since nothing
+/// was asked of it. The desired rows it has not installed but was seen
+/// holding go to `present` in one call, made only when there is one: those
+/// on the machine in any form are missing, the rest removed. A `present`
+/// that fails breaks the backend as a failed list does: a manager that
+/// answered its list and then failed one more query is not trusted for the
+/// rest of this report.
 pub fn fromManifest(
     arena: std.mem.Allocator,
     m: manifest_mod.Manifest,
@@ -170,6 +228,7 @@ pub fn fromManifest(
     r: *const Resolver,
     assume_available: []const []const u8,
     purpose: Purpose,
+    seen: Seen,
     diag: ?*Diag,
 ) !Report {
     if (!m.inUse()) return .{};
@@ -244,7 +303,7 @@ pub fn fromManifest(
     for (assumed.items) |b| {
         try out.append(arena, .{
             .backend = b.name,
-            .drift = drift_mod.compute(arena, b, rows, &.{}, .{}, m) catch |e| {
+            .drift = drift_mod.compute(arena, b, rows, &.{}, .{}, .{}, m) catch |e| {
                 try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
@@ -274,6 +333,19 @@ pub fn fromManifest(
             break;
         }
         if (!shape_ok) continue;
+        const record = recordOf(b, seen);
+        const asked: []const Row = if (record) |ids| drift_mod.candidates(arena, b, rows, installed, ids) catch |e| {
+            try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
+            continue;
+        } else &.{};
+        const lost: drift_mod.Lost = if (asked.len == 0) .{} else .{
+            .seen = record.?,
+            .present = (b.present(arena, asked) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                try noteBroken(arena, &broken, &notes, diag, m, b.name, "present", e);
+                continue;
+            }).?,
+        };
         // A limitation is a remark about what this manager cannot see, and
         // nothing is judged by it. One that fails costs the reader that
         // remark and nothing else: the drift below is already computable, and
@@ -299,13 +371,22 @@ pub fn fromManifest(
         };
         try out.append(arena, .{
             .backend = b.name,
-            .drift = drift_mod.compute(arena, b, rows, installed, judged, m) catch |e| {
+            .drift = drift_mod.compute(arena, b, rows, installed, judged, lost, m) catch |e| {
                 try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
                 continue;
             },
             .limitation = limitation,
             .gated = try gatedFor(arena, gated.items, b.name),
             .unchecked = unchecked,
+            .explicit = installed,
+            .desired_ids = drift_mod.idsOf(arena, b, rows) catch |e| {
+                try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
+                continue;
+            },
+            .declared_ids = drift_mod.idsOf(arena, b, m.packages) catch |e| {
+                try noteBroken(arena, &broken, &notes, diag, m, b.name, "id", e);
+                continue;
+            },
         });
     }
 
@@ -323,6 +404,14 @@ fn astrayOf(arena: std.mem.Allocator, b: Backend, rows: []const Row, installed: 
     const held = try drift_mod.held(arena, b, rows, installed);
     if (held.len == 0) return .{};
     return b.astray(arena, held);
+}
+
+/// The record of `b` when it is in effect: `seen` has an entry for it and
+/// it answers `present`. A record whose candidates nobody could ask about
+/// would call every one of them removed.
+fn recordOf(b: Backend, seen: Seen) ?[]const []const u8 {
+    if (!b.canTellPresent()) return null;
+    return seen.of(b.name);
 }
 
 /// The gated-out rows naming `backend`, in manifest order.
@@ -416,7 +505,7 @@ test "fromManifest: a manager no row names failing a verb is a note, not this re
     const r: resolver_mod.Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.broken.len);
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
     try testing.expect(std.mem.indexOf(u8, rep.notes[0], "no row asks it to install anything") != null);
@@ -433,7 +522,7 @@ test "fromManifest: a repo not using the subsystem reports nothing" {
     // No manifest files: every installed package would otherwise read as
     // untracked on a machine that never opted in.
     const m: manifest_mod.Manifest = .{ .files = 0 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{} }, &r, &.{}, .judge, .none, null);
     try testing.expect(!rep.in_use);
     try testing.expect(rep.clean());
 }
@@ -451,7 +540,7 @@ test "fromManifest: an unusable backend is never queried" {
         .packages = &.{rowOf("bat", "dnf")},
         .files = 1,
     };
-    try testing.expectError(error.Unreached, fromManifest(a, m, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, .judge, null));
+    try testing.expectError(error.Unreached, fromManifest(a, m, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, .judge, .none, null));
 }
 
 test "fromManifest: drift comes back per backend" {
@@ -474,7 +563,7 @@ test "fromManifest: drift comes back per backend" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expect(rep.in_use);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
@@ -517,7 +606,7 @@ test "fromManifest: a manifest matching the machine is clean" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expect(rep.clean());
 }
 
@@ -540,7 +629,7 @@ test "fromManifest: an invalid manifest is refused before anything is queried" {
     var d: Diag = .{};
     try testing.expectError(
         validate_mod.Error.UnknownBackend,
-        fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, &d),
+        fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, &d),
     );
 }
 
@@ -577,7 +666,7 @@ test "fromManifest: an absent backend apply would bootstrap is assumed, its rows
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
     try testing.expectEqualStrings("absent; apply will bootstrap it", rep.backends[0].limitation.?);
@@ -608,7 +697,7 @@ test "fromManifest: a bootstrap row whose gate excludes this machine assumes not
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 1), rep.notes.len);
@@ -639,7 +728,7 @@ test "fromManifest: an inert backend is not assumed for its bootstrap row" {
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{p.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{p.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
     try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
@@ -666,7 +755,7 @@ test "fromManifest: a broken backend is not bootstrapped over, whatever the mani
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 1), rep.broken.len);
     // No backend drift at all: its rows were not judged.
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
@@ -692,7 +781,7 @@ test "fromManifest: a broken backend is treated as absent and listed as broken" 
         .files = 1,
     };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     // Broken is drift of its own: nothing to install, but nothing clean.
     try testing.expect(!rep.clean());
@@ -729,7 +818,7 @@ test "fromManifest: a broken manager only a blacklist row names is a note saying
     };
     const m: manifest_mod.Manifest = .{ .blacklist = &.{bl}, .files = 1 };
 
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.broken.len);
     try testing.expectEqual(@as(usize, 0), rep.backends.len);
     try testing.expect(rep.clean());
@@ -761,7 +850,7 @@ test "fromManifest: a probe error on a backend no row names is a note, and the r
         .packages = &.{rowOf("ripgrep", "brew")},
         .files = 1,
     };
-    const rep = try fromManifest(a, m, .{ .backends = &.{ b.backend(), test_backend.make("dnf") } }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{ b.backend(), test_backend.make("dnf") } }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("brew", rep.backends[0].backend);
     try testing.expect(rep.clean());
@@ -786,11 +875,11 @@ test "fromManifest: a probe error on a backend a blacklist or bootstrap row name
     };
     const by_blacklist: manifest_mod.Manifest = .{ .blacklist = &.{bl}, .files = 1 };
     var d: Diag = .{};
-    try testing.expectError(error.Unreached, fromManifest(a, by_blacklist, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, .judge, &d));
+    try testing.expectError(error.Unreached, fromManifest(a, by_blacklist, .{ .backends = &.{test_backend.make("dnf")} }, &r, &.{}, .judge, .none, &d));
     try testing.expectEqualStrings("dnf: available failed: Unreached", d.capture().?);
 
     const by_bootstrap: manifest_mod.Manifest = .{ .bootstrap = &.{bootstrapRowOf("dnf", null)}, .files = 1 };
-    try testing.expectError(error.Unreached, fromManifest(a, by_bootstrap, .{ .backends = &.{test_backend.makeBootstrappable("dnf")} }, &r, &.{}, .judge, null));
+    try testing.expectError(error.Unreached, fromManifest(a, by_bootstrap, .{ .backends = &.{test_backend.makeBootstrappable("dnf")} }, &r, &.{}, .judge, .none, null));
 }
 
 test "fromManifest: a usable backend leaves no note about usability" {
@@ -809,7 +898,7 @@ test "fromManifest: a usable backend leaves no note about usability" {
     var b: brew_mod.Brew = .{ .runner = fake.runner() };
 
     const m: manifest_mod.Manifest = .{ .packages = &.{}, .files = 1 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.notes.len);
     // Whatever limitation rides here is the adapter's own; being usable adds
     // nothing, and never "absent; apply will bootstrap it".
@@ -855,7 +944,7 @@ test "fromManifest: an installed row brew holds astray is drift, and comes back 
     const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     const m: manifest_mod.Manifest = .{ .packages = &.{rowOf("owner/tap/emacs-plus@30", "brew")}, .files = 1 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.missingCount());
     try testing.expectEqual(@as(usize, 1), rep.astrayCount());
     const s = rep.backends[0].drift.astray[0];
@@ -880,10 +969,161 @@ test "fromManifest: an astray check that fails is drift of its own, and the rest
     const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
 
     const m: manifest_mod.Manifest = .{ .packages = &.{ rowOf("ripgrep", "brew"), rowOf("fd", "brew") }, .files = 1 };
-    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, null);
+    const rep = try fromManifest(a, m, .{ .backends = &.{b.backend()} }, &r, &.{}, .judge, .none, null);
     try testing.expectEqual(@as(usize, 0), rep.broken.len);
     try testing.expectEqual(@as(usize, 1), rep.missingCount());
     try testing.expectEqual(@as(usize, 1), rep.uncheckedCount());
     try testing.expectEqualStrings("brew exited nonzero answering what mox asked, saying why above", rep.backends[0].unchecked.?);
     try testing.expect(!rep.clean());
+}
+
+fn gatedRowOf(name: []const u8, backend: []const u8, when: []const u8) Row {
+    var row = rowOf(name, backend);
+    row.when = when;
+    return row;
+}
+
+test "fromManifest: a backend with no record in effect has every row it lacks missing, and is not asked present" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+    const m: manifest_mod.Manifest = .{ .packages = &.{rowOf("ripgrep", "fake")}, .files = 1 };
+
+    // No entry in `seen`.
+    var no_entry: test_backend.Fake = .{ .name = "fake" };
+    const rep = try fromManifest(a, m, .{ .backends = &.{no_entry.backend()} }, &r, &.{}, .judge, .none, null);
+    try testing.expectEqual(@as(usize, 1), rep.missingCount());
+    try testing.expectEqual(@as(usize, 0), rep.removedCount());
+    try testing.expectEqual(@as(usize, 0), no_entry.present_calls);
+
+    // An entry, but a manager with no `present` to ask.
+    const seen: Seen = .{ .records = &.{.{ .backend = "fake", .ids = &.{"ripgrep"} }} };
+    var unaskable: test_backend.Fake = .{ .name = "fake", .tells_present = false };
+    const rep2 = try fromManifest(a, m, .{ .backends = &.{unaskable.backend()} }, &r, &.{}, .judge, seen, null);
+    try testing.expectEqual(@as(usize, 1), rep2.missingCount());
+    try testing.expectEqual(@as(usize, 0), rep2.removedCount());
+
+    // An assumed backend: nothing was asked of it, so nothing is lost.
+    var assumed: test_backend.Fake = .{ .name = "fake" };
+    const rep3 = try fromManifest(a, m, .{ .backends = &.{assumed.backend()} }, &r, &.{"fake"}, .judge, seen, null);
+    try testing.expectEqual(@as(usize, 1), rep3.missingCount());
+    try testing.expectEqual(@as(usize, 0), rep3.removedCount());
+    try testing.expectEqual(@as(usize, 0), assumed.present_calls);
+}
+
+test "fromManifest: a seen row the manager holds in some form is missing, and one it holds in none is removed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // ripgrep is installed; fd was seen and is still there as a dependency;
+    // bat was seen and is gone; jq was never seen here.
+    var f: test_backend.Fake = .{ .name = "fake", .installed = &.{"ripgrep"}, .present_answer = &.{"fd"} };
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{ rowOf("ripgrep", "fake"), rowOf("fd", "fake"), rowOf("bat", "fake"), rowOf("jq", "fake") },
+        .files = 1,
+    };
+    const seen: Seen = .{ .records = &.{.{ .backend = "fake", .ids = &.{ "ripgrep", "fd", "bat" } }} };
+
+    inline for (.{ Purpose.judge, Purpose.reconcile }) |purpose| {
+        f.present_calls = 0;
+        const rep = try fromManifest(a, m, .{ .backends = &.{f.backend()} }, &r, &.{}, purpose, seen, null);
+        try testing.expectEqual(@as(usize, 1), f.present_calls);
+        try testing.expectEqual(@as(usize, 2), f.present_asked.len);
+        try testing.expectEqualStrings("fd", f.present_asked[0].name);
+        try testing.expectEqualStrings("bat", f.present_asked[1].name);
+        try testing.expectEqual(@as(usize, 1), rep.removedCount());
+        try testing.expectEqualStrings("bat", rep.backends[0].drift.removed[0].row.name);
+        try testing.expectEqual(@as(usize, 2), rep.missingCount());
+        try testing.expectEqualStrings("fd", rep.backends[0].drift.missing[0].row.name);
+        try testing.expectEqualStrings("jq", rep.backends[0].drift.missing[1].row.name);
+        try testing.expect(!rep.clean());
+    }
+}
+
+test "fromManifest: a present that fails breaks the backend as a failed list does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var f: test_backend.Fake = .{ .name = "fake", .present_answer = error.Timeout };
+    const m: manifest_mod.Manifest = .{ .packages = &.{rowOf("bat", "fake")}, .files = 1 };
+    const seen: Seen = .{ .records = &.{.{ .backend = "fake", .ids = &.{"bat"} }} };
+
+    var d: Diag = .{};
+    const rep = try fromManifest(a, m, .{ .backends = &.{f.backend()} }, &r, &.{}, .judge, seen, &d);
+    try testing.expectEqual(@as(usize, 1), f.present_calls);
+    try testing.expectEqual(@as(usize, 0), rep.backends.len);
+    try testing.expectEqual(@as(usize, 1), rep.broken.len);
+    try testing.expectEqualStrings("fake", rep.broken[0].backend);
+    try testing.expectEqualStrings("present", rep.broken[0].probe);
+    try testing.expect(d.capture() != null);
+    try testing.expect(!rep.clean());
+}
+
+test "fromManifest: present is not asked when no seen row is missing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    // ripgrep is seen and installed; fd is missing but was never seen.
+    var f: test_backend.Fake = .{ .name = "fake", .installed = &.{"ripgrep"}, .present_answer = error.Unreached };
+    const m: manifest_mod.Manifest = .{ .packages = &.{ rowOf("ripgrep", "fake"), rowOf("fd", "fake") }, .files = 1 };
+    const seen: Seen = .{ .records = &.{.{ .backend = "fake", .ids = &.{"ripgrep"} }} };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{f.backend()} }, &r, &.{}, .judge, seen, null);
+    try testing.expectEqual(@as(usize, 0), f.present_calls);
+    try testing.expectEqual(@as(usize, 1), rep.missingCount());
+    try testing.expectEqual(@as(usize, 0), rep.broken.len);
+}
+
+test "fromManifest: a usable backend carries its explicit, desired and declared ids" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var bindings = std.StringHashMap([]const u8).init(a);
+    try bindings.put("os", "linux");
+    const r: Resolver = .{ .live = &.{ .bindings = &bindings } };
+
+    var f: test_backend.Fake = .{ .name = "fake", .installed = &.{ "ripgrep", "htop" } };
+    const bl: manifest_mod.BlacklistRow = .{
+        .name = "usage",
+        .backend = "fake",
+        .origin = "/tmp/x.toml",
+        .label = "data/packages/a.toml",
+        .index = 0,
+    };
+    // `mac-only` is gated out here but declared all the same; `usage` is
+    // blacklisted, which declares nothing to keep.
+    const m: manifest_mod.Manifest = .{
+        .packages = &.{ rowOf("ripgrep", "fake"), gatedRowOf("mac-only", "fake", "os=darwin"), rowOf("fd", "fake") },
+        .blacklist = &.{bl},
+        .files = 1,
+    };
+
+    const rep = try fromManifest(a, m, .{ .backends = &.{f.backend()} }, &r, &.{}, .judge, .none, null);
+    const bd = rep.backends[0];
+    try testing.expectEqual(@as(usize, 2), bd.explicit.len);
+    try testing.expectEqualStrings("ripgrep", bd.explicit[0]);
+    try testing.expectEqualStrings("htop", bd.explicit[1]);
+    try testing.expectEqual(@as(usize, 2), bd.desired_ids.len);
+    try testing.expectEqualStrings("ripgrep", bd.desired_ids[0]);
+    try testing.expectEqualStrings("fd", bd.desired_ids[1]);
+    try testing.expectEqual(@as(usize, 3), bd.declared_ids.len);
+    try testing.expectEqualStrings("ripgrep", bd.declared_ids[0]);
+    try testing.expectEqualStrings("mac-only", bd.declared_ids[1]);
+    try testing.expectEqualStrings("fd", bd.declared_ids[2]);
 }

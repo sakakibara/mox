@@ -1003,7 +1003,7 @@ fn reconcilePackages(
     };
     for (pkg_backends.notes) |note| try ctx.out.print("  note       {s}\n", .{note});
 
-    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, .reconcile, &diag) catch |e| switch (e) {
+    const rep = mox.packages.report.fromManifest(ctx.alloc, m, registry, bindings, &.{}, .reconcile, .none, &diag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => {
             if (diag.capture()) |cap| {
