@@ -63,7 +63,7 @@ fn emitBaseLine(em: *Emitter, arena: std.mem.Allocator, line: []const u8, line_n
     const origin: Origin = if (line_has_secret or line_has_placeholder)
         .secret
     else if (machine_present and !std.mem.eql(u8, interpolated, line))
-        .{ .interpolated = .{ .origin_line = line_no } }
+        .{ .interpolated = .{ .origin_line = line_no, .multi_line = std.mem.indexOfScalar(u8, interpolated, '\n') != null } }
     else
         .{ .base = .{ .line = line_no } };
     try em.markSince(start, origin);

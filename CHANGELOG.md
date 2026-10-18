@@ -4,6 +4,18 @@ All notable changes to mox are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `mox commit` routes an edited capture in a TOML, YAML or INI file to its
+  fact or default, as it does in a shell or text file; it reported the line
+  as "source no longer matches recorded provenance". A line inserted
+  directly before or after a line a capture rewrote, in any of those files,
+  routes into the source beside it instead of staying in the live file. A
+  line inside a value of several lines (a YAML block scalar, a TOML
+  multi-line string) is reported as manual rather than offered as a whole
+  value.
+
 ## [0.13.0] - 2026-10-19
 
 ### Added

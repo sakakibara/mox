@@ -615,26 +615,22 @@ fn interpolate(
     var enc = context.Encoder.init(context.kindFor(file.format, file.live_path, bytes), &out, secrets == null);
     var ectx = ctx;
     ectx.encoder = &enc;
-    var secret_seen = false;
-    var line_secret: std.ArrayList(bool) = .empty;
+    var lines_out: std.ArrayList(OutLine) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     var first = true;
-    while (lines.next()) |line| {
+    var src_line: u32 = 0;
+    while (lines.next()) |line| : (src_line += 1) {
         if (!first) try out.append(arena, '\n');
         first = false;
         const exp = try interp.expandTracked(arena, line, null, ectx);
-        if (exp.secret) secret_seen = true;
+        const kind: OutLine.Kind = if (exp.secret or exp.placeholder) .secret else if (!std.mem.eql(u8, exp.bytes, line)) .interpolated else .literal;
         // A value of several lines fills an output line for each of them.
-        try line_secret.appendNTimes(arena, exp.secret, std.mem.count(u8, exp.bytes, "\n") + 1);
+        try lines_out.append(arena, .{ .kind = kind, .src_line = src_line, .out_lines = @intCast(std.mem.count(u8, exp.bytes, "\n") + 1) });
         try out.appendSlice(arena, exp.bytes);
     }
     try interp.finishEncoder(arena, &enc, out.items, file.live_path, diag);
     const result = try out.toOwnedSlice(arena);
-    if (secret_seen) {
-        try recordPerLineSecret(arena, prov, result, file, false, line_secret.items, base_removed);
-    } else {
-        try recordWhole(arena, prov, result, file, false, base_removed);
-    }
+    try recordInterpolated(arena, prov, result, file, false, lines_out.items, base_removed);
     return result;
 }
 
@@ -747,6 +743,67 @@ fn recordPerLineSecret(
         const is_secret = i < line_secret.len and line_secret[i];
         try prov_mod.map.append(arena, p, i, 1, if (is_secret) .secret else nonSecretOrigin(file, merged, base_removed, i));
     }
+}
+
+/// One source line of an interpolated file: what interpolation did to it,
+/// which line of the composed source it is, and how many output lines it
+/// filled.
+const OutLine = struct {
+    kind: Kind,
+    src_line: u32,
+    out_lines: u32 = 1,
+    const Kind = enum { literal, interpolated, secret };
+};
+
+/// Attribute an interpolated file per source line: a line that resolved a
+/// secret (or holds its placeholder) is `.secret`; one interpolation rewrote
+/// is `.interpolated` at its source line, so commit can route an edit of it
+/// to the fact or default that produced it, and one whose value filled
+/// several output lines is a single `multi_line` segment, which routes no
+/// edit; the rest keep the file's `nonSecretOrigin` at their source line.
+fn recordInterpolated(
+    arena: std.mem.Allocator,
+    prov: ?*std.ArrayList(Segment),
+    bytes: []const u8,
+    file: ManagedFile,
+    merged: bool,
+    lines_out: []const OutLine,
+    base_removed: []const u32,
+) !void {
+    const p = prov orelse return;
+    const n = prov_mod.map.lineCount(bytes);
+    if (!routesByLine(file, merged)) {
+        var secret_lines: std.ArrayList(bool) = .empty;
+        var any_secret = false;
+        for (lines_out) |ol| {
+            any_secret = any_secret or ol.kind == .secret;
+            try secret_lines.appendNTimes(arena, ol.kind == .secret, ol.out_lines);
+        }
+        return if (any_secret)
+            recordPerLineSecret(arena, prov, bytes, file, merged, secret_lines.items, base_removed)
+        else
+            recordWhole(arena, prov, bytes, file, merged, base_removed);
+    }
+    var out_line: u32 = 0;
+    for (lines_out) |ol| {
+        if (out_line >= n) break;
+        const len = @min(ol.out_lines, n - out_line);
+        switch (ol.kind) {
+            .secret => try prov_mod.map.append(arena, p, out_line, len, .secret),
+            .interpolated => try prov_mod.map.append(arena, p, out_line, len, .{ .interpolated = .{
+                .origin_line = source.head.sourceLine(base_removed, ol.src_line + 1),
+                .multi_line = len > 1,
+            } }),
+            .literal => try appendEach(arena, p, out_line, len, nonSecretOrigin(file, merged, base_removed, ol.src_line)),
+        }
+        out_line += len;
+    }
+    if (out_line < n) try appendEach(arena, p, out_line, n - out_line, nonSecretOrigin(file, merged, base_removed, out_line));
+}
+
+fn appendEach(arena: std.mem.Allocator, p: *std.ArrayList(Segment), start: u32, len: u32, origin: prov_mod.map.Origin) !void {
+    var i: u32 = 0;
+    while (i < len) : (i += 1) try prov_mod.map.append(arena, p, start + i, 1, origin);
 }
 
 /// Returns the absolute paths of all layers that match `bindings`, sorted

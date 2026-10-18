@@ -46,7 +46,10 @@ pub const Origin = union(enum) {
     secret,
     /// A base line whose text was changed by `<machine.X>` interpolation:
     /// never routed (would bake the expanded value back into source).
-    interpolated: struct { origin_line: u32 },
+    /// `multi_line`: the segment is one source line whose value filled
+    /// several output lines; it is never coalesced, and a line inside it
+    /// stands for no source line of its own.
+    interpolated: struct { origin_line: u32, multi_line: bool = false },
     /// Private-layer fragment. Routes ONLY to the private layer file at `path`.
     private: struct { path: []const u8, line: u32 },
 };
@@ -107,7 +110,8 @@ pub fn append(arena: std.mem.Allocator, list: *std.ArrayList(Segment), line: u32
                     last.out_len += n;
                     return;
                 },
-                .interpolated => |o| if (last.origin == .interpolated and
+                .interpolated => |o| if (last.origin == .interpolated and !o.multi_line and
+                    !last.origin.interpolated.multi_line and
                     last.origin.interpolated.origin_line + last.out_len == o.origin_line)
                 {
                     last.out_len += n;
@@ -229,6 +233,7 @@ fn segmentToJson(arena: std.mem.Allocator, seg: Segment) !json.Value {
         .interpolated => |o| {
             try origin.put(arena, "kind", .{ .string = "interpolated" });
             try origin.put(arena, "origin_line", .{ .integer = o.origin_line });
+            if (o.multi_line) try origin.put(arena, "multi_line", .{ .bool = true });
         },
         .private => |o| {
             try origin.put(arena, "kind", .{ .string = "private" });
@@ -300,7 +305,10 @@ fn segmentFromJson(arena: std.mem.Allocator, sv: json.Value) ParseError!Segment 
     else if (std.mem.eql(u8, kind, "secret"))
         .secret
     else if (std.mem.eql(u8, kind, "interpolated"))
-        .{ .interpolated = .{ .origin_line = @intCast(intOf(ov.get("origin_line")) orelse return error.InvalidProvenance) } }
+        .{ .interpolated = .{
+            .origin_line = @intCast(intOf(ov.get("origin_line")) orelse return error.InvalidProvenance),
+            .multi_line = if (ov.get("multi_line")) |m| m == .bool and m.bool else false,
+        } }
     else if (std.mem.eql(u8, kind, "private"))
         .{ .private = .{
             .path = try arena.dupe(u8, stringOf(ov.get("path")) orelse return error.InvalidProvenance),
@@ -438,4 +446,25 @@ test "serialize/deserialize: a secret outline round-trips, and a map with secret
     try testing.expectEqualStrings(" # c", back[1].shape.pieces[1]);
     try testing.expect((try deserialize(a, try serialize(a, "/h/f", &segs, null))).secretOutline() == null);
     try testing.expectEqual(@as(usize, 0), (try deserialize(a, try serialize(a, "/h/f", segs[0..1], null))).secretOutline().?.len);
+}
+
+test "provenance: a multi-line interpolated segment keeps its flag through serialization, and older data reads as single-line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const segs = [_]Segment{
+        .{ .out_start = 0, .out_len = 2, .origin = .{ .interpolated = .{ .origin_line = 3, .multi_line = true } } },
+        .{ .out_start = 2, .out_len = 1, .origin = .{ .interpolated = .{ .origin_line = 4 } } },
+    };
+    const bytes = try serialize(a, "/h/f", &segs, null);
+    const back = (try deserialize(a, bytes)).segments;
+    try std.testing.expect(back[0].origin.interpolated.multi_line);
+    try std.testing.expect(!back[1].origin.interpolated.multi_line);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "multi_line") != null);
+
+    var list: std.ArrayList(Segment) = .empty;
+    try append(a, &list, 0, 1, .{ .interpolated = .{ .origin_line = 1 } });
+    try append(a, &list, 1, 2, .{ .interpolated = .{ .origin_line = 2, .multi_line = true } });
+    try append(a, &list, 3, 1, .{ .interpolated = .{ .origin_line = 3 } });
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
 }

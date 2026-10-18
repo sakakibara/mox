@@ -316,6 +316,58 @@ test "commit: an insertion after an interpolated fragment line routes into the f
     );
 }
 
+test "commit: a line inside a YAML value of several lines is manual, and an insertion after the value routes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/app/config.yaml", "s: |\n  <machine.blk>\nt: 1\n");
+    try writeRepo(io, &tmp, "home/.config/mox/facts.toml", "blk = \"l1\\nl2\"\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+    const live = try h.liveOf(".config/app/config.yaml");
+    try std.testing.expectEqualStrings("s: |\n  l1\n  l2\nt: 1\n", try read(io, a, live));
+
+    try editLive(io, a, live, "  l2", "  l3");
+    const edit = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expect(std.mem.indexOf(u8, edit.out, "came from a capture value of several lines") != null);
+    try editLive(io, a, live, "  l3", "  l2");
+
+    try editLive(io, a, live, "  l2", "  X\n  l2");
+    const inside = try h.run(&.{ "mox", "commit", "--dry-run", "--color=never" });
+    try std.testing.expect(std.mem.indexOf(u8, inside.out, "came from a capture value of several lines") != null);
+    try editLive(io, a, live, "  X\n  l2", "  l2");
+
+    try editLive(io, a, live, "t: 1", "u: 2\nt: 1");
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "commit", "--yes" })).rc);
+    try std.testing.expectEqualStrings("s: |\n  <machine.blk>\nu: 2\nt: 1\n", try read(io, a, try h.srcOf(".config/app/config.yaml")));
+}
+
+test "commit: an insertion after an interpolated line of a shell base routes into it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.zshrc", "export A=1\nexport P=<machine.profile | default \"work\">\nexport B=2\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".zshrc");
+    try editLive(io, a, live, "export B=2", "export C=3\nexport B=2");
+
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "commit", "--yes" })).rc);
+    try std.testing.expectEqualStrings(
+        "export A=1\nexport P=<machine.profile | default \"work\">\nexport C=3\nexport B=2\n",
+        try read(io, a, try h.srcOf(".zshrc")),
+    );
+}
+
 test "commit: an insertion after an interpolated line of a structured base routes into it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2908,6 +2960,50 @@ test "commit: an edited fact value that compose escaped for its context is saved
     const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
     try std.testing.expect(std.mem.indexOf(u8, facts, "greeting = \"say \\\"bye\\\" $5\"") != null);
     try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: an edited capture in a YAML file routes to its fact" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/app/config.yaml", "a: 1\ndir: <machine.tooldir | default \"opt\">\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".config/app/config.yaml");
+    try editLive(io, a, live, "dir: opt", "dir: /usr/local/tools");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "f\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    const facts = try read(io, a, try h.homePath(".config/mox/facts.toml"));
+    try std.testing.expect(std.mem.indexOf(u8, facts, "tooldir = \"/usr/local/tools\"") != null);
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "status" })).rc);
+}
+
+test "commit: a YAML plain value whose scalar would not read back as a string is offered only as the source default" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try writeRepo(io, &tmp, "repo/src/.config/app/config.yaml", "a: 1\ndir: <machine.tooldir | default \"opt\">\n");
+    const h = try setup(a, io, &tmp, .{});
+    try std.testing.expectEqual(@as(u8, 0), (try h.run(&.{ "mox", "apply" })).rc);
+
+    const live = try h.liveOf(".config/app/config.yaml");
+    try editLive(io, a, live, "dir: opt", "dir: yes");
+
+    const res = try h.runWithInput(&.{ "mox", "commit", "--color=never" }, "d\n");
+    try std.testing.expectEqual(@as(u8, 0), res.rc);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "As written, it can only be the source default.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.out, "[f]") == null);
+    try std.testing.expect(!exists(io, try h.homePath(".config/mox/facts.toml")));
 }
 
 test "commit: an edited value no fact can produce in its context is offered only as the source default" {

@@ -7109,6 +7109,21 @@ fn routeHunk(cc: *const ClassCtx, lf: *LoopFile, hunk: Hunk) !Route {
         .loop => return loopRoute(cc, lf, seg, hunk),
         .secret => return .{ .manual = "came from a secret" },
         .interpolated => |o| {
+            // A value of several lines stands for one source line: nothing
+            // inside it maps to a line of its own.
+            if (o.multi_line) {
+                const at_edge = hunk.a_len == 0 and (hunk.a_start == seg.out_start or hunk.a_start == seg.out_start + seg.out_len);
+                if (!at_edge) return .{ .manual = "came from a capture value of several lines" };
+            }
+            // An insertion beside an interpolated line is template text, not
+            // a value: it routes into the base source as beside a literal
+            // line, its neighbours matched against their capture frames.
+            if (hunk.a_len == 0) {
+                const start = if (o.multi_line and hunk.a_start > seg.out_start) o.origin_line else (o.origin_line - 1) + (hunk.a_start - seg.out_start);
+                if (!try sourceStillHolds(arena, io, file.source_base_abs, seg, hunk, a_lines, start))
+                    return .{ .manual = "source no longer matches recorded provenance" };
+                return lineRoute(arena, file.source_base_abs, file.source_base_path, start, 0, new_lines, true, mox.source.path.isUnderDir(file.source_base_abs, file.private_dir));
+            }
             if (hunk.a_len != 1 or hunk.b_len != 1)
                 return .{ .manual = "came from a capture" };
             const start = (o.origin_line - 1) + (hunk.a_start - seg.out_start);
