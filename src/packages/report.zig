@@ -6,9 +6,9 @@
 //!
 //! What the machine was seen holding comes in from the caller as `Seen`:
 //! reading and writing the record is the caller's, since only it knows
-//! which backends it bootstrapped and whether the machine's identity could
-//! be read. The report only asks the manager whether a lost package is on
-//! the machine in any form, and classifies.
+//! which backends' installers it ran and whether the machine's identity
+//! could be read. The report only asks the manager whether a lost package
+//! is on the machine in any form, and classifies.
 //!
 //! A repo with no `data/packages/` is not using the subsystem, and
 //! `fromManifest` says so rather than reporting every installed package as
@@ -68,8 +68,8 @@ pub const BackendDrift = struct {
 /// The records in effect for a report: per backend, the ids this machine was
 /// seen holding through it (`seen.zig`). A backend with no entry has no
 /// record in effect, and every desired row it has not installed is missing.
-/// The caller leaves out a backend it bootstrapped in this run and one with
-/// no record of this machine's.
+/// The caller leaves out a backend whose installer it ran in this run,
+/// whatever came of it, and one with no record of this machine's.
 ///
 /// A backend whose record is there but cannot be used is `blocked` instead:
 /// treating it as having none would install again what the record says
@@ -214,15 +214,22 @@ fn noteBrokenWhy(
     verb: []const u8,
     why: []const u8,
 ) !void {
+    // A record's why names the record and its fault; "record failed"
+    // before it would say neither.
+    const record = std.mem.eql(u8, verb, "record");
     if (!actedOn(m, name)) {
-        try notes.append(arena, try std.fmt.allocPrint(
+        try notes.append(arena, if (record) try std.fmt.allocPrint(
+            arena,
+            "{s}: {s}; no row asks it to install anything, so nothing here needs it",
+            .{ name, why },
+        ) else try std.fmt.allocPrint(
             arena,
             "{s}: {s} failed: {s}; no row asks it to install anything, so nothing here needs it",
             .{ name, verb, why },
         ));
         return;
     }
-    if (diag) |d| d.set("{s}: {s} failed: {s}", .{ name, verb, why });
+    if (diag) |d| if (record) d.set("{s}: {s}: {s}", .{ name, verb, why }) else d.set("{s}: {s} failed: {s}", .{ name, verb, why });
     try broken.append(arena, .{
         .backend = name,
         .probe = verb,
@@ -1127,7 +1134,7 @@ test "fromManifest: a blocked record breaks its backend on the record, asking it
     var f: test_backend.Fake = .{ .name = "fake", .present_answer = error.Unreached };
     var other: test_backend.Fake = .{ .name = "other" };
     const m: manifest_mod.Manifest = .{ .packages = &.{ rowOf("bat", "fake"), rowOf("jq", "other") }, .files = 1 };
-    const seen: Seen = .{ .blocked = &.{.{ .backend = "fake", .why = "it was written by a newer mox; upgrade mox" }} };
+    const seen: Seen = .{ .blocked = &.{.{ .backend = "fake", .why = "/s/seen/fake-0.txt was written by a newer mox; upgrade mox" }} };
 
     var d: Diag = .{};
     const rep = try fromManifest(a, m, .{ .backends = &.{ f.backend(), other.backend() } }, &r, &.{}, .judge, seen, &d);
@@ -1136,11 +1143,23 @@ test "fromManifest: a blocked record breaks its backend on the record, asking it
     try testing.expectEqualStrings("fake", rep.broken[0].backend);
     try testing.expectEqualStrings("record", rep.broken[0].probe);
     try testing.expect(rep.broken[0].code == null);
-    try testing.expectEqualStrings("it was written by a newer mox; upgrade mox", rep.broken[0].why);
+    try testing.expectEqualStrings("/s/seen/fake-0.txt was written by a newer mox; upgrade mox", rep.broken[0].why);
     try testing.expectEqual(@as(usize, 1), rep.backends.len);
     try testing.expectEqualStrings("other", rep.backends[0].backend);
     try testing.expectEqual(@as(usize, 1), rep.missingCount());
     try testing.expect(!rep.clean());
+    try testing.expectEqualStrings("fake: record: /s/seen/fake-0.txt was written by a newer mox; upgrade mox", d.capture().?);
+
+    // No row asks it for anything: a note, naming the record's fault alone.
+    var idle: test_backend.Fake = .{ .name = "fake", .present_answer = error.Unreached };
+    const m3: manifest_mod.Manifest = .{ .packages = &.{rowOf("jq", "other")}, .files = 1 };
+    const rep3 = try fromManifest(a, m3, .{ .backends = &.{ idle.backend(), other.backend() } }, &r, &.{}, .judge, seen, null);
+    try testing.expectEqual(@as(usize, 0), rep3.broken.len);
+    try testing.expectEqual(@as(usize, 1), rep3.notes.len);
+    try testing.expectEqualStrings(
+        "fake: /s/seen/fake-0.txt was written by a newer mox; upgrade mox; no row asks it to install anything, so nothing here needs it",
+        rep3.notes[0],
+    );
 
     // A manager with no present keeps no record, so nothing blocks it.
     var unaskable: test_backend.Fake = .{ .name = "fake", .tells_present = false };

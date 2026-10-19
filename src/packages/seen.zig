@@ -46,10 +46,17 @@ pub const Identity = union(enum) {
     /// The identity; empty where the OS has none, which is as stable as
     /// one, so a container without a machine-id keeps its record.
     known: []const u8,
-    /// The source exists but could not be read: why. No record is in effect
-    /// and none is written, since an owner guessed here could name another
+    /// The source exists but could not be read. No record is in effect and
+    /// none is written, since an owner guessed here could name another
     /// machine's record.
-    failed: []const u8,
+    failed: Failed,
+
+    pub const Failed = struct {
+        /// Why the read failed.
+        why: []const u8,
+        /// What to make readable for it to succeed.
+        source: []const u8,
+    };
 };
 
 /// The owner a record of `identity` is filed under: the first `owner_len`
@@ -86,7 +93,7 @@ pub fn linuxIdentity(arena: std.mem.Allocator, io: Io, paths: []const []const u8
         const bytes = Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(4096)) catch |e| switch (e) {
             error.FileNotFound => continue,
             error.OutOfMemory => return e,
-            else => return .{ .failed = try std.fmt.allocPrint(arena, "{s} could not be read ({s})", .{ p, @errorName(e) }) },
+            else => return .{ .failed = .{ .why = try std.fmt.allocPrint(arena, "{s} could not be read ({s})", .{ p, @errorName(e) }), .source = p } },
         };
         const id = std.mem.trim(u8, bytes, " \t\r\n");
         if (id.len == 0 or std.mem.eql(u8, id, "uninitialized")) continue;
@@ -103,7 +110,7 @@ pub const ioreg_argv = [_][]const u8{ "/usr/sbin/ioreg", "-rd1", "-c", "IOPlatfo
 pub fn macIdentity(arena: std.mem.Allocator, runner: exec.Runner) !Identity {
     const res = switch (try query(arena, runner, &ioreg_argv)) {
         .out => |out| out,
-        .failed => |why| return .{ .failed = why },
+        .failed => |why| return .{ .failed = .{ .why = why, .source = ioreg_argv[0] } },
     };
     var it = std.mem.splitScalar(u8, res, '\n');
     while (it.next()) |line| {
@@ -114,7 +121,7 @@ pub fn macIdentity(arena: std.mem.Allocator, runner: exec.Runner) !Identity {
         if (value.len < 3 or value[0] != '"' or value[value.len - 1] != '"') continue;
         return .{ .known = value[1 .. value.len - 1] };
     }
-    return .{ .failed = try std.fmt.allocPrint(arena, "{s} reported no IOPlatformUUID", .{ioreg_argv[0]}) };
+    return .{ .failed = .{ .why = try std.fmt.allocPrint(arena, "{s} reported no IOPlatformUUID", .{ioreg_argv[0]}), .source = ioreg_argv[0] } };
 }
 
 /// `MachineGuid` as reg.exe reports it, reg.exe named under `SystemRoot`
@@ -125,12 +132,13 @@ pub fn windowsIdentity(arena: std.mem.Allocator, runner: exec.Runner, env: ?*con
         const m = env orelse break :blk "";
         break :blk std.mem.trim(u8, m.get("SystemRoot") orelse "", " \t\r\n");
     };
-    if (root.len == 0) return .{ .failed = "SystemRoot is not set, so reg.exe cannot be found" };
+    if (root.len == 0) return .{ .failed = .{ .why = "SystemRoot is not set, so reg.exe cannot be found", .source = "SystemRoot" } };
     const reg = try std.fmt.allocPrint(arena, "{s}\\System32\\reg.exe", .{std.mem.trimEnd(u8, root, "\\")});
     const argv = [_][]const u8{ reg, "query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid" };
+    const source = try std.fmt.allocPrint(arena, "{s} MachineGuid", .{reg});
     const res = switch (try query(arena, runner, &argv)) {
         .out => |out| out,
-        .failed => |why| return .{ .failed = why },
+        .failed => |why| return .{ .failed = .{ .why = why, .source = source } },
     };
     var it = std.mem.splitScalar(u8, res, '\n');
     while (it.next()) |line| {
@@ -142,7 +150,7 @@ pub fn windowsIdentity(arena: std.mem.Allocator, runner: exec.Runner, env: ?*con
         const value = words.next() orelse continue;
         return .{ .known = value };
     }
-    return .{ .failed = try std.fmt.allocPrint(arena, "{s} reported no MachineGuid", .{reg}) };
+    return .{ .failed = .{ .why = try std.fmt.allocPrint(arena, "{s} reported no MachineGuid", .{reg}), .source = source } };
 }
 
 const Query = union(enum) {
@@ -306,7 +314,7 @@ pub const Machine = struct {
         const got = self.got orelse return null;
         if (got != .failed or self.noted) return null;
         self.noted = true;
-        return try std.fmt.allocPrint(self.arena, "this machine's identity could not be read ({s}), so no record of the packages it held is used or written", .{got.failed});
+        return try std.fmt.allocPrint(self.arena, "this machine's identity could not be read ({s}), so no record of the packages it held is used or written", .{got.failed.why});
     }
 };
 
@@ -335,7 +343,7 @@ pub const Loaded = struct {
 
 /// Read the record of every backend in `backends` that answers `present`,
 /// and put in effect each that holds ids and is not in `exclude` (the
-/// backends this run bootstrapped, whose record starts afresh). The
+/// backends whose installer this run ran, whose record starts afresh). The
 /// identity is read only when the records directory holds a file for one of
 /// them: with none there, every record is absent whoever the machine is.
 ///
@@ -374,8 +382,8 @@ pub fn load(
             try states.append(arena, .{ .backend = b.name, .writable = false });
             if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
                 arena,
-                "this machine's identity could not be read ({s}), so which record under {s} is its own cannot be told",
-                .{ machine.got.?.failed, try std.fs.path.join(arena, &.{ state_dir, dir_name }) },
+                "this machine's identity could not be read ({s}), so which record under {s} is its own cannot be told; make {s} readable",
+                .{ machine.got.?.failed.why, try std.fs.path.join(arena, &.{ state_dir, dir_name }), machine.got.?.failed.source },
             ) });
             continue;
         };
@@ -385,8 +393,8 @@ pub fn load(
             try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
             if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
                 arena,
-                "its record of the packages this machine held ({s}) could not be read: {s}",
-                .{ p, exec.errorText(e) },
+                "{s} could not be read ({s}); make it readable",
+                .{ p, @errorName(e) },
             ) });
             continue;
         };
@@ -400,15 +408,15 @@ pub fn load(
                 try states.append(arena, .{ .backend = b.name, .writable = excluded, .exists = true });
                 if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
                     arena,
-                    "its record of the packages this machine held ({s}) is unusable: {s}; remove {s} to start the record afresh",
-                    .{ p, why, p },
+                    "{s} is not a record mox can read ({s}); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost",
+                    .{ p, why },
                 ) });
             },
             .newer => {
                 try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
                 if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
                     arena,
-                    "its record of the packages this machine held ({s}) was written by a newer mox; upgrade mox",
+                    "{s} was written by a newer mox; upgrade mox",
                     .{p},
                 ) });
             },
@@ -665,7 +673,8 @@ test "linuxIdentity: a machine-id that is there but cannot be read is a failed r
     try tmp.dir.createDirPath(io, "machine-id");
     const etc = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "machine-id" });
     const got = try linuxIdentity(a, io, &.{etc});
-    try testing.expect(std.mem.indexOf(u8, got.failed, "could not be read") != null);
+    try testing.expect(std.mem.indexOf(u8, got.failed.why, "could not be read") != null);
+    try testing.expectEqualStrings(etc, got.failed.source);
 }
 
 const ioreg_line = "/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice";
@@ -700,7 +709,8 @@ test "macIdentity: a spawn failure, a timeout, a nonzero exit or an answer witho
         var fake: exec.Fake = .{ .arena = a, .entries = &.{c} };
         const got = try macIdentity(a, fake.runner());
         try testing.expect(got == .failed);
-        try testing.expect(std.mem.startsWith(u8, got.failed, "/usr/sbin/ioreg"));
+        try testing.expect(std.mem.startsWith(u8, got.failed.why, "/usr/sbin/ioreg"));
+        try testing.expectEqualStrings("/usr/sbin/ioreg", got.failed.source);
     }
 }
 
@@ -730,7 +740,7 @@ test "windowsIdentity: no SystemRoot, a spawn failure, a timeout, a nonzero exit
     {
         var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
         var env = try windowsEnv(a, null);
-        try testing.expect(try windowsIdentity(a, fake.runner(), &env) == .failed);
+        try testing.expectEqualStrings("SystemRoot", (try windowsIdentity(a, fake.runner(), &env)).failed.source);
         try testing.expect(try windowsIdentity(a, fake.runner(), null) == .failed);
         try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
     }
@@ -746,7 +756,8 @@ test "windowsIdentity: no SystemRoot, a spawn failure, a timeout, a nonzero exit
         var env = try windowsEnv(a, "C:\\Windows");
         const got = try windowsIdentity(a, fake.runner(), &env);
         try testing.expect(got == .failed);
-        try testing.expect(std.mem.startsWith(u8, got.failed, "C:\\Windows\\System32\\reg.exe"));
+        try testing.expect(std.mem.startsWith(u8, got.failed.why, "C:\\Windows\\System32\\reg.exe"));
+        try testing.expectEqualStrings("C:\\Windows\\System32\\reg.exe MachineGuid", got.failed.source);
     }
 }
 
@@ -765,7 +776,7 @@ test "load: with no record on disk the identity is never read, and every backend
     const state = try tmpState(a, &tmp);
     var brew: test_backend.Fake = .{ .name = "brew" };
     var plug: test_backend.Fake = .{ .name = "plug", .tells_present = false };
-    var machine = testMachine(a, .{ .failed = "unreadable" });
+    var machine = testMachine(a, .{ .failed = .{ .why = "unreadable", .source = "/etc/machine-id" } });
 
     const got = try load(a, testing.io, state, &machine, &.{ brew.backend(), plug.backend() }, &.{});
     try testing.expect(machine.got == null);
@@ -816,18 +827,21 @@ test "load: a failed identity read blocks each backend with a record file, of an
     var apt: test_backend.Fake = .{ .name = "apt" };
     try replace(a, io, state, "brew", &ownerOf("machine-a"), &.{"ripgrep"});
 
-    var machine = testMachine(a, .{ .failed = "ioreg exited 1" });
+    var machine = testMachine(a, .{ .failed = .{ .why = "ioreg exited 1", .source = "/usr/sbin/ioreg" } });
     const got = try load(a, io, state, &machine, &.{ brew.backend(), apt.backend() }, &.{});
     try testing.expectEqual(@as(usize, 0), got.seen.records.len);
     try testing.expectEqual(@as(usize, 1), got.seen.blocked.len);
     const why = got.seen.blockedOf("brew").?;
-    try testing.expect(std.mem.startsWith(u8, why, "this machine's identity could not be read (ioreg exited 1)"));
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "this machine's identity could not be read (ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg readable", .{try std.fs.path.join(a, &.{ state, dir_name })}),
+        why,
+    );
     try testing.expect(got.seen.blockedOf("apt") == null);
     try testing.expect(!got.stateOf("brew").?.writable);
     try testing.expect(!got.stateOf("apt").?.writable);
 
-    // A backend this run bootstrapped is never blocked.
-    var again = testMachine(a, .{ .failed = "ioreg exited 1" });
+    // A backend whose installer this run ran is never blocked.
+    var again = testMachine(a, .{ .failed = .{ .why = "ioreg exited 1", .source = "/usr/sbin/ioreg" } });
     const excluded = try load(a, io, state, &again, &.{ brew.backend(), apt.backend() }, &.{"brew"});
     try testing.expectEqual(@as(usize, 0), excluded.seen.blocked.len);
     try testing.expect(!excluded.stateOf("brew").?.writable);
@@ -858,18 +872,20 @@ test "load: an unusable, a newer and an unreadable record each block their backe
     try testing.expectEqual(@as(usize, 0), got.seen.records.len);
     try testing.expectEqual(@as(usize, 3), got.seen.blocked.len);
     try testing.expectEqualStrings(
-        try std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) is unusable: line 2 is not a package id; remove {s} to start the record afresh", .{ brew_path, brew_path }),
+        try std.fmt.allocPrint(a, "{s} is not a record mox can read (line 2 is not a package id); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{brew_path}),
         got.seen.blockedOf("brew").?,
     );
     try testing.expectEqualStrings(
-        try std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) was written by a newer mox; upgrade mox", .{apt_path}),
+        try std.fmt.allocPrint(a, "{s} was written by a newer mox; upgrade mox", .{apt_path}),
         got.seen.blockedOf("apt").?,
     );
-    try testing.expect(std.mem.startsWith(u8, got.seen.blockedOf("dnf").?, try std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) could not be read: ", .{dnf_path})));
+    const dnf_why = got.seen.blockedOf("dnf").?;
+    try testing.expect(std.mem.startsWith(u8, dnf_why, try std.fmt.allocPrint(a, "{s} could not be read (", .{dnf_path})));
+    try testing.expect(std.mem.endsWith(u8, dnf_why, "); make it readable"));
     for ([_][]const u8{ "brew", "apt", "dnf" }) |n| try testing.expect(!got.stateOf(n).?.writable);
 
-    // Bootstrapped in this run, an unusable record is written over afresh;
-    // a newer or unreadable one is still never written.
+    // With its installer run this run, an unusable record is written over
+    // afresh; a newer or unreadable one is still never written.
     var again = testMachine(a, .{ .known = "machine-a" });
     const excluded = try load(a, io, state, &again, &.{ brew.backend(), apt.backend(), dnf.backend() }, &.{ "brew", "apt", "dnf" });
     try testing.expectEqual(@as(usize, 0), excluded.seen.blocked.len);

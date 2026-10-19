@@ -5461,7 +5461,7 @@ test "apply: an identity that cannot be read writes no record, saying so once; w
         \\name = "ripgrep"
         \\
     );
-    mox.cli.app.identity_override = .{ .failed = "/usr/sbin/ioreg exited 1" };
+    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .source = "/usr/sbin/ioreg" } };
     defer mox.cli.app.identity_override = null;
     const fake = try brewWithRecorded(a, "ripgrep\n", "ripgrep\n", "fd\nripgrep\n", "", &.{
         .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
@@ -5486,7 +5486,7 @@ test "apply: an identity that cannot be read writes no record, saying so once; w
     const r2 = try h.run(&.{ "mox", "apply" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r2.out, r2.err });
     try std.testing.expectEqual(@as(u8, 2), r2.rc);
-    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
+    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg readable", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
     try std.testing.expect(std.mem.indexOf(u8, r2.err, try std.fmt.allocPrint(a, "mox apply: brew: record: {s}; its packages were left alone\n", .{why})) != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.out, note) == null);
     for (second.calls.items) |c| try std.testing.expect(!std.mem.startsWith(u8, c, "env HOMEBREW_NO_ASK=1 brew install"));
@@ -5934,11 +5934,11 @@ test "status: an identity that cannot be read, with a record file there, shows t
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
     try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
     const before = try seenBytes(h, "brew", testutil.test_identity);
-    mox.cli.app.identity_override = .{ .failed = "/usr/sbin/ioreg exited 1" };
+    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .source = "/usr/sbin/ioreg" } };
     defer mox.cli.app.identity_override = null;
     useFake(try brewWith(a, "", "", &.{}));
     defer mox.cli.app.package_runner_override = null;
-    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
+    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg readable", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
 
     const r = try h.run(&.{ "mox", "status" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
@@ -5964,15 +5964,15 @@ const BlockedRecord = struct {
 };
 
 fn newerWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) was written by a newer mox; upgrade mox", .{record});
+    return std.fmt.allocPrint(a, "{s} was written by a newer mox; upgrade mox", .{record});
 }
 
 fn unusableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) is unusable: its first line is not a record header; remove {s} to start the record afresh", .{ record, record });
+    return std.fmt.allocPrint(a, "{s} is not a record mox can read (its first line is not a record header); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{record});
 }
 
 fn unreadableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "its record of the packages this machine held ({s}) could not be read: ", .{record});
+    return std.fmt.allocPrint(a, "{s} could not be read (", .{record});
 }
 
 /// apply, status and commit with brew's record blocked as `case` lays it:
@@ -6018,8 +6018,15 @@ fn expectBlocked(case: BlockedRecord) !void {
     try expectPorcelain(p.out);
     try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}", .{why})) != null);
 
+    const j = try h.run(&.{ "mox", "status", "--json" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ j.out, j.err });
+    try std.testing.expectEqual(@as(u8, 1), j.rc);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, try std.fmt.allocPrint(a, "{{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":null,\"probe\":\"record\",\"why\":\"{s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, "\"missing\"") == null);
+
     const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ c.out, c.err });
+    try std.testing.expectEqual(@as(u8, 0), c.rc);
     try std.testing.expect(std.mem.indexOf(u8, c.out, try std.fmt.allocPrint(a, "  note       brew: record: {s}", .{why})) != null);
     try std.testing.expect(std.mem.indexOf(u8, c.out, "; nothing to reconcile for it\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, c.out, "untracked package:") == null);
