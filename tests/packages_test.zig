@@ -6400,7 +6400,7 @@ test "commit: r whose record write fails keeps the row's removal and warns, sayi
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but the record of the packages this machine held could not be updated: ") != null);
     const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
     try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "updated: {s} could not be written (", .{record})) != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "; until an apply rewrites the record, a row declaring it again reads as removed\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, ". Until the record is updated, a row declaring fd again reads as removed\n") != null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }
 
