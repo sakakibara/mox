@@ -729,7 +729,8 @@ or, when the identity cannot be read, the `seen/` directory:
 
 - a record whose first line is `mox-seen <N>`, N above 1, was written by a
   newer mox and is neither read nor replaced: upgrade mox;
-- a record that cannot be read: make it readable;
+- a record that cannot be read: make it readable when its permissions deny
+  the read, otherwise remove it or make it a readable file;
 - a record with any other first line, or a broken line after it, is not
   one mox can read: repair it, or remove it, after which the next apply
   installs every declared package this machine lacks, including ones it

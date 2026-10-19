@@ -437,7 +437,13 @@ pub fn newerWhy(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
 /// Why the record at `p`, whose read failed with `e`, cannot be used, and
 /// the fix.
 pub fn unreadableWhy(arena: std.mem.Allocator, p: []const u8, e: anyerror) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} could not be read ({s}); make it readable", .{ p, @errorName(e) });
+    // Only a denied read is fixed by permissions alone: a directory, say, is
+    // readable and still holds no record.
+    const fix = switch (e) {
+        error.AccessDenied, error.PermissionDenied => "make it readable",
+        else => "remove it or make it a readable file",
+    };
+    return std.fmt.allocPrint(arena, "{s} could not be read ({s}); {s}", .{ p, @errorName(e), fix });
 }
 
 /// Why the record at `p`, which `read` called unusable for `why`, cannot be
@@ -924,7 +930,13 @@ test "load: an unusable, a newer and an unreadable record each block their backe
     );
     const dnf_why = got.seen.blockedOf("dnf").?;
     try testing.expect(std.mem.startsWith(u8, dnf_why, try std.fmt.allocPrint(a, "{s} could not be read (", .{dnf_path})));
-    try testing.expect(std.mem.endsWith(u8, dnf_why, "); make it readable"));
+    // Windows may refuse a directory opened as a file as access denied.
+    if (std.mem.indexOf(u8, dnf_why, "(IsDir)") != null) {
+        try testing.expect(std.mem.endsWith(u8, dnf_why, "); remove it or make it a readable file"));
+    } else {
+        try testing.expect(builtin.os.tag == .windows);
+        try testing.expect(std.mem.endsWith(u8, dnf_why, "); make it readable"));
+    }
     for ([_][]const u8{ "brew", "apt", "dnf" }) |n| try testing.expect(!got.stateOf(n).?.writable);
 
     // With its installer run this run, an unusable record is written over
@@ -935,6 +947,32 @@ test "load: an unusable, a newer and an unreadable record each block their backe
     try testing.expect(excluded.stateOf("brew").?.writable);
     try testing.expect(!excluded.stateOf("apt").?.writable);
     try testing.expect(!excluded.stateOf("dnf").?.writable);
+}
+
+test "load: a record read denied by its permissions says to make it readable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    const owner = ownerOf("machine-a");
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    try replace(a, io, state, "brew", &owner, &.{"ripgrep"});
+    const brew_z = try a.dupeZ(u8, try path(a, state, "brew", &owner));
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(brew_z, 0o000));
+    defer _ = std.c.chmod(brew_z, 0o600);
+
+    var machine = testMachine(a, .{ .known = "machine-a" });
+    const got = try load(a, io, state, &machine, &.{brew.backend()}, &.{});
+    // Root reads it regardless.
+    if (got.seen.records.len != 0) return error.SkipZigTest;
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} could not be read (AccessDenied); make it readable", .{brew_z}),
+        got.seen.blockedOf("brew").?,
+    );
 }
 
 test "next: what was held and is still declared, plus what is desired and installed" {
