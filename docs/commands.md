@@ -34,13 +34,14 @@ each in the form mox writes it: the lock files (`mox.lock`, `readers.lock`,
 `triggers.txt` holding only trigger records; `mox-path` holding only blank
 lines and absolute paths; `zypper.txt` empty or holding distinct package
 ids, one per line; `seen/` holding only regular `*.txt` files, the record
-of what each machine was seen holding; `commit-recovery/` holding only
-run-id directories of commit's recovery copies (`repo/` and `private/`
-trees, `facts`, and `other/` files named by a number); a check hook's
-`check-<16 hex>` directory holding at most one regular file and its `.out`
-file; and the files a file browser leaves (`.DS_Store`, `Thumbs.db`,
-`desktop.ini`). mox creates the
-state directory, with the marker, when it first writes; a command that only
+of what each machine was seen holding, and the temporary file a write of
+one killed mid-way leaves (`<name>.txt.mox-tmp.<pid>.<n>`);
+`commit-recovery/` holding only run-id directories of commit's recovery
+copies (`repo/` and `private/` trees, `facts`, and `other/` files named by
+a number); a check hook's `check-<16 hex>` directory holding at most one
+regular file and its `.out` file; and the files a file browser leaves
+(`.DS_Store`, `Thumbs.db`, `desktop.ini`). mox creates the state
+directory, with the marker, when it first writes; a command that only
 reads an absent one finds an empty state and creates nothing. Any other
 directory is refused, exit 2, before anything in it is read or changed, with
 both ways out:
@@ -348,16 +349,18 @@ its row, keep it off this machine, or have the next apply install it. What
 each machine held is recorded per backend under the state directory
 (`seen/`) after each real apply that ran its package step: the desired
 packages verified installed, plus what it held before and some row still
-declares under any gate. A manager whose installer ran in the run, whether
-or not it then failed, starts that record afresh, and one whose bootstrap
-failed has its record left unwritten. A record that is there but cannot be
-used -- written by a newer mox, unreadable, unusable, or any record file
-for that manager when this machine's identity cannot be read -- makes that
-manager `BROKEN` for the run, naming the cause and the fix, and nothing is
-installed through it (exit 2); falling back to no record would install
-again what the record says this machine lost. With no record file, an
-identity that cannot be read only leaves the record unwritten, which a
-note says.
+declares under any gate. A manager whose installer ran in the run and is
+there afterwards starts that record afresh, even when the installer
+failed: the record then holds only what that manager verifiably holds. One
+still absent afterwards has its record left as it is. A record that is
+there but cannot be used -- written by a newer mox, unreadable, unusable,
+or any record file for that manager when this machine's identity cannot be
+read -- makes that manager `BROKEN` for the run, naming the cause and the
+fix, and nothing is installed through it (exit 2); falling back to no
+record would install again what the record says this machine lost. When
+no row asks that manager to install anything, a note says so instead and
+the run is not failed for it. With no record file, an identity that cannot
+be read only leaves the record unwritten, which a note says once.
 An `UNCHECKED` one is named on stderr and counted (`, N unchecked`) but
 changes nothing about the exit code: what apply installs is known all the
 same. Each backend that installed anything is asked again afterwards, and a

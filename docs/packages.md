@@ -710,28 +710,35 @@ The record is in effect, and a package can be REMOVED, only when it exists
 and can be read, the machine's identity could be read, the backend can be
 asked whether a package is on the machine, and, for apply, the manager's
 installer did not run in that run. With no record, a declared package that
-is not installed is MISSING.
+is not installed is MISSING. A manager whose installer ran and is there
+afterwards, even after a failed install, starts its record afresh from what
+it verifiably holds; one still absent afterwards keeps its record as it
+is.
 
 A record that is there but cannot be used never counts as none, since that
 would install again every package it says this machine lost. Instead the
 backend is BROKEN for the run, on its record: nothing is asked of it or
 installed through it, apply exits 2, status shows it in every format, and
-commit has nothing to reconcile for it. The message names the cause and
-the fix:
+commit has nothing to reconcile for it. When no row asks the backend to
+install anything, a note says so instead and nothing is failed for it. The
+message names the record's path, the cause and the fix:
 
 - a record whose first line is `mox-seen <N>`, N above 1, was written by a
   newer mox and is neither read nor replaced: upgrade mox;
-- a record that cannot be read names its path and the error;
-- a record with any other first line, or a broken line after it, is
-  unusable: remove the file it names to start the record afresh;
+- a record that cannot be read: make it readable;
+- a record with any other first line, or a broken line after it, is not
+  one mox can read: repair it, or remove it, after which the next apply
+  installs every declared package this machine lacks, including ones it
+  had lost;
 - when the machine's identity cannot be read, which record is this
   machine's cannot be told, so any record file for that backend, of any
-  owner, blocks it, saying why the identity could not be read.
+  owner, blocks it, saying why the identity could not be read and what to
+  make readable.
 
 With no record file for a backend, an identity that cannot be read only
-leaves its record unwritten, which a note says. The identity is read only
-when a record file exists for a backend that can be asked, or a record is
-to be written.
+leaves its record unwritten, which a note says once. The identity is read
+only when a record file exists for a backend that can be asked, or a
+record is to be written.
 
 A declared package off the manager's explicit list but in the record is
 asked about once more: is it on the machine in any form? One that is -- a
