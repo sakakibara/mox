@@ -324,9 +324,20 @@ pub const Machine = struct {
         const got = self.got orelse return null;
         if (got != .failed or self.noted) return null;
         self.noted = true;
-        return try std.fmt.allocPrint(self.arena, "this machine's identity could not be read ({s}), so no record of the packages it held is used or written", .{got.failed.why});
+        return try identityWhy(self.arena, got.failed, null);
     }
 };
+
+/// What to say of an identity read that failed: why, what it stops, and the
+/// fix. With `state_dir`, it stops telling which record under it is this
+/// machine's; without, it stops every record for the run.
+pub fn identityWhy(arena: std.mem.Allocator, failed: Identity.Failed, state_dir: ?[]const u8) ![]const u8 {
+    const stops = if (state_dir) |d|
+        try std.fmt.allocPrint(arena, "which record under {s} is its own cannot be told", .{try std.fs.path.join(arena, &.{ d, dir_name })})
+    else
+        "no record of the packages it held is used or written";
+    return std.fmt.allocPrint(arena, "this machine's identity could not be read ({s}), so {s}; {s}", .{ failed.why, stops, failed.fix });
+}
 
 /// The records a run puts in effect, and which it may write back.
 pub const Loaded = struct {
@@ -391,11 +402,7 @@ pub fn load(
         }
         const o = owner orelse {
             try states.append(arena, .{ .backend = b.name, .writable = false });
-            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
-                arena,
-                "this machine's identity could not be read ({s}), so which record under {s} is its own cannot be told; {s}",
-                .{ machine.got.?.failed.why, try std.fs.path.join(arena, &.{ state_dir, dir_name }), machine.got.?.failed.fix },
-            ) });
+            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try identityWhy(arena, machine.got.?.failed, state_dir) });
             continue;
         };
         const p = try path(arena, state_dir, b.name, &o);

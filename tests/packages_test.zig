@@ -5468,7 +5468,7 @@ test "apply: an identity that cannot be read writes no record, saying so once; w
     });
     useFake(fake);
     defer mox.cli.app.package_runner_override = null;
-    const note = "  note            this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written\n";
+    const note = "  note            this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written; make /usr/sbin/ioreg runnable\n";
 
     // No record yet: the identity is first needed to write one.
     const r1 = try h.run(&.{ "mox", "apply" });
@@ -5519,7 +5519,7 @@ test "apply: a failed identity read says once that no record is written, even fo
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.out, "  note            this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.out, "  note            this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written; make /usr/sbin/ioreg runnable\n"));
     try std.testing.expectEqualStrings("absent", try readSeen(h, "brew", testutil.test_identity));
     try std.testing.expectEqualStrings(apt_before, try seenBytes(h, "apt", "another-machine"));
 }

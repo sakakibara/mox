@@ -1351,7 +1351,7 @@ fn stillDeclared(ctx: *app.Ctx, context: app.Context, b: mox.packages.backend.Ba
 }
 
 /// Take `id` out of this machine's record for `backend`. Null when it is
-/// out; otherwise why it could not be taken out, naming the cause and,
+/// out, or when the manager keeps no record to take it out of; otherwise why it could not be taken out, naming the cause and,
 /// where there is one, the fix, as a record that blocks its backend does.
 fn forgetHeld(
     ctx: *app.Ctx,
@@ -1361,14 +1361,11 @@ fn forgetHeld(
     backend: []const u8,
     id: []const u8,
 ) !?[]const u8 {
-    // The record is read again rather than judged by `loaded`: what stops
-    // the update now -- a failed identity read, a record that cannot be
-    // read, is unusable or is a newer mox's -- is what gets named.
-    if (loaded.stateOf(backend) == null) return "its manager keeps no record";
-    const owner = (try machine.owner()) orelse {
-        const failed = machine.got.?.failed;
-        return try std.fmt.allocPrint(ctx.alloc, "this machine's identity could not be read ({s}); {s}", .{ failed.why, failed.fix });
-    };
+    // The record file is read again rather than judged by `loaded`, so
+    // what stops the update now is what gets named; the identity is the
+    // one this run already read.
+    if (loaded.stateOf(backend) == null) return null;
+    const owner = (try machine.owner()) orelse return try mox.packages.seen.identityWhy(ctx.alloc, machine.got.?.failed, state_dir);
     const p = try mox.packages.seen.path(ctx.alloc, state_dir, backend, &owner);
     const held = mox.packages.seen.read(ctx.alloc, ctx.io, state_dir, backend, &owner) catch |e| switch (e) {
         error.OutOfMemory => return e,
