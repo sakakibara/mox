@@ -6397,10 +6397,36 @@ test "commit: r whose record write fails keeps the row's removal and warns, sayi
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
-    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but mox could not update its record of what this machine held: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but the record of the packages this machine held could not be updated: ") != null);
     const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
-    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "held: {s} could not be written (", .{record})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "updated: {s} could not be written (", .{record})) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "; until an apply rewrites the record, a row declaring it again reads as removed\n") != null);
+    try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
+}
+
+test "apply: a record write that fails names the record and fails nothing" {
+    if (builtin.os.tag == .windows or std.c.geteuid() == 0) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+    defer mox.cli.app.package_runner_override = null;
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n\n[[packages]]\nname = \"ripgrep\"\n");
+    try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
+    useFake(try brewWith(a, "fd\nripgrep\n", "", &.{}));
+    const dir = try a.dupeZ(u8, try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name }));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(dir, 0o555));
+    defer _ = std.c.chmod(dir, 0o755);
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "mox apply: brew: the record of the packages this machine held could not be updated: {s} could not be written (", .{record})) != null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }
 

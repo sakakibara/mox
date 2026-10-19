@@ -1535,7 +1535,8 @@ fn updateRecords(
         };
         mox.packages.seen.replace(ctx.alloc, ctx.io, context.paths.state_dir, b.backend, &owner, ids) catch |e| {
             if (e == error.OutOfMemory) return e;
-            try ctx.err.print("mox apply: {s}: the record of the packages this machine held could not be written: {s}\n", .{ b.backend, @errorName(e) });
+            const p = try mox.packages.seen.path(ctx.alloc, context.paths.state_dir, b.backend, &owner);
+            try ctx.err.print("mox apply: {s}: the record of the packages this machine held could not be updated: {s}\n", .{ b.backend, try mox.packages.seen.unwritableWhy(ctx.alloc, p, e) });
             try ctx.err.flush();
         };
     }

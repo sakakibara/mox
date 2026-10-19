@@ -1306,13 +1306,13 @@ fn reconcilePackages(
                         .free => (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) orelse continue,
                     };
                     try ctx.out.flush();
-                    try ctx.err.print("mox commit: warning: {s} {s}: its row was removed, but mox could not update its record of what this machine held: {s}; until an apply rewrites the record, a row declaring it again reads as removed\n", .{ b.backend, gone.row.name, why });
+                    try ctx.err.print("mox commit: warning: {s} {s}: its row was removed, but the record of the packages this machine held could not be updated: {s}; until an apply rewrites the record, a row declaring it again reads as removed\n", .{ b.backend, gone.row.name, why });
                     try ctx.err.flush();
                 },
                 2 => {
                     if (try forgetHeld(ctx, context.paths.state_dir, &machine, loaded, b.backend, gone.id)) |why| {
                         try ctx.out.flush();
-                        try ctx.err.print("mox commit: {s} {s}: the record of what this machine held could not be updated: {s}\n", .{ b.backend, gone.row.name, why });
+                        try ctx.err.print("mox commit: {s} {s}: the record of the packages this machine held could not be updated: {s}\n", .{ b.backend, gone.row.name, why });
                         try ctx.err.flush();
                         res.still_removed += 1;
                         continue;
@@ -1384,7 +1384,7 @@ fn forgetHeld(
     for (ids) |held_id| if (!std.mem.eql(u8, held_id, id)) try kept.append(ctx.alloc, held_id);
     mox.packages.seen.replace(ctx.alloc, ctx.io, state_dir, backend, &owner, kept.items) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return try std.fmt.allocPrint(ctx.alloc, "{s} could not be written ({s})", .{ p, @errorName(e) }),
+        else => return try mox.packages.seen.unwritableWhy(ctx.alloc, p, e),
     };
     return null;
 }

@@ -446,6 +446,11 @@ pub fn unreadableWhy(arena: std.mem.Allocator, p: []const u8, e: anyerror) ![]co
     return std.fmt.allocPrint(arena, "{s} could not be read ({s}); {s}", .{ p, @errorName(e), fix });
 }
 
+/// Why the record at `p` could not be updated: its write failed with `e`.
+pub fn unwritableWhy(arena: std.mem.Allocator, p: []const u8, e: anyerror) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} could not be written ({s})", .{ p, @errorName(e) });
+}
+
 /// Why the record at `p`, which `read` called unusable for `why`, cannot be
 /// used, and the fix.
 pub fn unusableWhy(arena: std.mem.Allocator, p: []const u8, why: []const u8) ![]const u8 {
