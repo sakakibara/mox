@@ -469,16 +469,16 @@ fn named(m: manifest_mod.Manifest, backend: []const u8) bool {
     return false;
 }
 
-/// Whether the manifest asks this backend to do anything. A blacklist row
-/// asks for nothing to happen, so a manager named by one alone has nothing
-/// to install and nothing to judge: its being broken is worth a note, not
-/// drift the run can never clear.
 /// Whether some `[[packages]]` row names `backend`, under any gate.
 fn declares(m: manifest_mod.Manifest, backend: []const u8) bool {
     for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
     return false;
 }
 
+/// Whether the manifest asks this backend to do anything. A blacklist row
+/// asks for nothing to happen, so a manager named by one alone has nothing
+/// to install and nothing to judge: its being broken is worth a note, not
+/// drift the run can never clear.
 fn actedOn(m: manifest_mod.Manifest, backend: []const u8) bool {
     for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
     for (m.bootstrap) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
