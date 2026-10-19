@@ -355,8 +355,16 @@ fn editRow(arena: std.mem.Allocator, io: Io, row: manifest_mod.Row, change: RowC
     switch (change) {
         .remove => {
             var resume_at = end + 1;
-            if (head > 0 and items[head - 1] == .blank and resume_at < items.len and items[resume_at] == .blank) resume_at += 1;
-            try out.appendSlice(arena, content[0..scan.offs[head]]);
+            var cut = head;
+            var rest = resume_at;
+            while (rest < items.len and items[rest] == .blank) rest += 1;
+            if (rest == items.len) {
+                // A last row takes the blank lines before it along, so the file
+                // ends where what came before the row ended.
+                while (cut > 0 and items[cut - 1] == .blank) cut -= 1;
+                resume_at = items.len;
+            } else if (head > 0 and items[head - 1] == .blank and items[resume_at] == .blank) resume_at += 1;
+            try out.appendSlice(arena, content[0..scan.offs[cut]]);
             if (resume_at < items.len) try out.appendSlice(arena, content[scan.offs[resume_at]..]);
         },
         .keep_off => |machine| {
@@ -1519,7 +1527,7 @@ test "removeRow: two blank lines meeting where the row was collapse to one" {
     try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"c\"\n", try fx.read("darwin.toml"));
 }
 
-test "removeRow: a last row with no final newline goes, and what came before it stays byte for byte" {
+test "removeRow: a last row with no final newline goes with the blank line before it" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1529,7 +1537,36 @@ test "removeRow: a last row with no final newline goes, and what came before it 
 
     try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"");
     try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("b")));
-    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n", try fx.read("darwin.toml"));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow: a last row leaves the file ending on one newline, blank lines after it included" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n\n[[packages]]\nname = \"b\"\nkind = \"cask\"\n\n\n");
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("b")));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"a\"\n", try fx.read("darwin.toml"));
+
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("a")));
+    try testing.expectEqualStrings("backend = \"brew\"\n", try fx.read("darwin.toml"));
+}
+
+test "removeRow: a last row under a comment keeps the comment as the file's end" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fx = try EditFixture.init(arena.allocator(), io, &tmp);
+
+    try fx.put("darwin.toml", "backend = \"brew\"\r\n\r\n[[packages]]\r\nname = \"a\"\r\n\r\n# casks\r\n[[packages]]\r\nname = \"b\"\r\n");
+    try testing.expectEqual(Edit.written, try removeRow(fx.a, io, try fx.row("b")));
+    try testing.expectEqualStrings("backend = \"brew\"\r\n\r\n[[packages]]\r\nname = \"a\"\r\n\r\n# casks\r\n", try fx.read("darwin.toml"));
 }
 
 test "removeRow: CRLF line endings are kept" {
@@ -1597,7 +1634,7 @@ test "removeRow: two removals from one file, each from the rows as first loaded"
     const c_row = try fx.row("c");
     try testing.expectEqual(Edit.written, try removeRow(fx.a, io, a_row));
     try testing.expectEqual(Edit.written, try removeRow(fx.a, io, c_row));
-    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"b\"\n\n", try fx.read("darwin.toml"));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"b\"\n", try fx.read("darwin.toml"));
 }
 
 test "removeRow: a file edited after the row was reported is searched by content, and a row that changed is left" {
@@ -1617,7 +1654,7 @@ test "removeRow: a file edited after the row was reported is searched by content
 
     try testing.expectEqual(Edit.written, try removeRow(fx.a, io, b_row));
     try expectLeft(try removeRow(fx.a, io, a_row), "no row in it is the one reported any more");
-    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"new\"\n\n[[packages]]\nname = \"a\"\npin = true\n\n", try fx.read("darwin.toml"));
+    try testing.expectEqualStrings("backend = \"brew\"\n\n[[packages]]\nname = \"new\"\n\n[[packages]]\nname = \"a\"\npin = true\n", try fx.read("darwin.toml"));
 }
 
 test "removeRow: a symlinked manifest is edited where the link points, and the link survives" {

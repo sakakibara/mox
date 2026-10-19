@@ -6368,7 +6368,7 @@ test "commit: r keeps the record's entry while another row still declares the pa
     const r = try h.runWithInput(&.{ "mox", "commit" }, "r\n");
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("backend = \"brew\"\n", try readManifest(io, h, a, "darwin.toml"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "warning") == null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }
@@ -6396,7 +6396,7 @@ test "commit: r whose record write fails keeps the row's removal and warns, sayi
     const r = try h.runWithInput(&.{ "mox", "commit" }, "r\n");
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expectEqual(@as(u8, 0), r.rc);
-    try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("backend = \"brew\"\n", try readManifest(io, h, a, "darwin.toml"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but the record of the packages this machine held could not be updated: ") != null);
     const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
     try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "updated: {s} could not be written (", .{record})) != null);
@@ -6671,7 +6671,7 @@ test "commit: R answers for its own backend only, so the next backend's removed 
     try std.testing.expectEqual(@as(u8, 1), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.out, try removedQuestion(a, "pacman", "jq", "data/packages/arch.toml")) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.out, try packageSummary(a, .{ 0, 0, 1, 0, 0, 0, 1 })) != null);
-    try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
+    try std.testing.expectEqualStrings("backend = \"brew\"\n", try readManifest(io, h, a, "darwin.toml"));
     try std.testing.expectEqualStrings(arch, try readManifest(io, h, a, "arch.toml"));
     try std.testing.expectEqualStrings("jq", try readSeen(h, "pacman", testutil.test_identity));
 }
