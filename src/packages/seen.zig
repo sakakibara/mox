@@ -96,11 +96,10 @@ pub fn linuxIdentity(arena: std.mem.Allocator, io: Io, paths: []const []const u8
             else => return .{
                 .failed = .{
                     .why = try std.fmt.allocPrint(arena, "{s} could not be read ({s})", .{ p, @errorName(e) }),
-                    // Only a denied read is fixed by permissions alone: a
-                    // directory, say, is readable and still holds no id.
-                    .fix = switch (e) {
-                        error.AccessDenied, error.PermissionDenied => try std.fmt.allocPrint(arena, "make {s} readable", .{p}),
-                        else => try std.fmt.allocPrint(arena, "make {s} a readable file", .{p}),
+                    .fix = switch (readFailure(io, p, e)) {
+                        .not_a_file => try std.fmt.allocPrint(arena, "make {s} a readable file", .{p}),
+                        .denied => try std.fmt.allocPrint(arena, "make {s} readable", .{p}),
+                        .other => "fix the cause and run again",
                     },
                 },
             },
@@ -403,7 +402,7 @@ pub fn load(
         const got = read(arena, io, state_dir, b.name, &o) catch |e| {
             if (e == error.OutOfMemory) return e;
             try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
-            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try unreadableWhy(arena, p, e) });
+            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try unreadableWhy(arena, io, p, e) });
             continue;
         };
         switch (got) {
@@ -435,15 +434,34 @@ pub fn newerWhy(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
 }
 
 /// Why the record at `p`, whose read failed with `e`, cannot be used, and
-/// the fix.
-pub fn unreadableWhy(arena: std.mem.Allocator, p: []const u8, e: anyerror) ![]const u8 {
-    // Only a denied read is fixed by permissions alone: a directory, say, is
-    // readable and still holds no record.
-    const fix = switch (e) {
-        error.AccessDenied, error.PermissionDenied => "make it readable",
-        else => "remove it or make it a readable file",
+/// the fix, chosen by what is at `p` and the kind of failure: only a
+/// regular file whose read was denied is fixed by permissions, and only
+/// something other than a file is fixed by removing it.
+pub fn unreadableWhy(arena: std.mem.Allocator, io: Io, p: []const u8, e: anyerror) ![]const u8 {
+    return switch (readFailure(io, p, e)) {
+        .not_a_file => std.fmt.allocPrint(arena, "{s} is not a file; replace it with a file, or remove it, " ++ removal_consequence, .{p}),
+        .denied => std.fmt.allocPrint(arena, "{s} could not be read ({s}); make it readable", .{ p, @errorName(e) }),
+        .other => std.fmt.allocPrint(arena, "{s} could not be read ({s}); fix the cause and run again", .{ p, @errorName(e) }),
     };
-    return std.fmt.allocPrint(arena, "{s} could not be read ({s}); {s}", .{ p, @errorName(e), fix });
+}
+
+/// What follows removing a record, for every message that advises it.
+const removal_consequence = "after which the next apply installs every declared package this machine lacks, including ones it had lost";
+
+const ReadFailure = enum { not_a_file, denied, other };
+
+/// What a read of `p` that failed with `e` says of it. A directory opened
+/// as a file may be refused as access denied (Windows does), so a denied
+/// read is told apart by what a stat finds there.
+fn readFailure(io: Io, p: []const u8, e: anyerror) ReadFailure {
+    return switch (e) {
+        error.IsDir => .not_a_file,
+        error.AccessDenied, error.PermissionDenied => {
+            const st = Io.Dir.cwd().statFile(io, p, .{}) catch return .denied;
+            return if (st.kind == .file) .denied else .not_a_file;
+        },
+        else => .other,
+    };
 }
 
 /// Why the record at `p` could not be updated: its write failed with `e`.
@@ -454,7 +472,7 @@ pub fn unwritableWhy(arena: std.mem.Allocator, p: []const u8, e: anyerror) ![]co
 /// Why the record at `p`, which `read` called unusable for `why`, cannot be
 /// used, and the fix.
 pub fn unusableWhy(arena: std.mem.Allocator, p: []const u8, why: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} is not a record mox can read ({s}); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{ p, why });
+    return std.fmt.allocPrint(arena, "{s} is not a record mox can read ({s}); repair it, or remove it, " ++ removal_consequence, .{ p, why });
 }
 
 /// Per backend in `backends`, whether the records directory holds a file
@@ -703,12 +721,7 @@ test "linuxIdentity: a machine-id that is there but cannot be read is a failed r
     const etc = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "machine-id" });
     const got = try linuxIdentity(a, io, &.{etc});
     try testing.expect(std.mem.indexOf(u8, got.failed.why, "could not be read") != null);
-    // Windows may refuse a directory opened as a file as access denied.
-    if (std.mem.indexOf(u8, got.failed.why, "(IsDir)") != null) {
-        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} a readable file", .{etc}), got.failed.fix);
-    } else {
-        try testing.expect(builtin.os.tag == .windows);
-    }
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} a readable file", .{etc}), got.failed.fix);
 }
 
 test "linuxIdentity: a machine-id read denied by its permissions says to make it readable" {
@@ -933,15 +946,10 @@ test "load: an unusable, a newer and an unreadable record each block their backe
         try std.fmt.allocPrint(a, "{s} was written by a newer mox; upgrade mox", .{apt_path}),
         got.seen.blockedOf("apt").?,
     );
-    const dnf_why = got.seen.blockedOf("dnf").?;
-    try testing.expect(std.mem.startsWith(u8, dnf_why, try std.fmt.allocPrint(a, "{s} could not be read (", .{dnf_path})));
-    // Windows may refuse a directory opened as a file as access denied.
-    if (std.mem.indexOf(u8, dnf_why, "(IsDir)") != null) {
-        try testing.expect(std.mem.endsWith(u8, dnf_why, "); remove it or make it a readable file"));
-    } else {
-        try testing.expect(builtin.os.tag == .windows);
-        try testing.expect(std.mem.endsWith(u8, dnf_why, "); make it readable"));
-    }
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} is not a file; replace it with a file, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{dnf_path}),
+        got.seen.blockedOf("dnf").?,
+    );
     for ([_][]const u8{ "brew", "apt", "dnf" }) |n| try testing.expect(!got.stateOf(n).?.writable);
 
     // With its installer run this run, an unusable record is written over
@@ -977,6 +985,24 @@ test "load: a record read denied by its permissions says to make it readable" {
     try testing.expectEqualStrings(
         try std.fmt.allocPrint(a, "{s} could not be read (AccessDenied); make it readable", .{brew_z}),
         got.seen.blockedOf("brew").?,
+    );
+}
+
+test "unreadableWhy: a denied read of a regular file says to make it readable, and any other failure gives no removal advice" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "brew.txt", .data = header ++ "\n" });
+    const p = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(testing.io, ".", a), "brew.txt" });
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} could not be read (AccessDenied); make it readable", .{p}),
+        try unreadableWhy(a, testing.io, p, error.AccessDenied),
+    );
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} could not be read (SystemResources); fix the cause and run again", .{p}),
+        try unreadableWhy(a, testing.io, p, error.SystemResources),
     );
 }
 

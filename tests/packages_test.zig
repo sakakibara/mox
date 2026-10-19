@@ -6161,8 +6161,8 @@ fn unusableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{s} is not a record mox can read (its first line is not a record header); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{record});
 }
 
-fn unreadableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s} could not be read (", .{record});
+fn notAFileWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s} is not a file; replace it with a file, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{record});
 }
 
 /// apply, status and commit with brew's record blocked as `case` lays it:
@@ -6238,8 +6238,8 @@ test "apply, status and commit: an unusable record breaks its backend, saying to
     try expectBlocked(.{ .data = "mox-seen 1\r\nfd\r\n", .why = unusableWhy });
 }
 
-test "apply, status and commit: a record that cannot be read breaks its backend, naming its path, and is left as it is" {
-    try expectBlocked(.{ .data = null, .why = unreadableWhy });
+test "apply, status and commit: a directory where a record goes breaks its backend, saying to replace or remove it, and is left as it is" {
+    try expectBlocked(.{ .data = null, .why = notAFileWhy });
 }
 
 test "apply, status and commit: a backend no row declares is never blocked by its record, so its untracked packages still show, and the record is left as it is" {

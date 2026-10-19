@@ -1372,7 +1372,7 @@ fn forgetHeld(
     const p = try mox.packages.seen.path(ctx.alloc, state_dir, backend, &owner);
     const held = mox.packages.seen.read(ctx.alloc, ctx.io, state_dir, backend, &owner) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return try mox.packages.seen.unreadableWhy(ctx.alloc, p, e),
+        else => return try mox.packages.seen.unreadableWhy(ctx.alloc, ctx.io, p, e),
     };
     const ids = switch (held) {
         .ids => |ids| ids,
