@@ -112,6 +112,9 @@ pub const Scoop = struct {
     io: ?Io = null,
     /// The last bootstrap's installer exit code, when it exited nonzero.
     installer_exit: ?u8 = null,
+    /// Whether the last bootstrap ran the installer rather than adopting a
+    /// scoop already here, which `bootstrapRanInstaller` answers with.
+    ran_installer: bool = false,
 
     pub fn backend(self: *Scoop) Backend {
         return .{
@@ -136,11 +139,17 @@ pub const Scoop = struct {
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
         .installerExit = installerExitImpl,
+        .bootstrapRanInstaller = bootstrapRanInstallerImpl,
     };
 
     fn installerExitImpl(ctx: *anyopaque) ?u8 {
         const self: *Scoop = @ptrCast(@alignCast(ctx));
         return self.installer_exit;
+    }
+
+    fn bootstrapRanInstallerImpl(ctx: *anyopaque) bool {
+        const self: *Scoop = @ptrCast(@alignCast(ctx));
+        return self.ran_installer;
     }
 
     /// scoop installs itself from a PowerShell script mox has already fetched
@@ -153,8 +162,10 @@ pub const Scoop = struct {
         // apply in that terminal probes scoop as absent. Running the
         // installer again over a scoop that is there is refused ("exists and
         // is not empty"), so what is there is adopted instead.
+        self.ran_installer = false;
         if (try self.adopt(arena)) |shims| return shims;
         self.installer_exit = null;
+        self.ran_installer = true;
         const res = try exec.runPowerShell(self.runner, arena, &.{installer_path}, null, true);
         try exec.checkTimedOut(res);
         if (!res.ok) {
@@ -1844,6 +1855,7 @@ test "scoop: a scoop already here is adopted, and the installer is not run over 
 
     const shims = (try s.backend().bootstrap(a, "C:\\i.ps1")).?;
     try testing.expectEqualStrings(try std.fs.path.join(a, &.{ "C:\\Users\\x", "scoop", "shims" }), shims);
+    try testing.expect(!s.backend().bootstrapRanInstaller());
     // And every call after it reaches the scoop that was adopted.
     _ = try s.backend().installedExplicit(a);
     try testing.expect(fake.called(shim_export));
@@ -1871,6 +1883,7 @@ test "scoop: a root with no working shim is not adopted, and the installer runs"
 
     _ = try s.backend().bootstrap(a, "C:\\i.ps1");
     try testing.expect(fake.called("pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\i.ps1"));
+    try testing.expect(s.backend().bootstrapRanInstaller());
     try testing.expect((try s.backend().available(a)) == .present);
 }
 

@@ -102,6 +102,9 @@ pub const Plugin = struct {
     /// installed nothing, and its rows must not be reported as possibly
     /// landed.
     spawned: bool = false,
+    /// Whether the last `bootstrap` handed the installer to a plugin that
+    /// implements the verb, which `bootstrapRanInstaller` answers with.
+    ran_installer: bool = false,
 
     pub fn backend(self: *Plugin) Backend {
         return .{
@@ -121,6 +124,7 @@ pub const Plugin = struct {
         .installSpawned = installSpawnedImpl,
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
+        .bootstrapRanInstaller = bootstrapRanInstallerImpl,
         .limitation = limitationImpl,
     };
 
@@ -139,6 +143,11 @@ pub const Plugin = struct {
     fn installSpawnedImpl(ctx: *anyopaque) bool {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
         return self.spawned;
+    }
+
+    fn bootstrapRanInstallerImpl(ctx: *anyopaque) bool {
+        const self: *Plugin = @ptrCast(@alignCast(ctx));
+        return self.ran_installer;
     }
 
     /// The one place a spawn's argv is built, so a file this machine cannot
@@ -322,9 +331,13 @@ pub const Plugin = struct {
         const out_path = try std.fmt.allocPrint(arena, "{s}.bindir", .{installer_path});
         std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
         defer std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
+        self.ran_installer = true;
         const res = try self.call(arena, "bootstrap", &.{ installer_path, out_path }, "", true);
         if (res.timed_out) return Error.PluginTimedOut;
-        if (res.code == exit_not_implemented) return Error.PluginVerbNotImplemented;
+        if (res.code == exit_not_implemented) {
+            self.ran_installer = false;
+            return Error.PluginVerbNotImplemented;
+        }
         if (!res.ok) return Error.PluginFailed;
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, out_path, arena, .limited(64 * 1024)) catch |e| switch (e) {
             error.FileNotFound => return null,
@@ -690,6 +703,8 @@ test "exit 64: an optional verb the plugin lacks is named, never defaulted" {
     var p = pluginWith(&fake);
 
     try testing.expectError(Error.PluginVerbNotImplemented, p.backend().bootstrap(a, "/tmp/i"));
+    // A plugin with no bootstrap verb ran no installer.
+    try testing.expect(!p.backend().bootstrapRanInstaller());
     try testing.expect((try p.backend().limitationOf(a)) == null);
 }
 
@@ -739,6 +754,7 @@ test "bootstrap: no line is no bin dir, and anything but one absolute path in th
     } };
     var p = pluginWith(&fake);
     try testing.expect((try p.backend().bootstrap(a, installer)) == null);
+    try testing.expect(p.backend().bootstrapRanInstaller());
     try testing.expect((try p.backend().bootstrap(a, installer)) == null);
     try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, installer));
     try testing.expectError(Error.PluginBadOutput, p.backend().bootstrap(a, installer));

@@ -5660,6 +5660,67 @@ test "apply: an installer that exits nonzero but leaves its manager there starts
     try std.testing.expectEqualStrings("fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
 }
 
+test "apply: a bootstrap that adopts a scoop already here runs no installer, so its record stays in effect across applies" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "Write-Output 'installing scoop'\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writeManifest(io, h, a, "windows.toml", try std.fmt.allocPrint(a,
+        \\backend = "scoop"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.ps1"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "git"
+        \\
+        \\[[packages]]
+        \\name = "jq"
+        \\
+    , .{hex}));
+    try writeSeen(h, "scoop", testutil.test_identity, &.{ "git", "jq" });
+    mox.cli.app.brew_prefixes_override = &no_brew_prefix;
+    defer mox.cli.app.brew_prefixes_override = null;
+
+    // scoop is on this machine but off this run's PATH: its shim answers.
+    const shims = try std.fs.path.join(a, &.{ h.home, "scoop", "shims" });
+    const shim = try std.fs.path.join(a, &.{ shims, "scoop.ps1" });
+    try Io.Dir.cwd().createDirPath(io, shims);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = shim, .data = "" });
+    const via_shim = try std.fmt.allocPrint(a, "pwsh -NoProfile -ExecutionPolicy Bypass -File {s}", .{shim});
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} --version", .{via_shim}), .stdout = "v0.5.2\n" });
+    try entries.append(a, .{ .argv = try std.fmt.allocPrint(a, "{s} export", .{via_shim}), .stdout = "{ \"apps\": [ { \"Name\": \"jq\", \"Source\": \"main\" } ] }" });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    for (0..2) |_| {
+        const r = try h.run(&.{ "mox", "apply" });
+        errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+        try std.testing.expectEqual(@as(u8, 1), r.rc);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, try removedLine(a, "scoop", "git")) != null);
+        try std.testing.expectEqualStrings("git jq", try readSeen(h, "scoop", testutil.test_identity));
+    }
+    for (fake.calls.items) |c| {
+        try std.testing.expect(std.mem.indexOf(u8, c, " install") == null);
+        // Fetched and verified, but never run.
+        if (!std.mem.startsWith(u8, c, "curl ")) try std.testing.expect(std.mem.indexOf(u8, c, "scoop-installer-") == null);
+    }
+}
+
 test "apply: a row gated off this machine keeps its id recorded, and one no row declares is dropped" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

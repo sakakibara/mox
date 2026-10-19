@@ -983,7 +983,8 @@ fn bootstrapBackends(
     var failed: usize = 0;
     var failed_names: std.ArrayList([]const u8) = .empty;
     // Every manager whose installer was started, whatever came of it: what
-    // the machine held through it before may be gone.
+    // the machine held through it before may be gone. A bootstrap that
+    // adopted a manager already here ran nothing, so it is not among them.
     var ran_names: std.ArrayList([]const u8) = .empty;
     for (m.bootstrap) |b| {
         if (!try bootstrapGateHolds(ctx.alloc, b, bindings)) continue;
@@ -1060,8 +1061,8 @@ fn bootstrapBackends(
                 keepalive.start(ctx.io, mox.packages.admin.refresh_interval_ms, (if (builtin.is_test) app.admin_refresh_override else null) orelse mox.packages.admin.sudo_refresh);
             },
         };
-        try ran_names.append(ctx.alloc, b.backend);
         const bin_dir = backend.bootstrap(ctx.alloc, path) catch |e| {
+            if (backend.bootstrapRanInstaller()) try ran_names.append(ctx.alloc, b.backend);
             const why = if (e == error.BootstrapInstallerFailed and backend.installerExit() != null)
                 if (unattended_admin)
                     try std.fmt.allocPrint(ctx.alloc, "the installer exited {d}; it needs administrator access: run mox from a terminal so sudo can ask for the password, or cache a sudo timestamp first", .{backend.installerExit().?})
@@ -1075,6 +1076,7 @@ fn bootstrapBackends(
             try failed_names.append(ctx.alloc, b.backend);
             continue;
         };
+        if (backend.bootstrapRanInstaller()) try ran_names.append(ctx.alloc, b.backend);
         // The installer executed, whatever it left behind: the machine may
         // have changed, so the run must re-read it even where the manager it
         // was supposed to install is still not there.

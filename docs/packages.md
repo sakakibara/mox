@@ -128,12 +128,12 @@ it just put in place. scoop looks there first: its installer puts the shims
 directory on PATH by writing the registry and its own session, so a terminal
 opened before the first apply never sees it and the next apply in that
 terminal probes scoop as absent -- where a scoop that answers is adopted
-rather than installed over, which its installer refuses anyway. A plugin runs
-`bootstrap <path> <out>` itself, streamed
-like an install, and writes the directory to put on PATH -- one absolute
-existing directory -- as one line into `<out>`, if there is one. If a
-bootstrap fails, the rows of that manager are not attempted and the run
-fails.
+rather than installed over, which its installer refuses anyway; no
+installer ran, so its record of what this machine held stays in effect. A
+plugin runs `bootstrap <path> <out>` itself, streamed like an install, and
+writes the directory to put on PATH -- one absolute existing directory --
+as one line into `<out>`, if there is one. If a bootstrap fails, the rows
+of that manager are not attempted and the run fails.
 An installer over 64 MiB is refused. `--dry-run` fetches nothing and plans
 as though the bootstrap had happened, so what it lists is what the real run
 would install, and `status` reports the rows of an absent manager that has

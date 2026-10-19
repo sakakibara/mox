@@ -113,6 +113,9 @@ pub const Brew = struct {
     probe_budget_ms: i64 = exec.default_timeout_ms,
     /// The last bootstrap's installer exit code, when it exited nonzero.
     installer_exit: ?u8 = null,
+    /// Whether the last bootstrap reached Homebrew's installer, which
+    /// `bootstrapRanInstaller` answers with.
+    ran_installer: bool = false,
 
     pub fn backend(self: *Brew) Backend {
         return .{
@@ -140,8 +143,14 @@ pub const Brew = struct {
         .declare = declareImpl,
         .bootstrap = bootstrapImpl,
         .installerExit = installerExitImpl,
+        .bootstrapRanInstaller = bootstrapRanInstallerImpl,
         .spacePaths = spacePathsImpl,
     };
+
+    fn bootstrapRanInstallerImpl(ctx: *anyopaque) bool {
+        const self: *Brew = @ptrCast(@alignCast(ctx));
+        return self.ran_installer;
+    }
 
     /// brew's prefix, where every formula lands, and on a mac the
     /// temporary directory a cask is staged in before it is moved into
@@ -182,9 +191,11 @@ pub const Brew = struct {
     /// machine it is on no PATH yet.
     fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Brew = @ptrCast(@alignCast(ctx));
+        self.ran_installer = false;
         const io = self.io orelse return error.NoBootstrapForBackend;
 
         self.installer_exit = null;
+        self.ran_installer = true;
         const res = try self.runner.streamStep(arena, &(stream_env ++ .{ "NONINTERACTIVE=1", "/bin/bash", installer_path }), "brew: Homebrew's installer");
         try exec.checkTimedOut(res);
         if (!res.ok) {
@@ -1833,6 +1844,21 @@ test "bootstrap: an installer killed at its bound is a timeout, not a failed boo
 
     try testing.expectError(error.TimedOut, b.backend().bootstrap(a, "/tmp/i"));
     try testing.expectEqualStrings("brew", b.exe);
+    // Killed, but it ran: what it left behind is unknown.
+    try testing.expect(b.backend().bootstrapRanInstaller());
+}
+
+test "bootstrap: with no io to find what it installs, the installer is never run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fake: exec.Fake = .{ .arena = a, .entries = &.{} };
+    var b: Brew = .{ .runner = fake.runner() };
+
+    try testing.expectError(error.NoBootstrapForBackend, b.backend().bootstrap(a, "/tmp/i"));
+    try testing.expect(!b.backend().bootstrapRanInstaller());
+    try testing.expectEqual(@as(usize, 0), fake.calls.items.len);
 }
 
 test "install: a failed tap fails its row and the rows after it still run" {

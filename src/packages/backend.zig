@@ -461,6 +461,11 @@ pub const Backend = struct {
         /// The exit code of the last `bootstrap`'s installer, when it ran and
         /// exited nonzero. Absent, or null, when there is none to report.
         installerExit: ?*const fn (ctx: *anyopaque) ?u8 = null,
+        /// Whether the last `bootstrap` reached the point of running its
+        /// installer, whatever the installer then did. Absent for an adapter
+        /// whose bootstrap runs it first thing, where the answer is always
+        /// yes.
+        bootstrapRanInstaller: ?*const fn (ctx: *anyopaque) bool = null,
         /// What this backend structurally cannot see, asked once of a usable
         /// backend. Absent when the `limitation` field states it, or when there is
         /// nothing to state.
@@ -602,6 +607,15 @@ pub const Backend = struct {
 
     pub fn installerExit(self: Backend) ?u8 {
         const f = self.vtable.installerExit orelse return null;
+        return f(self.ctx);
+    }
+
+    /// Whether the last `bootstrap` ran its installer. One that returned
+    /// without running it -- adopting a manager already on the machine, or
+    /// refusing before the installer -- left the machine as it was, so what
+    /// the record says it held through that manager still holds.
+    pub fn bootstrapRanInstaller(self: Backend) bool {
+        const f = self.vtable.bootstrapRanInstaller orelse return true;
         return f(self.ctx);
     }
 
