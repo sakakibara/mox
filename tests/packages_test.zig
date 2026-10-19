@@ -6058,10 +6058,39 @@ test "status: an identity that cannot be read, with a record file there, shows t
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ p.out, p.err });
     try expectPorcelain(p.out);
-    try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}\n", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}\n", .{try porcelainField(a, why)})) != null);
     try std.testing.expect(std.mem.indexOf(u8, p.out, "package_missing") == null);
 
     try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
+}
+
+/// `s` as status --porcelain writes a free-form field: backslash, tab,
+/// newline and carriage return C-escaped. A Windows path carries
+/// backslashes.
+fn porcelainField(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| switch (c) {
+        '\\' => try out.appendSlice(a, "\\\\"),
+        '\t' => try out.appendSlice(a, "\\t"),
+        '\n' => try out.appendSlice(a, "\\n"),
+        '\r' => try out.appendSlice(a, "\\r"),
+        else => try out.append(a, c),
+    };
+    return out.toOwnedSlice(a);
+}
+
+/// `s` as status --json writes it inside a string, without the quotes.
+fn jsonText(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(a, "\\\""),
+        '\\' => try out.appendSlice(a, "\\\\"),
+        '\n' => try out.appendSlice(a, "\\n"),
+        '\r' => try out.appendSlice(a, "\\r"),
+        '\t' => try out.appendSlice(a, "\\t"),
+        else => if (c < 0x20) try out.print(a, "\\u{x:0>4}", .{c}) else try out.append(a, c),
+    };
+    return out.toOwnedSlice(a);
 }
 
 /// A record of brew's for this machine laid as `data` (a directory when
@@ -6125,12 +6154,12 @@ fn expectBlocked(case: BlockedRecord) !void {
     const p = try h.run(&.{ "mox", "status", "--porcelain" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ p.out, p.err });
     try expectPorcelain(p.out);
-    try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.out, try std.fmt.allocPrint(a, "package_broken\tbrew\t-\trecord\t{s}", .{try porcelainField(a, why)})) != null);
 
     const j = try h.run(&.{ "mox", "status", "--json" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ j.out, j.err });
     try std.testing.expectEqual(@as(u8, 1), j.rc);
-    try std.testing.expect(std.mem.indexOf(u8, j.out, try std.fmt.allocPrint(a, "{{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":null,\"probe\":\"record\",\"why\":\"{s}", .{why})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, j.out, try std.fmt.allocPrint(a, "{{\"backend\":\"brew\",\"state\":\"broken\",\"exit\":null,\"probe\":\"record\",\"why\":\"{s}", .{try jsonText(a, why)})) != null);
     try std.testing.expect(std.mem.indexOf(u8, j.out, "\"missing\"") == null);
 
     const c = try h.runWithInput(&.{ "mox", "commit" }, "y\n");
@@ -6153,7 +6182,7 @@ test "apply, status and commit: a record written by a newer mox breaks its backe
     try expectBlocked(.{ .data = "mox-seen 2\nfd\n", .why = newerWhy });
 }
 
-test "apply, status and commit: an unusable record breaks its backend, saying to remove it, and is left as it is" {
+test "apply, status and commit: an unusable record breaks its backend, saying to repair or remove it, and is left as it is" {
     try expectBlocked(.{ .data = "mox-seen 1\r\nfd\r\n", .why = unusableWhy });
 }
 
