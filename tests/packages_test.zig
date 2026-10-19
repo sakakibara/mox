@@ -6162,7 +6162,7 @@ fn unusableWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
 }
 
 fn notAFileWhy(a: std.mem.Allocator, record: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s} is not a file; replace it with a file, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{record});
+    return std.fmt.allocPrint(a, "{s} is not a file; remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{record});
 }
 
 /// apply, status and commit with brew's record blocked as `case` lays it:

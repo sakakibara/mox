@@ -730,11 +730,11 @@ directory:
 
 - a record whose first line is `mox-seen <N>`, N above 1, was written by a
   newer mox and is neither read nor replaced: upgrade mox;
-- a record whose read its permissions deny: make it readable;
 - something other than a file where a record goes, a directory say:
-  replace it with a file, or remove it, after which the next apply
-  installs every declared package this machine lacks, including ones it
-  had lost;
+  remove it, after which the next apply installs every declared package
+  this machine lacks, including ones it had lost;
+- a record its permissions deny reading: make it readable, or, when the
+  directory holding it denies access too, make both readable;
 - a record whose read fails for any other reason names the error: fix the
   cause and run again;
 - a record with any other first line, or a broken line after it, is not

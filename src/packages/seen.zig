@@ -46,13 +46,13 @@ pub const Identity = union(enum) {
     /// The identity; empty where the OS has none, which is as stable as
     /// one, so a container without a machine-id keeps its record.
     known: []const u8,
-    /// The source exists but could not be read. No record is in effect and
+    /// The identity source could not be used. No record is in effect and
     /// none is written, since an owner guessed here could name another
     /// machine's record.
     failed: Failed,
 
     pub const Failed = struct {
-        /// Why the read failed.
+        /// The cause alone, as `identityWhy` puts it in parentheses.
         why: []const u8,
         /// What to do for it to succeed, as a clause.
         fix: []const u8,
@@ -95,10 +95,11 @@ pub fn linuxIdentity(arena: std.mem.Allocator, io: Io, paths: []const []const u8
             error.OutOfMemory => return e,
             else => return .{
                 .failed = .{
-                    .why = try std.fmt.allocPrint(arena, "{s} could not be read ({s})", .{ p, @errorName(e) }),
+                    .why = try std.fmt.allocPrint(arena, "{s}: {s}", .{ p, @errorName(e) }),
                     .fix = switch (readFailure(io, p, e)) {
                         .not_a_file => try std.fmt.allocPrint(arena, "make {s} a readable file", .{p}),
                         .denied => try std.fmt.allocPrint(arena, "make {s} readable", .{p}),
+                        .denied_dir => try std.fmt.allocPrint(arena, "make {s} and its directory readable", .{p}),
                         .other => "fix the cause and run again",
                     },
                 },
@@ -142,7 +143,7 @@ pub fn windowsIdentity(arena: std.mem.Allocator, runner: exec.Runner, env: ?*con
         const m = env orelse break :blk "";
         break :blk std.mem.trim(u8, m.get("SystemRoot") orelse "", " \t\r\n");
     };
-    if (root.len == 0) return .{ .failed = .{ .why = "SystemRoot is not set, so reg.exe cannot be found", .fix = "set SystemRoot" } };
+    if (root.len == 0) return .{ .failed = .{ .why = "SystemRoot is not set", .fix = "set SystemRoot" } };
     const reg = try std.fmt.allocPrint(arena, "{s}\\System32\\reg.exe", .{std.mem.trimEnd(u8, root, "\\")});
     const argv = [_][]const u8{ reg, "query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid" };
     const fix = try std.fmt.allocPrint(arena, "make {s} able to read MachineGuid", .{reg});
@@ -441,13 +442,14 @@ pub fn newerWhy(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
 }
 
 /// Why the record at `p`, whose read failed with `e`, cannot be used, and
-/// the fix, chosen by what is at `p` and the kind of failure: only a
-/// regular file whose read was denied is fixed by permissions, and only
-/// something other than a file is fixed by removing it.
+/// the fix, chosen as `readFailure` classes it: something other than a
+/// regular file is fixed by removing it, a denied read by permissions, and
+/// anything else by fixing its cause.
 pub fn unreadableWhy(arena: std.mem.Allocator, io: Io, p: []const u8, e: anyerror) ![]const u8 {
     return switch (readFailure(io, p, e)) {
-        .not_a_file => std.fmt.allocPrint(arena, "{s} is not a file; replace it with a file, or remove it, " ++ removal_consequence, .{p}),
+        .not_a_file => std.fmt.allocPrint(arena, "{s} is not a file; remove it, " ++ removal_consequence, .{p}),
         .denied => std.fmt.allocPrint(arena, "{s} could not be read ({s}); make it readable", .{ p, @errorName(e) }),
+        .denied_dir => std.fmt.allocPrint(arena, "{s} could not be read ({s}); make it and the directory holding it readable", .{ p, @errorName(e) }),
         .other => std.fmt.allocPrint(arena, "{s} could not be read ({s}); fix the cause and run again", .{ p, @errorName(e) }),
     };
 }
@@ -455,20 +457,27 @@ pub fn unreadableWhy(arena: std.mem.Allocator, io: Io, p: []const u8, e: anyerro
 /// What follows removing a record, for every message that advises it.
 const removal_consequence = "after which the next apply installs every declared package this machine lacks, including ones it had lost";
 
-const ReadFailure = enum { not_a_file, denied, other };
+const ReadFailure = enum {
+    /// Something other than a regular file is at the path.
+    not_a_file,
+    /// A regular file whose read was denied.
+    denied,
+    /// A denied read that a stat could not get past either, as when the
+    /// directory holding the file denies search.
+    denied_dir,
+    other,
+};
 
-/// What a read of `p` that failed with `e` says of it. A directory opened
-/// as a file may be refused as access denied (Windows does), so a denied
-/// read is told apart by what a stat finds there.
+/// What a read of `p` that failed with `e`, neither `FileNotFound` nor
+/// `OutOfMemory`, says of it, judged with what a stat finds there.
 fn readFailure(io: Io, p: []const u8, e: anyerror) ReadFailure {
-    return switch (e) {
-        error.IsDir => .not_a_file,
-        error.AccessDenied, error.PermissionDenied => {
-            const st = Io.Dir.cwd().statFile(io, p, .{}) catch return .denied;
-            return if (st.kind == .file) .denied else .not_a_file;
-        },
-        else => .other,
+    const denied = e == error.AccessDenied or e == error.PermissionDenied;
+    const st = Io.Dir.cwd().statFile(io, p, .{}) catch {
+        if (e == error.IsDir) return .not_a_file;
+        return if (denied) .denied_dir else .other;
     };
+    if (st.kind != .file) return .not_a_file;
+    return if (denied) .denied else .other;
 }
 
 /// Why the record at `p` could not be updated: its write failed with `e`.
@@ -727,7 +736,7 @@ test "linuxIdentity: a machine-id that is there but cannot be read is a failed r
     try tmp.dir.createDirPath(io, "machine-id");
     const etc = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "machine-id" });
     const got = try linuxIdentity(a, io, &.{etc});
-    try testing.expect(std.mem.indexOf(u8, got.failed.why, "could not be read") != null);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}: IsDir", .{etc}), got.failed.why);
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} a readable file", .{etc}), got.failed.fix);
 }
 
@@ -747,8 +756,30 @@ test "linuxIdentity: a machine-id read denied by its permissions says to make it
     const got = try linuxIdentity(a, io, &.{etc});
     // Root reads it regardless.
     if (got == .known) return error.SkipZigTest;
-    try testing.expect(std.mem.indexOf(u8, got.failed.why, "could not be read") != null);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}: AccessDenied", .{etc}), got.failed.why);
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} readable", .{etc}), got.failed.fix);
+}
+
+test "linuxIdentity: a machine-id behind a directory that denies search says to make it and its directory readable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.createDirPath(io, "etc");
+    try tmp.dir.writeFile(io, .{ .sub_path = "etc/machine-id", .data = "e7e7e7\n" });
+    const dir = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "etc" });
+    const etc = try std.fs.path.join(a, &.{ dir, "machine-id" });
+    const dir_z = try a.dupeZ(u8, dir);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(dir_z, 0o000));
+    defer _ = std.c.chmod(dir_z, 0o700);
+    const got = try linuxIdentity(a, io, &.{etc});
+    // Root reads it regardless.
+    if (got == .known) return error.SkipZigTest;
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}: AccessDenied", .{etc}), got.failed.why);
+    try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} and its directory readable", .{etc}), got.failed.fix);
 }
 
 const ioreg_line = "/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice";
@@ -954,7 +985,7 @@ test "load: an unusable, a newer and an unreadable record each block their backe
         got.seen.blockedOf("apt").?,
     );
     try testing.expectEqualStrings(
-        try std.fmt.allocPrint(a, "{s} is not a file; replace it with a file, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{dnf_path}),
+        try std.fmt.allocPrint(a, "{s} is not a file; remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{dnf_path}),
         got.seen.blockedOf("dnf").?,
     );
     for ([_][]const u8{ "brew", "apt", "dnf" }) |n| try testing.expect(!got.stateOf(n).?.writable);
@@ -992,6 +1023,83 @@ test "load: a record read denied by its permissions says to make it readable" {
     try testing.expectEqualStrings(
         try std.fmt.allocPrint(a, "{s} could not be read (AccessDenied); make it readable", .{brew_z}),
         got.seen.blockedOf("brew").?,
+    );
+}
+
+test "load: a record path holding a directory its permissions deny is not a file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    const owner = ownerOf("machine-a");
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    const brew_path = try path(a, state, "brew", &owner);
+    try Io.Dir.cwd().createDirPath(io, brew_path);
+    const brew_z = try a.dupeZ(u8, brew_path);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(brew_z, 0o000));
+    defer _ = std.c.chmod(brew_z, 0o700);
+
+    var machine = testMachine(a, .{ .known = "machine-a" });
+    const got = try load(a, io, state, &machine, &.{brew.backend()}, &.{});
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} is not a file; remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{brew_path}),
+        got.seen.blockedOf("brew").?,
+    );
+}
+
+test "load: a record behind a directory that denies search says to make it and the directory holding it readable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try tmpState(a, &tmp);
+    const owner = ownerOf("machine-a");
+    var brew: test_backend.Fake = .{ .name = "brew" };
+    try replace(a, io, state, "brew", &owner, &.{"ripgrep"});
+    const brew_path = try path(a, state, "brew", &owner);
+    const dir_z = try a.dupeZ(u8, std.fs.path.dirname(brew_path).?);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(dir_z, 0o000));
+    defer _ = std.c.chmod(dir_z, 0o700);
+
+    var machine = testMachine(a, .{ .known = "machine-a" });
+    const got = try load(a, io, state, &machine, &.{brew.backend()}, &.{});
+    // Root reads it regardless.
+    if (got.seen.records.len != 0) return error.SkipZigTest;
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} could not be read (AccessDenied); make it and the directory holding it readable", .{brew_path}),
+        got.seen.blockedOf("brew").?,
+    );
+}
+
+test "unreadableWhy: a socket where a record goes is not a file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "s" });
+    var addr: std.c.sockaddr.un = .{ .path = @splat(0) };
+    if (p.len >= addr.path.len) return error.SkipZigTest;
+    @memcpy(addr.path[0..p.len], p);
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    try testing.expectEqual(@as(c_int, 0), std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)));
+
+    // Opening a socket fails as Unexpected (macOS) or NoDevice (Linux);
+    // reading it here would print the unexpected errno's trace.
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "{s} is not a file; remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{p}),
+        try unreadableWhy(a, io, p, error.Unexpected),
     );
 }
 
