@@ -1077,9 +1077,10 @@ fn bootstrapBackends(
             continue;
         };
         if (backend.bootstrapRanInstaller()) try ran_names.append(ctx.alloc, b.backend);
-        // The installer executed, whatever it left behind: the machine may
-        // have changed, so the run must re-read it even where the manager it
-        // was supposed to install is still not there.
+        // The bootstrap ran an installer or adopted a manager already here,
+        // whatever it left behind: the machine or PATH may have changed, so
+        // the run captures it again even where the manager is still not
+        // there.
         ran += 1;
         if (bin_dir) |dir| {
             if (!std.fs.path.isAbsolute(dir) or (std.Io.Dir.cwd().access(ctx.io, dir, .{}) catch null) == null) {
@@ -1164,9 +1165,9 @@ const PackageCounts = struct {
     /// Managers installed from their declared installer: the machine changed
     /// even when no row was left to install.
     bootstrapped: usize = 0,
-    /// Declared installers that executed, the ones that left their manager
-    /// absent included: an installer that ran may have changed the machine
-    /// whether or not it did the one thing it was fetched for.
+    /// Bootstraps that ran an installer or adopted a manager already here,
+    /// the ones that left their manager absent included: either may have
+    /// changed the machine or PATH whether or not the manager is now there.
     bootstrap_ran: usize = 0,
     installed: usize = 0,
     /// Rows converged without an install: the package was on the machine
@@ -1497,10 +1498,10 @@ fn applyPackages(
 /// backend, else by the read before. A backend whose installer ran this run
 /// held nothing in effect, so its record starts afresh, even where the
 /// bootstrap failed: the manager the report read is the one the installer
-/// left. A backend assumed, broken, or whose record could not be read or is
-/// a newer mox's keeps its record as it is, and so does every backend when
-/// the machine's identity could not be read, which is said once. A write
-/// that fails is said and fails nothing: the packages are installed.
+/// left. A backend that is assumed, broken, or whose record is not writable
+/// keeps its record as it is, and so does every backend when the machine's
+/// identity could not be read, which is said once. A write that fails is
+/// said and fails nothing: the packages are installed.
 fn updateRecords(
     ctx: *app.Ctx,
     context: app.Context,
