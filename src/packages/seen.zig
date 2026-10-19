@@ -375,8 +375,7 @@ pub const Loaded = struct {
 /// backend at all. Falling back to no record would install again every
 /// package it says this machine lost, so the report calls that backend
 /// broken for the run instead, saying why and what fixes it, unless no row
-/// declares it. A backend in
-/// `exclude` is never blocked.
+/// declares it. A backend in `exclude` is never blocked.
 pub fn load(
     arena: std.mem.Allocator,
     io: Io,
