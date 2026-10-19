@@ -5660,6 +5660,58 @@ test "apply: an installer that exits nonzero but leaves its manager there starts
     try std.testing.expectEqualStrings("fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
 }
 
+test "apply: a manager still absent after its installer fails keeps its record byte for byte across applies" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    const installer = "#!/bin/bash\nexit 1\n";
+    const hex = mox.apply.applied.contentHashHex(installer);
+    try writeManifest(io, h, a, "darwin.toml", try std.fmt.allocPrint(a,
+        \\backend = "brew"
+        \\
+        \\[[bootstrap]]
+        \\url = "https://example.invalid/install.sh"
+        \\sha256 = "{s}"
+        \\
+        \\[[packages]]
+        \\name = "fd"
+        \\
+        \\[[packages]]
+        \\name = "ripgrep"
+        \\
+    , .{hex}));
+    try writeSeen(h, "brew", testutil.test_identity, &.{ "fd", "ripgrep" });
+    const before = try seenBytes(h, "brew", testutil.test_identity);
+
+    mox.cli.app.brew_prefixes_override = &no_brew_prefix;
+    defer mox.cli.app.brew_prefixes_override = null;
+    mox.cli.app.elevation_override = .root;
+    defer mox.cli.app.elevation_override = null;
+    var entries: std.ArrayList(mox.packages.exec.Fake.Entry) = .empty;
+    try entries.append(a, .{ .argv = "brew --version", .fail = error.FileNotFound });
+    try absentLinuxManagers(a, &entries);
+    try entries.append(a, roomy_df);
+    try entries.append(a, .{ .argv = "curl -fsSL -o", .match = .prefix, .stdout = installer, .write_after = "-o", .io = io });
+    try entries.append(a, .{ .argv = "env HOMEBREW_NO_ASK=1 NONINTERACTIVE=1 /bin/bash", .match = .prefix, .code = 1 });
+    const fake = try a.create(mox.packages.exec.Fake);
+    fake.* = .{ .arena = a, .entries = try entries.toOwnedSlice(a) };
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    for (0..2) |_| {
+        const r = try h.run(&.{ "mox", "apply" });
+        errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+        try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: the installer exited 1\n") != null);
+        try std.testing.expectEqual(@as(u8, 2), r.rc);
+        try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
+    }
+}
+
 test "apply: a bootstrap that adopts a scoop already here runs no installer, so its record stays in effect across applies" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
