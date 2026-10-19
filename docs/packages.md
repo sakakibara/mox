@@ -732,8 +732,8 @@ message names the record's path, the cause and the fix:
   had lost;
 - when the machine's identity cannot be read, which record is this
   machine's cannot be told, so any record file for that backend, of any
-  owner, blocks it, saying why the identity could not be read and what to
-  make readable.
+  owner, blocks it, saying why the identity could not be read and what
+  fixes it.
 
 With no record file for a backend, an identity that cannot be read only
 leaves its record unwritten, which a note says once. The identity is read

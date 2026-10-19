@@ -5461,7 +5461,7 @@ test "apply: an identity that cannot be read writes no record, saying so once; w
         \\name = "ripgrep"
         \\
     );
-    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .source = "/usr/sbin/ioreg" } };
+    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .fix = "make /usr/sbin/ioreg runnable" } };
     defer mox.cli.app.identity_override = null;
     const fake = try brewWithRecorded(a, "ripgrep\n", "ripgrep\n", "fd\nripgrep\n", "", &.{
         .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
@@ -5486,7 +5486,7 @@ test "apply: an identity that cannot be read writes no record, saying so once; w
     const r2 = try h.run(&.{ "mox", "apply" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r2.out, r2.err });
     try std.testing.expectEqual(@as(u8, 2), r2.rc);
-    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg readable", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
+    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg runnable", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
     try std.testing.expect(std.mem.indexOf(u8, r2.err, try std.fmt.allocPrint(a, "mox apply: brew: record: {s}; its packages were left alone\n", .{why})) != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.out, note) == null);
     for (second.calls.items) |c| try std.testing.expect(!std.mem.startsWith(u8, c, "env HOMEBREW_NO_ASK=1 brew install"));
@@ -5507,7 +5507,7 @@ test "apply: a failed identity read says once that no record is written, even fo
     // is read for it, and brew, with no file of its own, is left unwritten.
     try writeSeen(h, "apt", "another-machine", &.{"ripgrep"});
     const apt_before = try seenBytes(h, "apt", "another-machine");
-    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .source = "/usr/sbin/ioreg" } };
+    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .fix = "make /usr/sbin/ioreg runnable" } };
     defer mox.cli.app.identity_override = null;
     const fake = try brewWithRecorded(a, "", "", "fd\n", "", &.{
         .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
@@ -5982,11 +5982,11 @@ test "status: an identity that cannot be read, with a record file there, shows t
     try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
     try writeSeen(h, "brew", testutil.test_identity, &.{"fd"});
     const before = try seenBytes(h, "brew", testutil.test_identity);
-    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .source = "/usr/sbin/ioreg" } };
+    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .fix = "make /usr/sbin/ioreg runnable" } };
     defer mox.cli.app.identity_override = null;
     useFake(try brewWith(a, "", "", &.{}));
     defer mox.cli.app.package_runner_override = null;
-    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg readable", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
+    const why = try std.fmt.allocPrint(a, "this machine's identity could not be read (/usr/sbin/ioreg exited 1), so which record under {s} is its own cannot be told; make /usr/sbin/ioreg runnable", .{try std.fs.path.join(a, &.{ h.state, mox.packages.seen.dir_name })});
 
     const r = try h.run(&.{ "mox", "status" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
