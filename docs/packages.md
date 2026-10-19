@@ -712,8 +712,10 @@ asked whether a package is on the machine, and, for apply, the manager's
 installer did not run in that run. With no record, a declared package that
 is not installed is MISSING. A manager whose installer ran and is there
 afterwards, even after a failed install, starts its record afresh from what
-it verifiably holds; one still absent afterwards keeps its record as it
-is.
+it verifiably holds, except that a newer mox's record is never written
+over, and a record that cannot be read, or any record when the machine's
+identity cannot be read, is not written; one still absent afterwards keeps
+its record as it is.
 
 A record that is there but cannot be used never counts as none, since that
 would install again every package it says this machine lost. Instead the
@@ -722,7 +724,8 @@ installed through it, apply exits 2, status shows it in every format, and
 commit has nothing to reconcile for it. A backend no `[[packages]]` row
 declares, under any gate, is never blocked: its record is neither used nor
 written, and the backend is reported as usual, its untracked packages
-included. The message names the record's path, the cause and the fix:
+included. The message names the cause and the fix, and the record's path,
+or, when the identity cannot be read, the `seen/` directory:
 
 - a record whose first line is `mox-seen <N>`, N above 1, was written by a
   newer mox and is neither read nor replaced: upgrade mox;

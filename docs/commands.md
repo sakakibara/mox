@@ -351,8 +351,10 @@ each machine held is recorded per backend under the state directory
 packages verified installed, plus what it held before and some row still
 declares under any gate. A manager whose installer ran in the run and is
 there afterwards starts that record afresh, even when the installer
-failed: the record then holds only what that manager verifiably holds. One
-still absent afterwards has its record left as it is. A record that is
+failed: the record then holds only what that manager verifiably holds. A
+record written by a newer mox is still never written over, and one that
+cannot be read, or any record when this machine's identity cannot be read,
+is not written. One still absent afterwards has its record left as it is. A record that is
 there but cannot be used -- written by a newer mox, unreadable, unusable,
 or any record file for that manager when this machine's identity cannot be
 read -- makes that manager `BROKEN` for the run, naming the cause and the
