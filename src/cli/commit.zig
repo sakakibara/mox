@@ -1351,7 +1351,8 @@ fn stillDeclared(ctx: *app.Ctx, context: app.Context, b: mox.packages.backend.Ba
 }
 
 /// Take `id` out of this machine's record for `backend`. Null when it is
-/// out; otherwise why it could not be taken out.
+/// out; otherwise why it could not be taken out, in the words a record that
+/// blocks its backend is reported in.
 fn forgetHeld(
     ctx: *app.Ctx,
     state_dir: []const u8,
@@ -1360,24 +1361,27 @@ fn forgetHeld(
     backend: []const u8,
     id: []const u8,
 ) !?[]const u8 {
-    const state = loaded.stateOf(backend) orelse return "its manager keeps no record";
-    if (!state.writable) return "the record cannot be written";
+    // Whatever left the record unwritable -- a failed identity read, a
+    // newer mox's record, one that cannot be read or is unusable -- is met
+    // again below and named there.
+    if (loaded.stateOf(backend) == null) return "its manager keeps no record";
     const owner = (try machine.owner()) orelse return "this machine's identity could not be read";
+    const p = try mox.packages.seen.path(ctx.alloc, state_dir, backend, &owner);
     const held = mox.packages.seen.read(ctx.alloc, ctx.io, state_dir, backend, &owner) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return @errorName(e),
+        else => return try mox.packages.seen.unreadableWhy(ctx.alloc, p, e),
     };
     const ids = switch (held) {
         .ids => |ids| ids,
         .absent => return null,
-        .unusable => |why| return try std.fmt.allocPrint(ctx.alloc, "the record is unusable ({s})", .{why}),
-        .newer => return "the record was written by a newer mox; upgrade mox",
+        .unusable => |why| return try mox.packages.seen.unusableWhy(ctx.alloc, p, why),
+        .newer => return try mox.packages.seen.newerWhy(ctx.alloc, p),
     };
     var kept: std.ArrayList([]const u8) = .empty;
     for (ids) |held_id| if (!std.mem.eql(u8, held_id, id)) try kept.append(ctx.alloc, held_id);
     mox.packages.seen.replace(ctx.alloc, ctx.io, state_dir, backend, &owner, kept.items) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        else => return @errorName(e),
+        else => return try std.fmt.allocPrint(ctx.alloc, "{s} could not be written ({s})", .{ p, @errorName(e) }),
     };
     return null;
 }

@@ -6398,6 +6398,8 @@ test "commit: r whose record write fails keeps the row's removal and warns, sayi
     try std.testing.expectEqual(@as(u8, 0), r.rc);
     try std.testing.expectEqualStrings("backend = \"brew\"\n\n", try readManifest(io, h, a, "darwin.toml"));
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox commit: warning: brew fd: its row was removed, but mox could not update its record of what this machine held: ") != null);
+    const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, try std.fmt.allocPrint(a, "held: {s} could not be written (", .{record})) != null);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "; until an apply rewrites the record, a row declaring it again reads as removed\n") != null);
     try std.testing.expectEqualStrings("fd", try readSeen(h, "brew", testutil.test_identity));
 }

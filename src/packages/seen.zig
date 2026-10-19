@@ -393,11 +393,7 @@ pub fn load(
         const got = read(arena, io, state_dir, b.name, &o) catch |e| {
             if (e == error.OutOfMemory) return e;
             try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
-            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
-                arena,
-                "{s} could not be read ({s}); make it readable",
-                .{ p, @errorName(e) },
-            ) });
+            if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try unreadableWhy(arena, p, e) });
             continue;
         };
         switch (got) {
@@ -408,19 +404,11 @@ pub fn load(
             },
             .unusable => |why| {
                 try states.append(arena, .{ .backend = b.name, .writable = excluded, .exists = true });
-                if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
-                    arena,
-                    "{s} is not a record mox can read ({s}); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost",
-                    .{ p, why },
-                ) });
+                if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try unusableWhy(arena, p, why) });
             },
             .newer => {
                 try states.append(arena, .{ .backend = b.name, .writable = false, .exists = true });
-                if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try std.fmt.allocPrint(
-                    arena,
-                    "{s} was written by a newer mox; upgrade mox",
-                    .{p},
-                ) });
+                if (!excluded) try blocked.append(arena, .{ .backend = b.name, .why = try newerWhy(arena, p) });
             },
         }
     }
@@ -428,6 +416,24 @@ pub fn load(
         .seen = .{ .records = try records.toOwnedSlice(arena), .blocked = try blocked.toOwnedSlice(arena) },
         .backends = try states.toOwnedSlice(arena),
     };
+}
+
+/// Why the record at `p`, written by a newer mox, cannot be used, and the
+/// fix.
+pub fn newerWhy(arena: std.mem.Allocator, p: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} was written by a newer mox; upgrade mox", .{p});
+}
+
+/// Why the record at `p`, whose read failed with `e`, cannot be used, and
+/// the fix.
+pub fn unreadableWhy(arena: std.mem.Allocator, p: []const u8, e: anyerror) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} could not be read ({s}); make it readable", .{ p, @errorName(e) });
+}
+
+/// Why the record at `p`, which `read` called unusable for `why`, cannot be
+/// used, and the fix.
+pub fn unusableWhy(arena: std.mem.Allocator, p: []const u8, why: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} is not a record mox can read ({s}); repair it, or remove it, after which the next apply installs every declared package this machine lacks, including ones it had lost", .{ p, why });
 }
 
 /// Per backend in `backends`, whether the records directory holds a file
