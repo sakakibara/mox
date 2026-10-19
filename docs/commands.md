@@ -357,10 +357,11 @@ there but cannot be used -- written by a newer mox, unreadable, unusable,
 or any record file for that manager when this machine's identity cannot be
 read -- makes that manager `BROKEN` for the run, naming the cause and the
 fix, and nothing is installed through it (exit 2); falling back to no
-record would install again what the record says this machine lost. When
-no row asks that manager to install anything, a note says so instead and
-the run is not failed for it. With no record file, an identity that cannot
-be read only leaves the record unwritten, which a note says once.
+record would install again what the record says this machine lost. A
+manager no `[[packages]]` row declares, under any gate, is never blocked:
+its record is neither used nor written, and the manager is reported as
+usual. With no record file, an identity that cannot be read only leaves
+the record unwritten, which a note says once.
 An `UNCHECKED` one is named on stderr and counted (`, N unchecked`) but
 changes nothing about the exit code: what apply installs is known all the
 same. Each backend that installed anything is asked again afterwards, and a

@@ -6242,6 +6242,45 @@ test "apply, status and commit: a record that cannot be read breaks its backend,
     try expectBlocked(.{ .data = null, .why = unreadableWhy });
 }
 
+test "apply, status and commit: a backend no row declares is never blocked by its record, so its untracked packages still show, and the record is left as it is" {
+    const io = std.testing.io;
+    for ([_][]const u8{ "mox-seen 2\nfd\n", "mox-seen 1\r\nfd\r\n" }) |data| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const h = try setup(a, io, &tmp, .{});
+
+        try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n");
+        try testutil.markState(h);
+        const record = try mox.packages.seen.path(a, h.state, "brew", &mox.packages.seen.ownerOf(testutil.test_identity));
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(record).?);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = record, .data = data });
+        useFake(try brewWith(a, "htop\n", "", &.{}));
+        defer mox.cli.app.package_runner_override = null;
+
+        const r = try h.run(&.{ "mox", "apply" });
+        errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+        try std.testing.expectEqual(@as(u8, 0), r.rc);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "record") == null);
+        try std.testing.expect(std.mem.indexOf(u8, r.err, "record") == null);
+
+        const st = try h.run(&.{ "mox", "status" });
+        errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ st.out, st.err });
+        try std.testing.expect(std.mem.indexOf(u8, st.out, "UNTRACKED brew htop") != null);
+        try std.testing.expect(std.mem.indexOf(u8, st.out, "BROKEN") == null);
+
+        const c = try h.runWithInput(&.{ "mox", "commit" }, "s\n");
+        errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ c.out, c.err });
+        try std.testing.expectEqual(@as(u8, 1), c.rc);
+        try std.testing.expect(std.mem.indexOf(u8, c.out, "untracked package: brew htop") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c.out, "nothing to reconcile") == null);
+
+        try std.testing.expectEqualStrings(data, try Io.Dir.cwd().readFileAlloc(io, record, a, .limited(1 << 16)));
+    }
+}
+
 /// What commit asks about a removed package, before its choices.
 fn removedQuestion(a: std.mem.Allocator, backend: []const u8, name: []const u8, label: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "\nremoved package: {s} {s} ({s}): installed here before, not any more\n", .{ backend, name, label });

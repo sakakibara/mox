@@ -74,6 +74,9 @@ pub const BackendDrift = struct {
 /// A backend whose record is there but cannot be used is `blocked` instead:
 /// treating it as having none would install again what the record says
 /// this machine lost, so the report calls it broken, asking it nothing.
+/// One no `[[packages]]` row declares, under any gate, has nothing such a
+/// record could withhold: it is reported as usual, with no record in
+/// effect.
 pub const Seen = struct {
     records: []const Record = &.{},
     blocked: []const Blocked = &.{},
@@ -200,36 +203,16 @@ fn noteBroken(
     verb: []const u8,
     e: anyerror,
 ) !void {
-    return noteBrokenWhy(arena, broken, notes, diag, m, name, verb, exec.errorText(e));
-}
-
-/// `noteBroken` for a failure said in words rather than by an error.
-fn noteBrokenWhy(
-    arena: std.mem.Allocator,
-    broken: *std.ArrayList(Broken),
-    notes: *std.ArrayList([]const u8),
-    diag: ?*Diag,
-    m: manifest_mod.Manifest,
-    name: []const u8,
-    verb: []const u8,
-    why: []const u8,
-) !void {
-    // A record's why names the record and its fault; "record failed"
-    // before it would say neither.
-    const record = std.mem.eql(u8, verb, "record");
+    const why = exec.errorText(e);
     if (!actedOn(m, name)) {
-        try notes.append(arena, if (record) try std.fmt.allocPrint(
-            arena,
-            "{s}: {s}; no row asks it to install anything, so nothing here needs it",
-            .{ name, why },
-        ) else try std.fmt.allocPrint(
+        try notes.append(arena, try std.fmt.allocPrint(
             arena,
             "{s}: {s} failed: {s}; no row asks it to install anything, so nothing here needs it",
             .{ name, verb, why },
         ));
         return;
     }
-    if (diag) |d| if (record) d.set("{s}: {s}: {s}", .{ name, verb, why }) else d.set("{s}: {s} failed: {s}", .{ name, verb, why });
+    if (diag) |d| d.set("{s}: {s} failed: {s}", .{ name, verb, why });
     try broken.append(arena, .{
         .backend = name,
         .probe = verb,
@@ -357,8 +340,14 @@ pub fn fromManifest(
         });
     }
     for (usable.items) |b| {
-        if (b.canTellPresent()) if (seen.blockedOf(b.name)) |why| {
-            try noteBrokenWhy(arena, &broken, &notes, diag, m, b.name, "record", why);
+        // A backend no `[[packages]]` row declares has no package a record
+        // could withhold, so a record that cannot be used costs it nothing:
+        // it is reported as usual, with no record in effect. Its record's
+        // why names the record and its fault; "record failed" before it
+        // would say neither.
+        if (b.canTellPresent() and declares(m, b.name)) if (seen.blockedOf(b.name)) |why| {
+            if (diag) |d| d.set("{s}: record: {s}", .{ b.name, why });
+            try broken.append(arena, .{ .backend = b.name, .probe = "record", .code = null, .why = why });
             continue;
         };
         const installed = b.installedExplicit(arena) catch |e| {
@@ -484,6 +473,12 @@ fn named(m: manifest_mod.Manifest, backend: []const u8) bool {
 /// asks for nothing to happen, so a manager named by one alone has nothing
 /// to install and nothing to judge: its being broken is worth a note, not
 /// drift the run can never clear.
+/// Whether some `[[packages]]` row names `backend`, under any gate.
+fn declares(m: manifest_mod.Manifest, backend: []const u8) bool {
+    for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
+    return false;
+}
+
 fn actedOn(m: manifest_mod.Manifest, backend: []const u8) bool {
     for (m.packages) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
     for (m.bootstrap) |row| if (std.mem.eql(u8, row.backend, backend)) return true;
@@ -1150,16 +1145,27 @@ test "fromManifest: a blocked record breaks its backend on the record, asking it
     try testing.expect(!rep.clean());
     try testing.expectEqualStrings("fake: record: /s/seen/fake-0.txt was written by a newer mox; upgrade mox", d.capture().?);
 
-    // No row asks it for anything: a note, naming the record's fault alone.
-    var idle: test_backend.Fake = .{ .name = "fake", .present_answer = error.Unreached };
+    // A row gated off this machine still declares the backend: its record
+    // keeps that row's uninstall, so the backend is blocked all the same.
+    var gated_off: test_backend.Fake = .{ .name = "fake", .present_answer = error.Unreached };
+    const m4: manifest_mod.Manifest = .{ .packages = &.{gatedRowOf("bat", "fake", "os=nowhere")}, .files = 1 };
+    const rep4 = try fromManifest(a, m4, .{ .backends = &.{gated_off.backend()} }, &r, &.{}, .judge, seen, null);
+    try testing.expectEqual(@as(usize, 1), rep4.broken.len);
+    try testing.expectEqualStrings("record", rep4.broken[0].probe);
+
+    // No row declares it: there is nothing for the record to withhold, so
+    // it is reported as usual, with no record in effect and its untracked
+    // packages listed.
+    var idle: test_backend.Fake = .{ .name = "fake", .installed = &.{"htop"}, .present_answer = error.Unreached };
     const m3: manifest_mod.Manifest = .{ .packages = &.{rowOf("jq", "other")}, .files = 1 };
     const rep3 = try fromManifest(a, m3, .{ .backends = &.{ idle.backend(), other.backend() } }, &r, &.{}, .judge, seen, null);
     try testing.expectEqual(@as(usize, 0), rep3.broken.len);
-    try testing.expectEqual(@as(usize, 1), rep3.notes.len);
-    try testing.expectEqualStrings(
-        "fake: /s/seen/fake-0.txt was written by a newer mox; upgrade mox; no row asks it to install anything, so nothing here needs it",
-        rep3.notes[0],
-    );
+    try testing.expectEqual(@as(usize, 0), rep3.notes.len);
+    try testing.expectEqual(@as(usize, 2), rep3.backends.len);
+    try testing.expectEqualStrings("fake", rep3.backends[0].backend);
+    try testing.expectEqual(@as(usize, 1), rep3.backends[0].drift.untracked.len);
+    try testing.expectEqualStrings("htop", rep3.backends[0].drift.untracked[0]);
+    try testing.expectEqual(@as(usize, 0), idle.present_calls);
 
     // A manager with no present keeps no record, so nothing blocks it.
     var unaskable: test_backend.Fake = .{ .name = "fake", .tells_present = false };

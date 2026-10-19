@@ -14,8 +14,8 @@ All notable changes to mox are documented here. The format follows
   identity. A record that is there but cannot be used (written by a newer
   mox, unreadable, unusable, or unidentifiable as this machine's) makes its
   manager broken for the run, saying what fixes it, rather than counting as
-  none; when no row asks that manager for anything, a note says so
-  instead. A state directory that `MOX_STATE_DIR` names may hold it before
+  none, unless no row declares a package for that manager. A state
+  directory that `MOX_STATE_DIR` names may hold it before
   it holds the marker, and `mox uninstall` removes it.
 - `mox commit` offers each removed package (see Changed) after the untracked
   ones: `r` deletes its row from the manifest, for every machine; `k` gates
