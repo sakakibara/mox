@@ -1054,7 +1054,7 @@ built-in keeps its place, so the rows it validates stay validated.
 | `list` | -- | one id per line: what was explicitly installed | nonzero, 64 included: failed |
 | `install` | rows, one per line | streamed to the terminal | nonzero, 64 included: failed |
 | `declare <id>` | -- | a TOML row body: `name = "..."` plus adapter fields | nonzero, 64 included: failed |
-| `bootstrap <path> <out>` | -- | streamed to the terminal; the bin dir to put on PATH, if any, is written to the file `<out>` as one line, an absolute path (a second line, or a relative path, is bad output) | 64: not implemented; other nonzero: failed |
+| `bootstrap <path> <out>` | -- | streamed to the terminal; the bin dir to put on PATH, if any, is written to the file `<out>` as one line, an absolute path (a second line, or a relative path, is bad output) | 64: not implemented, so never once an installer ran; other nonzero: failed |
 | `limitation` | -- | one line on what it cannot see, at most 200 bytes and no control bytes | 64: none; other nonzero: failed |
 
 Rows arrive as TOML inline tables carrying `name` and the row's adapter
@@ -1087,7 +1087,11 @@ backend.
   was needed. Nothing is substituted for a missing verb. Every other verb is
   required, so 64 from one of them carries no meaning: `available` reads it as
   a broken plugin like any other unexpected exit, and `id`, `list`, `install`
-  and `declare` as a failure like any other nonzero exit.
+  and `declare` as a failure like any other nonzero exit. A `bootstrap` must
+  not exit 64 after running an installer: mox reads 64 as nothing having
+  run, and keeps the record of what this machine held through the manager
+  the installer may have replaced. A plugin that passes an installer's exit
+  code through maps 64 to another failure code.
 - Every captured call runs under `LC_ALL=C` with `LANGUAGE` unset, because
   mox parses what it prints and parses one language; a streamed call keeps
   your locale, because what it prints reaches your terminal

@@ -102,8 +102,9 @@ pub const Plugin = struct {
     /// installed nothing, and its rows must not be reported as possibly
     /// landed.
     spawned: bool = false,
-    /// Whether the last `bootstrap` handed the installer to a plugin that
-    /// implements the verb, which `bootstrapRanInstaller` answers with.
+    /// Whether the last `bootstrap` asked the plugin to run the installer
+    /// and was not told the verb is not implemented, which
+    /// `bootstrapRanInstaller` answers with.
     ran_installer: bool = false,
 
     pub fn backend(self: *Plugin) Backend {
@@ -328,6 +329,7 @@ pub const Plugin = struct {
     /// run can use what it installed.
     fn bootstrapImpl(ctx: *anyopaque, arena: std.mem.Allocator, installer_path: []const u8) anyerror!?[]const u8 {
         const self: *Plugin = @ptrCast(@alignCast(ctx));
+        self.ran_installer = false;
         const out_path = try std.fmt.allocPrint(arena, "{s}.bindir", .{installer_path});
         std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
         defer std.Io.Dir.cwd().deleteFile(self.io, out_path) catch {};
