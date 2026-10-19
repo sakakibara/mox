@@ -15,9 +15,9 @@ All notable changes to mox are documented here. The format follows
   unreadable, unusable, or unidentifiable as this machine's) makes its
   manager broken for the run, saying what fixes it, rather than counting as
   none, unless no `[[packages]]` row, under any gate, declares a package for
-  that manager (a `[[bootstrap]]` row does not count). A state directory
-  that `MOX_STATE_DIR` names may hold it before it holds the marker, and
-  `mox uninstall` removes it.
+  that manager (a `[[bootstrap]]` or `[[blacklist]]` row does not count). A
+  state directory that `MOX_STATE_DIR` names may hold it before it holds
+  the marker, and `mox uninstall` removes it.
 - `mox commit` offers each removed package (see Changed) after the untracked
   ones: `r` deletes its row from the manifest, for every machine; `k` gates
   the row off this machine with `not machine="<m>"`; `i` has the next apply
