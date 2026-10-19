@@ -102,9 +102,11 @@ pub const Plugin = struct {
     /// installed nothing, and its rows must not be reported as possibly
     /// landed.
     spawned: bool = false,
-    /// Whether the last `bootstrap` asked the plugin to run the installer
-    /// and was not told the verb is not implemented, which
-    /// `bootstrapRanInstaller` answers with.
+    /// Whether the last `bootstrap` may have run the installer, which
+    /// `bootstrapRanInstaller` answers with: set as the plugin is started,
+    /// since a call that fails cannot tell a plugin that never started from
+    /// one that ran and failed, and cleared when the plugin answers that the
+    /// verb is not implemented.
     ran_installer: bool = false,
 
     pub fn backend(self: *Plugin) Backend {
