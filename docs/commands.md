@@ -350,20 +350,20 @@ each machine held is recorded per backend under the state directory
 (`seen/`) after each real apply that ran its package step: the desired
 packages verified installed, plus what it held before and some row still
 declares under any gate. A manager whose installer ran in the run and is
-there afterwards starts that record afresh, even when the installer
-failed: the record then holds only what that manager verifiably holds. A
-record written by a newer mox is still never written over, and one that
-cannot be read, or any record when this machine's identity cannot be read,
-is not written. One still absent afterwards has its record left as it is. A record that is
-there but cannot be used -- written by a newer mox, unreadable, unusable,
-or any record file for that manager when this machine's identity cannot be
-read -- makes that manager `BROKEN` for the run, naming the cause and the
-fix, and nothing is installed through it (exit 2); falling back to no
-record would install again what the record says this machine lost. A
-manager no `[[packages]]` row declares, under any gate, is never blocked:
-its record is neither used nor written, and the manager is reported as
-usual. With no record file, an identity that cannot be read only leaves
-the record unwritten, which a note says once.
+there afterwards starts that record afresh, even when the installer failed:
+the record then holds only what that manager verifiably holds. A record
+written by a newer mox is still never written over, and one that cannot be
+read, or any record when this machine's identity cannot be read, is not
+written. One still absent afterwards has its record left as it is. A record
+that is there but cannot be used -- written by a newer mox, unreadable,
+unusable, or any record file for that manager when this machine's identity
+cannot be read -- makes that manager `BROKEN` for the run, naming the cause
+and the fix, and nothing is installed through it (exit 2); falling back to
+no record would install again what the record says this machine lost. A
+manager no `[[packages]]` row declares, under any gate, is never blocked: a
+record it cannot use is neither used nor written, and the manager is
+reported as usual. With no record file, an identity that cannot be read only
+leaves the record unwritten, which a note says once.
 An `UNCHECKED` one is named on stderr and counted (`, N unchecked`) but
 changes nothing about the exit code: what apply installs is known all the
 same. Each backend that installed anything is asked again afterwards, and a

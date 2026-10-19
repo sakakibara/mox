@@ -9,14 +9,15 @@ All notable changes to mox are documented here. The format follows
 ### Added
 - mox records, per package manager and per machine, the declared packages
   each machine was seen holding, in `<state dir>/seen/`. Each `mox apply`
-  that runs its package step, `--dry-run` aside, writes it; machines
-  sharing a state directory each keep their own, keyed by the machine's
-  identity. A record that is there but cannot be used (written by a newer
-  mox, unreadable, unusable, or unidentifiable as this machine's) makes its
+  that runs its package step, `--dry-run` aside, writes it; machines sharing
+  a state directory each keep their own, keyed by the machine's identity. A
+  record that is there but cannot be used (written by a newer mox,
+  unreadable, unusable, or unidentifiable as this machine's) makes its
   manager broken for the run, saying what fixes it, rather than counting as
-  none, unless no row declares a package for that manager. A state
-  directory that `MOX_STATE_DIR` names may hold it before
-  it holds the marker, and `mox uninstall` removes it.
+  none, unless no `[[packages]]` row, under any gate, declares a package for
+  that manager (a `[[bootstrap]]` row does not count). A state directory
+  that `MOX_STATE_DIR` names may hold it before it holds the marker, and
+  `mox uninstall` removes it.
 - `mox commit` offers each removed package (see Changed) after the untracked
   ones: `r` deletes its row from the manifest, for every machine; `k` gates
   the row off this machine with `not machine="<m>"`; `i` has the next apply
