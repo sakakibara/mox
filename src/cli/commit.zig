@@ -1351,8 +1351,9 @@ fn stillDeclared(ctx: *app.Ctx, context: app.Context, b: mox.packages.backend.Ba
 }
 
 /// Take `id` out of this machine's record for `backend`. Null when it is
-/// out, or when the manager keeps no record to take it out of; otherwise why it could not be taken out, naming the cause and,
-/// where there is one, the fix, as a record that blocks its backend does.
+/// out, or when the manager keeps no record to take it out of; otherwise
+/// why it could not be taken out, naming the cause and, where there is
+/// one, the fix, as a record that blocks its backend does.
 fn forgetHeld(
     ctx: *app.Ctx,
     state_dir: []const u8,
