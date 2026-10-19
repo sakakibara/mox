@@ -953,9 +953,9 @@ fn applyPass(
 /// installs that follow only through it. Returns how many were installed and
 /// how many failed: a manager that will not install is a genuine failure,
 /// not a reason to press on quietly installing nothing. Also returns the
-/// names of the managers it bootstrapped: a record of what this machine held
-/// through a manager just installed afresh describes a manager that is gone,
-/// so it is not in effect for them.
+/// names of the managers whose installer it ran, whatever came of it: a
+/// record of what this machine held through a manager just installed afresh
+/// describes a manager that is gone, so it is not in effect for them.
 ///
 /// An installer is believed only as far as the manager it was supposed to
 /// leave behind: the probe is asked again afterwards, and one that still
@@ -1485,18 +1485,20 @@ fn applyPackages(
     // longer goes back through its install, which for an installed package
     // is the adapter's own way of recording it.
     const after = if (installed_here.items.len > 0) try restoreRegressed(ctx, &pkg_backends, registry, manifest, bindings, rep, installed_here.items, &counts) else null;
-    if (!dry_run) try updateRecords(ctx, context, registry, &machine, loaded, rep, after, installed_here.items, failed_backends);
+    if (!dry_run) try updateRecords(ctx, context, registry, &machine, loaded, rep, after, installed_here.items);
     return counts;
 }
 
 /// Write each backend's record of what this machine held: what it held and
 /// some row still declares, plus what is desired here and verified
 /// installed -- by the read after the installs where one covered the
-/// backend, else by the read before. A backend assumed, broken, whose
-/// bootstrap failed, or whose record could not be read or is a newer mox's
-/// keeps its record as it is, and so does every backend when the machine's
-/// identity could not be read. A write that fails is said and fails
-/// nothing: the packages are installed.
+/// backend, else by the read before. A backend whose installer ran this run
+/// held nothing in effect, so its record starts afresh, even where the
+/// bootstrap failed: the manager the report read is the one the installer
+/// left. A backend assumed, broken, or whose record could not be read or is
+/// a newer mox's keeps its record as it is, and so does every backend when
+/// the machine's identity could not be read, which is said once. A write
+/// that fails is said and fails nothing: the packages are installed.
 fn updateRecords(
     ctx: *app.Ctx,
     context: app.Context,
@@ -1506,15 +1508,12 @@ fn updateRecords(
     before: mox.packages.report.Report,
     after: ?mox.packages.report.Report,
     installed_here: []const []const u8,
-    failed_backends: []const []const u8,
 ) !void {
     for (before.backends) |b| {
         if (b.assumed) continue;
-        if (bootstrapFailedFor(failed_backends, b.backend)) continue;
         const backend = registry.find(b.backend) orelse continue;
         if (!backend.canTellPresent()) continue;
         const state = loaded.stateOf(b.backend) orelse continue;
-        if (!state.writable) continue;
         var installed = b.explicit;
         if (containsName(installed_here, b.backend)) if (after) |a| for (a.backends) |ab| {
             if (std.mem.eql(u8, ab.backend, b.backend)) installed = ab.explicit;
@@ -1523,6 +1522,10 @@ fn updateRecords(
         // Nothing to write and nothing there to empty: the identity need
         // not be read for it.
         if (ids.len == 0 and !state.exists) continue;
+        if (!state.writable) {
+            if (try machine.failureNote()) |note| try ctx.out.print("  note            {s}\n", .{note});
+            continue;
+        }
         const owner = try machine.owner() orelse {
             if (try machine.failureNote()) |note| try ctx.out.print("  note            {s}\n", .{note});
             return;

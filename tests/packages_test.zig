@@ -5493,6 +5493,37 @@ test "apply: an identity that cannot be read writes no record, saying so once; w
     try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
 }
 
+test "apply: a failed identity read says once that no record is written, even for a backend skipped for another's file" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const h = try setup(a, io, &tmp, .{});
+
+    try writeManifest(io, h, a, "darwin.toml", "backend = \"brew\"\n\n[[packages]]\nname = \"fd\"\n");
+    // Another backend's record in the shared records directory: the identity
+    // is read for it, and brew, with no file of its own, is left unwritten.
+    try writeSeen(h, "apt", "another-machine", &.{"ripgrep"});
+    const apt_before = try seenBytes(h, "apt", "another-machine");
+    mox.cli.app.identity_override = .{ .failed = .{ .why = "/usr/sbin/ioreg exited 1", .source = "/usr/sbin/ioreg" } };
+    defer mox.cli.app.identity_override = null;
+    const fake = try brewWithRecorded(a, "", "", "fd\n", "", &.{
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
+    });
+    useFake(fake);
+    defer mox.cli.app.package_runner_override = null;
+
+    const r = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
+    try std.testing.expectEqual(@as(u8, 0), r.rc);
+    try std.testing.expect(fake.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r.out, "  note            this machine's identity could not be read (/usr/sbin/ioreg exited 1), so no record of the packages it held is used or written\n"));
+    try std.testing.expectEqualStrings("absent", try readSeen(h, "brew", testutil.test_identity));
+    try std.testing.expectEqualStrings(apt_before, try seenBytes(h, "apt", "another-machine"));
+}
+
 test "apply: a manager bootstrapped in the run ignores its record and starts it afresh" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5550,7 +5581,7 @@ test "apply: a manager bootstrapped in the run ignores its record and starts it 
     try std.testing.expectEqualStrings("ripgrep", try readSeen(h, "brew", testutil.test_identity));
 }
 
-test "apply: an installer that exits nonzero but leaves its manager there puts no record in effect and writes none" {
+test "apply: an installer that exits nonzero but leaves its manager there starts its record afresh, so the next apply withholds nothing" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5578,7 +5609,6 @@ test "apply: an installer that exits nonzero but leaves its manager there puts n
     // What the brew that was there before held; the one the installer left
     // holds nothing.
     try writeSeen(h, "brew", testutil.test_identity, &.{ "fd", "ripgrep" });
-    const before = try seenBytes(h, "brew", testutil.test_identity);
 
     const prefix_bin = try std.fs.path.join(a, &.{ h.state, "prefix", "bin" });
     try Io.Dir.cwd().createDirPath(io, prefix_bin);
@@ -5605,11 +5635,29 @@ test "apply: an installer that exits nonzero but leaves its manager there puts n
     const r = try h.run(&.{ "mox", "apply" });
     errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r.out, r.err });
     try std.testing.expect(std.mem.indexOf(u8, r.err, "mox apply: brew: bootstrap failed: the installer exited 1\n") != null);
-    try std.testing.expect(r.rc != 0);
+    try std.testing.expectEqual(@as(u8, 2), r.rc);
     try std.testing.expect(std.mem.indexOf(u8, r.err, "is not installed here any more") == null);
     try std.testing.expect(!fake.called(brew_present));
     for (fake.calls.items) |c| try std.testing.expect(std.mem.indexOf(u8, c, "brew install") == null);
-    try std.testing.expectEqualStrings(before, try seenBytes(h, "brew", testutil.test_identity));
+    // The brew left holds nothing, so neither does its record.
+    try std.testing.expectEqualStrings("absent", try readSeen(h, "brew", testutil.test_identity));
+
+    // The next apply finds brew there and no record of what the one before
+    // held: both rows are missing and installed, none removed.
+    mox.cli.app.brew_prefixes_override = null;
+    const next = try brewWithRecorded(a, "", "", "fd\nripgrep\n", "", &.{
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- fd" },
+        .{ .argv = "env HOMEBREW_NO_ASK=1 brew install -- ripgrep" },
+    });
+    useFake(next);
+    const r2 = try h.run(&.{ "mox", "apply" });
+    errdefer std.debug.print("stdout was:\n{s}\nstderr was:\n{s}\n", .{ r2.out, r2.err });
+    try std.testing.expectEqual(@as(u8, 0), r2.rc);
+    try std.testing.expect(std.mem.indexOf(u8, r2.err, "is not installed here any more") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.out, "Packages: 2 installed, 0 failed\n") != null);
+    try std.testing.expect(next.called("env HOMEBREW_NO_ASK=1 brew install -- fd"));
+    try std.testing.expect(next.called("env HOMEBREW_NO_ASK=1 brew install -- ripgrep"));
+    try std.testing.expectEqualStrings("fd ripgrep", try readSeen(h, "brew", testutil.test_identity));
 }
 
 test "apply: a row gated off this machine keeps its id recorded, and one no row declares is dropped" {
