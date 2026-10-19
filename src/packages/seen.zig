@@ -93,7 +93,17 @@ pub fn linuxIdentity(arena: std.mem.Allocator, io: Io, paths: []const []const u8
         const bytes = Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(4096)) catch |e| switch (e) {
             error.FileNotFound => continue,
             error.OutOfMemory => return e,
-            else => return .{ .failed = .{ .why = try std.fmt.allocPrint(arena, "{s} could not be read ({s})", .{ p, @errorName(e) }), .fix = try std.fmt.allocPrint(arena, "make {s} readable", .{p}) } },
+            else => return .{
+                .failed = .{
+                    .why = try std.fmt.allocPrint(arena, "{s} could not be read ({s})", .{ p, @errorName(e) }),
+                    // Only a denied read is fixed by permissions alone: a
+                    // directory, say, is readable and still holds no id.
+                    .fix = switch (e) {
+                        error.AccessDenied, error.PermissionDenied => try std.fmt.allocPrint(arena, "make {s} readable", .{p}),
+                        else => try std.fmt.allocPrint(arena, "make {s} a readable file", .{p}),
+                    },
+                },
+            },
         };
         const id = std.mem.trim(u8, bytes, " \t\r\n");
         if (id.len == 0 or std.mem.eql(u8, id, "uninitialized")) continue;
@@ -681,6 +691,31 @@ test "linuxIdentity: a machine-id that is there but cannot be read is a failed r
     try tmp.dir.createDirPath(io, "machine-id");
     const etc = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "machine-id" });
     const got = try linuxIdentity(a, io, &.{etc});
+    try testing.expect(std.mem.indexOf(u8, got.failed.why, "could not be read") != null);
+    // Windows may refuse a directory opened as a file as access denied.
+    if (std.mem.indexOf(u8, got.failed.why, "(IsDir)") != null) {
+        try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} a readable file", .{etc}), got.failed.fix);
+    } else {
+        try testing.expect(builtin.os.tag == .windows);
+    }
+}
+
+test "linuxIdentity: a machine-id read denied by its permissions says to make it readable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try tmp.dir.writeFile(io, .{ .sub_path = "machine-id", .data = "e7e7e7\n" });
+    const etc = try std.fs.path.join(a, &.{ try tmp.dir.realPathFileAlloc(io, ".", a), "machine-id" });
+    const etc_z = try a.dupeZ(u8, etc);
+    try testing.expectEqual(@as(c_int, 0), std.c.chmod(etc_z, 0o000));
+    defer _ = std.c.chmod(etc_z, 0o600);
+    const got = try linuxIdentity(a, io, &.{etc});
+    // Root reads it regardless.
+    if (got == .known) return error.SkipZigTest;
     try testing.expect(std.mem.indexOf(u8, got.failed.why, "could not be read") != null);
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "make {s} readable", .{etc}), got.failed.fix);
 }
