@@ -72,22 +72,24 @@ fn runShell(a: std.mem.Allocator, io: Io, argv: []const []const u8) !?[]const u8
 
 /// zpty harness: complete `cmdline` twice in a fresh interactive compsys
 /// session, printing FIRST-TAB-COMPLETED / SECOND-TAB-COMPLETED when `word`
-/// lands in the buffer. All keystrokes wait on the SETUP-DONE barrier.
+/// lands in the buffer. All keystrokes wait on the SETUP-DONE barrier. The
+/// waits are wall-clock deadlines that keep the harness silent for less than
+/// `wall_timeout`.
 fn zptyHarness(a: std.mem.Allocator, bin: []const u8, comp: []const u8, cmdline: []const u8, word: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a,
-        \\zmodload zsh/zpty || {{ print HARNESS-NO-ZPTY; exit 1 }}
+        \\zmodload zsh/zpty zsh/datetime || {{ print HARNESS-NO-ZPTY; exit 1 }}
         \\ACC=""
         \\drain() {{ local chunk; while zpty -rt z chunk 2>/dev/null; do ACC+=$chunk; done }}
-        \\wait_word() {{ local i=0; while (( i < ${{2:-60}} )); do drain; [[ $ACC == *"$1"* ]] && return 0; sleep 0.1; (( i++ )); done; return 1 }}
+        \\wait_word() {{ local deadline=$(( EPOCHREALTIME + $2 )); while :; do drain; [[ $ACC == *"$1"* ]] && return 0; (( EPOCHREALTIME < deadline )) || return 1; sleep 0.1; done }}
         \\zpty z zsh -f -i
         \\zpty -w z "TERM=vt100; PATH='{s}':\$PATH; fpath=('{s}' \$fpath); autoload -Uz compinit; compinit -u -D && print SETUP-DONE-\$+functions[compdef]"
-        \\wait_word "SETUP-DONE-1" 200 || {{ print HARNESS-SETUP-TIMEOUT; zpty -d z; exit 1 }}
+        \\wait_word "SETUP-DONE-1" 20 || {{ print HARNESS-SETUP-TIMEOUT; zpty -d z; exit 1 }}
         \\ACC=""
         \\zpty -w -n z "{s}"; zpty -w -n z $'\t'
-        \\if wait_word "{s}"; then print FIRST-TAB-COMPLETED; else print FIRST-TAB-EMPTY; fi
+        \\if wait_word "{s}" 20; then print FIRST-TAB-COMPLETED; else print FIRST-TAB-EMPTY; fi
         \\ACC=""
         \\zpty -w -n z $'\025'"{s}"; zpty -w -n z $'\t'
-        \\if wait_word "{s}"; then print SECOND-TAB-COMPLETED; else print SECOND-TAB-EMPTY; fi
+        \\if wait_word "{s}" 10; then print SECOND-TAB-COMPLETED; else print SECOND-TAB-EMPTY; fi
         \\zpty -d z
         \\
     , .{ bin, comp, cmdline, word, cmdline, word });
