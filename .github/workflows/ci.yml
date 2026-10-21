@@ -69,7 +69,10 @@ jobs:
       - name: build
         run: zig build
       - name: test
-        run: zig build test --summary all
+        # On Windows a process started alongside a test binary can inherit its output pipe and keep
+        # it open after the binary exits; the build runner waits max(--test-timeout, 60s) for it.
+        # The flag also caps each test at 10m.
+        run: zig build test --summary all --test-timeout 10m
       - name: installer (unix)
         if: runner.os != 'Windows'
         shell: bash
